@@ -3,6 +3,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
+# shellcheck source=ops/lib/cuda-device-sets.sh
+source "${script_dir}/lib/cuda-device-sets.sh"
 env_file="${PASCAL_ENV_FILE:-${repo_root}/.env}"
 [[ -r "${env_file}" ]] || {
   echo "deployment config is missing: ${env_file}; copy .env.example to .env" >&2
@@ -97,6 +99,68 @@ install_service() {
      systemctl --user daemon-reload"
 }
 
+active_text_profile() {
+  if [[ -n "${1:-}" ]]; then
+    printf '%s\n' "$1"
+  else
+    ssh "${remote_host}" "cat \"\$HOME/.config/pascal-llm/active-model\""
+  fi
+}
+
+require_image_service_compatible() {
+  local text_profile="$1"
+  local image_profile
+  local text_devices
+  local image_devices
+
+  ssh "${remote_host}" "systemctl --user is-active --quiet pascal-image.service" || return 0
+  image_profile="$(ssh "${remote_host}" "cat \"\$HOME/.config/pascal-llm/active-image-model\" 2>/dev/null" || true)"
+  validate_profile "${text_profile}"
+  [[ "${image_profile}" =~ ^[a-z0-9][a-z0-9._-]*$ && \
+     -f "${repo_root}/config/images/${image_profile}.env" ]] || {
+    echo "active image profile is missing or invalid; refusing concurrent GPU placement" >&2
+    exit 2
+  }
+  text_devices="$(pascal_profile_value "${profiles_dir}/${text_profile}.env" PASCAL_CUDA_DEVICES)"
+  image_devices="$(pascal_profile_value "${repo_root}/config/images/${image_profile}.env" PASCAL_IMAGE_CUDA_DEVICES)"
+  if pascal_cuda_device_sets_overlap "${text_devices}" "${image_devices}"; then
+    echo "text profile ${text_profile} overlaps active image profile ${image_profile} on CUDA devices ${text_devices}/${image_devices}" >&2
+    exit 2
+  else
+    overlap_status=$?
+    (( overlap_status == 1 )) || {
+      echo "invalid CUDA device declaration in text or image profile" >&2
+      exit 2
+    }
+  fi
+}
+
+require_comfyui_service_compatible() {
+  local text_profile="$1"
+  local text_devices
+  local comfyui_devices
+
+  ssh "${remote_host}" "systemctl --user is-active --quiet pascal-comfyui.service" || return 0
+  text_devices="$(pascal_profile_value "${profiles_dir}/${text_profile}.env" PASCAL_CUDA_DEVICES)"
+  comfyui_devices="$(ssh "${remote_host}" \
+    "source \"\$HOME/.config/pascal-llm/comfyui.env\" 2>/dev/null && \
+     printf '%s' \"\${PASCAL_COMFYUI_CUDA_DEVICES:-}\"")"
+  [[ -n "${comfyui_devices}" ]] || {
+    echo "active ComfyUI service has no valid CUDA-device declaration" >&2
+    exit 2
+  }
+  if pascal_cuda_device_sets_overlap "${text_devices}" "${comfyui_devices}"; then
+    echo "text profile ${text_profile} overlaps active ComfyUI on CUDA devices ${text_devices}/${comfyui_devices}" >&2
+    exit 2
+  else
+    overlap_status=$?
+    (( overlap_status == 1 )) || {
+      echo "invalid CUDA device declaration in text or ComfyUI config" >&2
+      exit 2
+    }
+  fi
+}
+
 command_name="${1:-status}"
 case "${command_name}" in
   sync)
@@ -105,6 +169,13 @@ case "${command_name}" in
   start)
     sync_remote
     install_service
+    if [[ -z "${2:-}" ]]; then
+      require_active_profile
+    fi
+    target_profile="$(active_text_profile "${2:-}")"
+    validate_profile "${target_profile}"
+    require_image_service_compatible "${target_profile}"
+    require_comfyui_service_compatible "${target_profile}"
     if [[ -n "${2:-}" ]]; then
       select_profile "$2"
       ssh "${remote_host}" "systemctl --user restart '${service_name}'"
@@ -114,12 +185,25 @@ case "${command_name}" in
     fi
     echo "Service start requested; use '$0 status' until it reports ready."
     ;;
+  download)
+    profile_name="${2:-}"
+    validate_profile "${profile_name}"
+    sync_remote
+    ssh "${remote_host}" "'${remote_root}/ops/download-model.sh' '${profile_name}'"
+    ;;
   stop)
     ssh "${remote_host}" "systemctl --user stop '${service_name}'"
     ;;
   restart)
     sync_remote
     install_service
+    if [[ -z "${2:-}" ]]; then
+      require_active_profile
+    fi
+    target_profile="$(active_text_profile "${2:-}")"
+    validate_profile "${target_profile}"
+    require_image_service_compatible "${target_profile}"
+    require_comfyui_service_compatible "${target_profile}"
     if [[ -n "${2:-}" ]]; then
       select_profile "$2"
     else
@@ -145,7 +229,7 @@ case "${command_name}" in
       -exec basename {} .env \; | sort
     ;;
   *)
-    echo "usage: $0 {sync|start [profile]|stop|restart [profile]|status|logs|profiles}" >&2
+    echo "usage: $0 {sync|download <profile>|start [profile]|stop|restart [profile]|status|logs|profiles}" >&2
     exit 2
     ;;
 esac

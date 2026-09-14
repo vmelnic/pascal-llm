@@ -75,3 +75,24 @@ The configuration change does not affect an already-running process. The
 non-MTP populated-262K run started before this change remains the baseline;
 MTP is not qualified until the next controlled service start reports a
 speculative context and real acceptance/timing telemetry.
+
+## Optional abliterated profile
+
+The official profile remains the default and is not overwritten. A separate
+profile selects Huihui's refusal-modified GGUF:
+
+```text
+profile                qwen-abliterated
+repository             huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF
+revision               8f1b52408a2f6e317535190c9386f776cacf0079
+artifact               Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf
+artifact bytes         17,378,626,464 B = 16.1851 GiB
+artifact SHA-256       ebbc66b45cf36bf47dc052d560337ff047a8b4eef851c8919d83d623703b6aa4
+model ID               qwen3.8-27b-abliterated-ud-q4-k-xl
+```
+
+It uses the same 262,144 shared context, exact-F16 KV, three-P100 tensor split
+and embedded MTP execution contract. Abliteration deliberately changes model
+weights and refusal behavior; it is therefore a separate semantic-fidelity
+profile, not positive quality evidence for the official model. Direct and
+minimal Pi transport passed, but real coding/tool quality remains unqualified.

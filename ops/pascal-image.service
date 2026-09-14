@@ -1,0 +1,16 @@
+[Unit]
+Description=Pascal image-generation service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@PASCAL_REMOTE_ROOT@/ops/run-image-server.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

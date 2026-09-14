@@ -53,3 +53,27 @@ Status: dependency order, 2026-09-14.
 14. Open only when one candidate is selected for real use: qualify its normal
     Pi instructions, tools, coding task, concurrency and populated-context
     behavior. The minimal Pi smoke is not a production qualification.
+15. Completed: Juggernaut XL v9 and Animagine XL 4.0 Opt passed the pinned
+    upstream `stable-diffusion.cpp` OpenAI Images path on one P100, then on the
+    isolated P40. P40 uses FP32 parameters and tiled VAE; measured walls were
+    189.574 and 211.642 seconds with 13,537 MiB peak and zero P100 residency.
+16. Completed: text/image launcher admission is profile-driven. Qwen started
+    and remained healthy on P100 devices `0,1,2` while Animagine remained
+    resident on P40 device `3`. Missing, invalid or overlapping declarations
+    fail closed. DreamShaper was removed after failing visual-quality review.
+17. Completed: native ComfyUI v0.3.72 is installed on the P40 with one managed
+    CPython 3.12/PyTorch-cu126 environment. Juggernaut completed the repository
+    SDXL workflow, Animagine is discovered through the same link-only model
+    path, SQLite is persistent, and Open WebUI reaches the backend through the
+    Docker host gateway. The legacy image service and ComfyUI fail closed on
+    concurrent P40 ownership.
+18. Completed for functionality: standard RealVisXL V5.0 is linked into
+    ComfyUI and configured as Open WebUI's default. Its 1216x832, 50-step gate
+    produced a coherent photorealistic PNG in 274.01 seconds while Qwen stayed
+    on P100 devices 0-2.
+19. Completed for transport only: Huihui Qwen3.8-27B Abliterated UD-Q4_K_XL
+    is a separate artifact-driven profile with pinned revision, byte size and
+    SHA-256. It passed direct `hi`, embedded-MTP telemetry and minimal Pi
+    selection. Open WebUI discovers it whenever that profile is resident.
+    Real coding/tool quality remains open and the official Qwen profile stays
+    the default.

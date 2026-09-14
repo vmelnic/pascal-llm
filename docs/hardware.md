@@ -78,3 +78,14 @@ GPT-OSS-20B and Granite H-Small were also initialized at a configured 65,536
 context exclusively on CUDA device 3. `nvidia-smi` reported only the P40 UUID
 for each process. This is an isolated alternative placement, not a combined
 P100/P40 execution domain.
+
+The image services also use CUDA device 3 independently. Juggernaut and
+Animagine passed as complete FP32 graphs with tiled VAE at 13,537 MiB peak;
+RealVisXL passed the same placement and isolation contract through ComfyUI.
+Qwen remained healthy on CUDA devices 0-2. The launcher admits concurrent text
+and image services only when their profile-declared device sets are disjoint.
+
+Native ComfyUI is the Open WebUI image backend and uses the same P40 and model
+payloads. Its PyTorch cu126 install passed direct FP32 CUDA execution on SM61.
+ComfyUI and the OpenAI-compatible `stable-diffusion.cpp` service are mutually
+exclusive; neither may claim device 3 while the other is active.

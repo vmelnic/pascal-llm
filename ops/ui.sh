@@ -71,6 +71,10 @@ create_config \
   "${config_dir}/open-webui.env.example" \
   replace-with-openssl-rand-hex-32
 REMOTE
+
+  ssh "${remote_host}" \
+    "python3 '${remote_root}/ops/configure-open-webui.py' \
+      '${remote_root}' '${remote_root}/config/open-webui.env'"
 }
 
 compose_remote() {

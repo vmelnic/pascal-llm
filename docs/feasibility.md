@@ -1,4 +1,206 @@
-# Qwen3.8 feasibility gate
+# Feasibility gates
+
+## RealVisXL V5.0 on the isolated P40
+
+Status: artifact and visual gate passed.
+
+The selected artifact is the author's standard-quality SDXL checkpoint, not
+the distilled Lightning variant:
+
+```text
+repository             SG161222/RealVisXL_V5.0
+revision               ac93e0dda1f6d448cae19bbfab8c5e720a5e48bc
+checkpoint             RealVisXL_V5.0_fp16.safetensors
+checkpoint bytes       6,938,065,488 B = 6.4616 GiB
+checkpoint SHA-256     6a35a7855770ae9820a3c931d4964c3817b6d9e3c6f9c4dabb5b3a94e5643b80
+physical image device  Tesla P40, CUDA 3, 24 GiB
+```
+
+It has the same SDXL graph class and nearly the same stored size as the
+qualified Animagine checkpoint. It passed the runtime gate through ComfyUI:
+the completed artifact was discovered by link, the standard 50-step DPM++
+2M/Karras workflow returned a visually coherent 1216x832 photorealistic PNG in
+274.01 seconds, and Qwen remained isolated on the P100 domain.
+
+The author's model card explicitly targets photorealistic SFW and NSFW output
+and recommends either DPM++ SDE/Karras at 30 or more steps or DPM++ 2M/Karras
+at 50 or more steps. The latter is selected because the existing workflow and
+runtime already qualify that sampler family. CFG 5.0 remains a deployment
+choice rather than an author-specified invariant.
+
+## Native ComfyUI on the isolated P40
+
+Status: implemented and passed the functional host gate on 2026-09-14.
+
+ComfyUI is an alternative frontend/runtime for the two already qualified SDXL
+checkpoints. It does not add a model copy and it does not change the model
+capacity calculation: the existing checkpoint files are exposed to ComfyUI by
+symbolic links. ComfyUI and `pascal-image.service` are mutually exclusive
+because both own physical CUDA device 3. The text service may remain active on
+physical devices 0,1,2.
+
+```text
+physical image device                 Tesla P40, CUDA 3, SM61, 24 GiB
+largest existing checkpoint           7,105,348,188 B = 6.6174 GiB
+FP32 UNet + text encoders + VAE       13,708,687,518 B = 12.7654 GiB
+measured tiled sd.cpp peak            13,537 MiB
+physical reserve at that peak         11,039 MiB
+text-device traffic                   0 B/request by construction
+checkpoint duplication                0 B; links target PASCAL_MODEL_ROOT
+```
+
+The measured `stable-diffusion.cpp` peak is evidence for model admission, not
+a ComfyUI peak prediction. The ComfyUI gate therefore requires a complete
+request and direct device telemetry rather than assuming equal allocator or
+workspace behavior. VAE decoding remains tiled in the supplied SDXL workflow;
+the untiled P40 path already failed at 24,187 MiB.
+
+No compatible Python or PyTorch installation exists on the host: system Python
+is 3.14 and Torch is absent. Native deployment is therefore limited to one
+repository-managed CPython 3.12 environment and one PyTorch CUDA 12.6 install.
+The official cu126 wheel reports a Pascal `sm_60` cubin rather than a separate
+`sm_61` entry. Direct FP32 allocation, matrix multiplication and convolution
+on the P40 SM61 all passed. The installer therefore fails closed unless the
+visible device is exactly a Tesla P40 SM61, the wheel reports Pascal code, and
+those CUDA operations execute with finite output.
+
+ComfyUI v0.3.72 imports `requests` from its frontend manager but omits it from
+that release's `requirements.txt`. The native installer closes this upstream
+dependency explicitly and imports the production server module before systemd
+may launch it. The unit also bounds repeated startup failures.
+
+The acceptance gate is functional, not a new image-performance benchmark:
+
+1. `pascal-comfyui.service` listens on `0.0.0.0:8188` with only physical CUDA
+   device 3 visible and no process memory on devices 0,1,2;
+2. ComfyUI discovers the existing Juggernaut and Animagine checkpoints through
+   links, without copying their payloads;
+3. the repository API-format SDXL workflow returns a valid PNG;
+4. the Open WebUI container reaches the ComfyUI API through the host gateway;
+5. stopping the service releases P40 process residency.
+
+The real gate passed with ComfyUI v0.3.72, CPython 3.12.11 and PyTorch
+2.7.1/cu126. Juggernaut produced a visually coherent 1216x832 PNG through the
+repository workflow in 110.99 seconds while Qwen remained resident on P100
+devices 0-2. ComfyUI discovered both existing checkpoints by link, its SQLite
+state initialized at the explicit persistent path, and Open WebUI reached the
+API through the Docker host gateway. This does not transfer the latency result
+to Animagine or qualify sustained concurrent image requests.
+
+## Juggernaut XL v9 on one P100
+
+Status: admitted and passed one direct runtime/API qualification on 2026-09-14.
+
+The selected artifact is the single-file SDXL checkpoint at Hugging Face
+revision `cf419233522daa0b9ea36c3aff98fa2cab1fb0fb`:
+
+```text
+checkpoint                              7,105,348,188 B =   6.6174 GiB
+one P100 physical VRAM                                     16.0000 GiB
+capacity left for graphs/activations                        9.3826 GiB
+UNet FP16 component                     5,135,149,760 B =   4.7825 GiB
+two text encoders                       1,635,526,328 B =   1.5232 GiB
+VAE FP32 component                        167,335,342 B =   0.1558 GiB
+```
+
+The file-size comparison is an admission bound, not peak-VRAM telemetry. A
+successful gate still required the server to report a fully resident CUDA
+placement, peak device use below the physical 16 GiB limit, and a valid image
+without NaN/Inf or CPU parameter offload. The measured run met these gates:
+6,624.11 MB of parameters were assigned to VRAM, 0 MB to RAM, peak device use
+was 14,735 MiB, and the output was a valid 1216x832 RGB PNG.
+Runtime inspection reported FP16 conditioner/diffusion weights and FP32 VAE
+weights; those roles are kept distinct instead of calling the whole file FP16.
+
+At the recommended 35 denoising steps, reading every UNet weight only once per
+step plus one pass through the text encoders and VAE gives this optimistic hot
+traffic floor:
+
+```text
+35 * 5,135,149,760 + 1,635,526,328 + 167,335,342
+  = 181,533,103,270 B = 169.0659 GiB/request
+nominal P100 HBM2 floor at 732 GB/s = 0.2480 s/request
+```
+
+This excludes convolution/matmul arithmetic, CFG batch work, intermediate
+activations, sampling, VAE decode and image encoding, so it is not a latency
+prediction. The checkpoint crosses NVMe, RAM and PCIe once during cold load;
+there is no per-step PCIe weight transfer when `--backend cuda0 --auto-fit off`
+succeeds. Unlike an LLM request, this pipeline has no retained context, KV
+cache, recurrent state or MTP state.
+
+The acceptance gate used one upstream `stable-diffusion.cpp` server on CUDA
+device 0 and a `1216x832`, 35-step, CFG 5.0, DPM++ 2M Karras request through
+`POST /v1/images/generations`. It returned HTTP 200 in 120.864 seconds;
+sampling took 111.84 seconds and VAE decode took 7.19 seconds. This was the
+first runtime request after service start, but the checkpoint had just been
+downloaded and may have remained in the host page cache, so it is not claimed
+as a physical cold-NVMe measurement. The text LLM service remained stopped
+because it uses the same P100 domain.
+
+## Animagine XL 4.0 Opt on one P100
+
+Animagine XL 4.0 Opt uses the same complete-model, single-P100 execution
+contract as Juggernaut. Its pinned single-file artifact passes the static
+capacity prerequisite:
+
+```text
+Animagine checkpoint       6,938,350,040 B = 6.4618 GiB
+remaining from 16 GiB                         9.5382 GiB
+```
+
+Using the same SDXL component sizes as the already inspected Juggernaut graph,
+the optimistic parameter-traffic floor is:
+
+```text
+Animagine, 28 steps:
+28 * 5,135,149,760 + 1,635,526,328 + 167,335,342
+  = 145,587,054,950 B = 135.5885 GiB/request
+```
+
+This is an admission bound, not a prediction. The runtime gate passed with
+zero parameter offload and zero residency on the other devices. Animagine
+produced a valid 832x1216 image with its official 28-step, CFG 5, Euler
+Ancestral preset in 170.187 seconds and peaked at 14,735 MiB.
+
+## Isolated image generation on the P40
+
+The text profiles use physical CUDA devices `0,1,2`. Image generation can run
+concurrently only if its complete checkpoint, parameters and workspaces stay
+on physical CUDA device `3`, the P40. The P40 has no peer path to the P100
+domain, so this design performs no cross-device model split and transfers no
+denoiser tensors between the services.
+
+P40 does not provide the P100's fast FP16 path. The image profiles therefore
+request FP32 execution explicitly. This increases precision rather than
+reducing it. Using Juggernaut's inspected component inventory gives the static
+capacity prerequisite:
+
+```text
+FP32 UNet + text encoders, FP32 VAE
+  = 2 * (5,135,149,760 + 1,635,526,328) + 167,335,342
+  = 13,708,687,518 B = 12.7654 GiB
+conservative measured non-parameter peak allowance       8.4000 GiB
+estimated resident peak                                 21.1654 GiB
+P40 physical capacity                                   24.0000 GiB
+estimated reserve                                        2.8346 GiB
+```
+
+The 8.4 GiB allowance is derived from the previous 14,735 MiB P100 peak minus
+the reported resident parameter allocation and rounded upward. It proved too
+low for the untiled VAE: denoising completed in 112.58 seconds, but decode
+reached 24,187 MiB and failed allocation. The single corrective gate enables
+upstream VAE tiling while keeping parameters and all compute on the same P40.
+It kept the same checkpoint, prompt, dimensions, step count, sampler and seed;
+required a valid RGB PNG without visible tile seams and zero process residency
+on P100 devices `0,1,2`; and rejected parameter offload or an incomplete
+request. The corrective gate passed. The runtime reported 12,230.64 MB of
+parameters in P40 VRAM and 0 MB in RAM. Juggernaut completed in 189.574 seconds
+and Animagine in 211.642 seconds; both peaked at 13,537 MiB in one-second
+sampling and passed visual inspection. Qwen then started concurrently on the
+three P100s while the image process remained resident on P40.
+
+## Qwen3.8 feasibility gate
 
 Status: the custom exact-component design fails the populated-262K 15 tok/s
 prerequisite. The upstream GGUF service is useful at ordinary context sizes;

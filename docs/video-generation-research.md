@@ -57,7 +57,8 @@ P40 must be evaluated separately.
 
 Start CogVideoX-2B on one P100 using its official FP16 path. If the complete
 pipeline does not fit without harmful offload, test the official distributed
-path on two P100s. The third P100 remains free for image work or another job.
+path on two P100s. The third P100 remains free for another text/video job; the
+qualified still-image service is isolated on P40.
 
 A three-P100 job is accepted only if end-to-end clip latency improves over the
 best one- or two-P100 configuration. Capacity alone is not sufficient. Do not

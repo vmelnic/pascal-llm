@@ -3,6 +3,116 @@
 Status: through 2026-09-14. Component gates and service results are kept
 separate.
 
+## Native ComfyUI functional gate
+
+ComfyUI v0.3.72 at commit
+`828b1b9953175b6df79459f417d1032869d0b46a` ran natively with CPython
+3.12.11 and PyTorch 2.7.1/cu126. The install gate identified the Tesla P40 as
+SM61 and executed finite FP32 matrix-multiplication and convolution results.
+The three P100s remained owned only by the concurrently running Qwen process.
+
+The repository SDXL API workflow loaded the existing Juggernaut checkpoint by
+symbolic link, generated one coherent 1216x832 PNG with 35 DPM++ 2M/Karras
+steps and tiled VAE decode, and completed in 110.99 seconds. The 1,141,924-byte
+output passed decode and visual inspection. ComfyUI also discovered Animagine
+and RealVisXL through the same link-only path. Open WebUI loaded the same
+workflow and node mapping and reached ComfyUI from inside its container.
+
+The standard, non-Lightning RealVisXL V5.0 checkpoint then generated a
+1,407,143-byte 1216x832 RGB PNG with 50 DPM++ 2M/Karras steps, CFG 5.0 and
+tiled VAE decode. Completion wall was 274.01 seconds. The fixed-seed output
+passed visual inspection for coherent photorealistic skin, eyes, hair,
+lighting and scene composition. During denoising the P40 was at 100% load;
+Qwen remained isolated on P100 devices 0-2.
+
+Two deployment faults were caught before qualification: the ComfyUI
+`--cuda-device 0` flag overrode an outer physical-device mask and selected a
+P100, and the pinned release omitted its direct `requests` dependency. The
+launcher now relies only on `CUDA_VISIBLE_DEVICES=3`; the installer closes the
+missing dependency, validates real Pascal CUDA execution and runs the official
+startup preflight. The SQLite path is explicit and persistent.
+
+## Qwen3.8-27B Abliterated transport gate
+
+The pinned `Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf` artifact is
+17,378,626,464 bytes with SHA-256
+`ebbc66b45cf36bf47dc052d560337ff047a8b4eef851c8919d83d623703b6aa4`.
+It loaded through the same three-P100 tensor path, 262,144 shared context,
+F16 K/V and embedded MTP settings as the official Qwen profile. Steady
+residency was 13,363, 13,109 and 13,347 MiB on P100 devices 0-2.
+
+One uncached direct `hi` with thinking disabled through
+`chat_template_kwargs.enable_thinking=false` produced 11 tokens at 36.55
+tok/s after a 13-token prefill at 17.53 tok/s. MTP proposed and accepted 9/9
+tokens. Minimal Pi transport then returned a coherent greeting and exited
+successfully. These results qualify artifact loading, API transport, Pi model
+selection and MTP execution only; they do not qualify coding quality, refusal
+behavior, long populated context or concurrent sessions.
+
+## Juggernaut XL v9 image-generation gate
+
+Runtime: upstream `stable-diffusion.cpp` commit
+`42d6c0ab92fe6595776b28e3f7c8925db79b31f5`, compiled for CUDA SM60/SM61.
+Artifact: `RunDiffusion/Juggernaut-XL-v9` revision
+`cf419233522daa0b9ea36c3aff98fa2cab1fb0fb`, single-file SDXL checkpoint,
+7,105,348,188 bytes, SHA-256
+`c9e3e68f89b8e38689e1097d4be4573cf308de4e3fd044c64ca697bdb4aa8bca`.
+
+The first request used the native OpenAI Images route, DPM++ 2M with Karras,
+35 steps, CFG 5.0 and the model-card landscape resolution. The endpoint
+returned HTTP 200 and a decodable, visually coherent photorealistic PNG.
+
+| Placement | Output | Sampling | VAE decode | HTTP wall | Peak VRAM | Peak GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| P100 device 0 only | 1216x832 RGB PNG | 111.84 s | 7.19 s | 120.864 s | 14,735 MiB | 100% |
+
+The runtime reported 6,624.11 MB of parameters on VRAM and 0 MB on RAM:
+1,564.36 MB text encoders, 4,900.07 MB diffusion model and 159.68 MB VAE.
+Its loader reported FP16 conditioner/diffusion weights and an FP32 VAE; the
+artifact is therefore not described as uniformly FP16.
+P100 devices 1-2 and the P40 retained zero process residency. This qualifies
+one Juggernaut profile and the API transport; it does not yet qualify warm
+latency, concurrent replicas, animation/cartoon quality or a public service.
+
+The upstream-recommended CUDA `--diffusion-fa` optimization was then tested
+with the identical model, prompt, seed, resolution, sampler and 35 steps. It
+reduced denoising residency from about 7,609 to 7,275 MiB, but sampling had not
+completed after more than 208 seconds, versus 111.84 seconds without Flash
+Attention. The run was stopped fail-fast and the P100 default was reverted.
+
+## Animagine image-generation gate
+
+The artifact was pinned, size/SHA-256 verified and executed through the same
+`sd-server` binary and OpenAI Images route. It used no CPU parameter offload or
+other device.
+
+| Profile | Preset | Output | Sampling | VAE decode | HTTP wall | Peak VRAM | Visual verdict |
+|---|---|---:|---:|---:|---:|---:|---|
+| Animagine XL 4.0 Opt | Euler A, 28 steps, CFG 5 | 832x1216 | 157.73 s | 10.69 s | 170.187 s | 14,735 MiB | passed anime sample |
+
+Animagine used the official tag-format prompt, quality suffix and negative
+prompt. Its output was coherent and visually strong.
+
+## Isolated P40 image-generation gates
+
+Both remaining profiles were then run as complete FP32 graphs on physical CUDA
+device `3`, with upstream VAE tiling and no parameter offload. Physical CUDA
+devices `0,1,2` retained zero process residency during both requests.
+
+| Profile | Output | Sampling | VAE decode | HTTP wall | Peak P40 | Visual verdict |
+|---|---:|---:|---:|---:|---:|---|
+| Juggernaut XL v9 | 1216x832 | 162.33 s | 25.29 s | 189.574 s | 13,537 MiB | passed photorealistic sample; no tile seams |
+| Animagine XL 4.0 Opt | 832x1216 | 183.10 s | 26.42 s | 211.642 s | 13,537 MiB | passed anime sample; no tile seams |
+
+The first untiled Juggernaut P40 attempt is a negative capacity result, not a
+latency sample: sampling completed in 112.58 seconds, then VAE decode reached
+24,187 MiB and aborted with CUDA OOM. Tiling was the single corrective change.
+After both image gates, Qwen started concurrently on P100 devices `0,1,2` and
+reported healthy while Animagine remained resident on P40. `nvidia-smi`
+reported approximately 12.6-12.8 GiB for the Qwen process on each P100 and
+12.9 GiB for the image process on the P40. Both services and Open WebUI were
+then stopped; all four GPUs reported zero process residency.
+
 ## New 64K profile transport gates
 
 North Mini Code 1.0 Q4_K_M (revision

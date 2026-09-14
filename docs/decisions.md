@@ -1,6 +1,6 @@
 # Decision ledger
 
-Status: 2026-09-13.
+Status: 2026-09-14.
 
 ## Accepted
 
@@ -24,6 +24,9 @@ Status: 2026-09-13.
   inequality failed. Use pinned, unmodified upstream `llama.cpp` for serving.
 - Use the approved `Qwen3.8-27B-UD-Q4_K_M.gguf` artifact. This changes weight
   fidelity relative to full precision; F16 refers only to the KV cache.
+- Keep Huihui Qwen3.8-27B Abliterated UD-Q4_K_XL as an explicitly selected
+  alternative profile. Its refusal-direction edit is a semantic fidelity
+  change and must never replace the official Qwen default implicitly.
 - Use tensor split across the three P100s. With NCCL 2.27.7 this path passed
   model initialization, Pi tool use and concurrent-session gates. Keep the P40
   outside the serving process because it lacks P2P with the P100 domain.
@@ -31,6 +34,23 @@ Status: 2026-09-13.
   This enables concurrent users but does not promise 262K to every slot at the
   same time.
 - Start the model service manually. It is deliberately disabled at boot.
+- Use upstream `stable-diffusion.cpp` instead of implementing an image API or
+  diffusion runtime. RealVisXL, Juggernaut and Animagine share one
+  artifact-driven server path and the native OpenAI Images compatibility
+  endpoint.
+- Run the complete image graph independently on P40 device `3`, while text
+  remains on P100 devices `0,1,2`. FP32 parameters plus tiled VAE passed at
+  13,537 MiB peak for both qualified profiles. The launchers compare declared
+  CUDA sets and allow concurrent services only when they are disjoint.
+- Use pinned native ComfyUI as the Open WebUI image backend. It reuses the
+  qualified checkpoints by symbolic link and owns exactly one managed
+  CPython/PyTorch-cu126 environment. Keep the OpenAI-compatible
+  `stable-diffusion.cpp` service as an alternative, never a concurrent second
+  owner of the P40. Custom ComfyUI nodes remain disabled by default.
+- Use RealVisXL V5.0 standard as the Open WebUI default for photorealism while
+  keeping Juggernaut and Animagine explicitly selectable. Do not make Qwen
+  infer the checkpoint. Frontend selection is deterministic and is passed to
+  ComfyUI as workflow input.
 
 ## Not transferable as positive evidence
 
@@ -75,6 +95,16 @@ They may be reopened only through the explicit complete-latency gate in
 - P40 as a layer-parallel cold-prefill stage. Its extra capacity does not repair
   the heterogeneous pipeline utilization, and the measured arm was already
   slower than the complete three-P100 tensor baseline at 62.5% progress.
+- Flash Attention as an SDXL speed default on P100 SM60. For an identical
+  Juggernaut request, `--diffusion-fa` had not completed sampling after more
+  than 208 seconds versus 111.84 seconds without it. It saves workspace but is
+  a latency regression on this measured path.
+- Untiled FP32 SDXL decode on P40. Juggernaut sampling completed, but VAE
+  allocation reached 24,187 MiB and aborted. Upstream VAE tiling is the
+  accepted correction; it completed with 13,537 MiB peak.
+- DreamShaper XL Lightning. Its measured four-step path was fast, but the
+  inspected image had material color and edge artifacts. The profile and its
+  checkpoint were removed rather than presenting a failed quality result.
 
 ## Open decision
 
