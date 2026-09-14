@@ -1,0 +1,7 @@
+.DS_Store
+.env
+config/*.env
+artifacts/
+build/
+out/
+work/
