@@ -14,22 +14,5 @@ services:
     volumes:
       - open-webui-data:/app/backend/data
 
-  anythingllm:
-    image: mintplexlabs/anythingllm:1.16.1
-    container_name: pascal-anythingllm
-    restart: unless-stopped
-    ports:
-      - "0.0.0.0:3001:3001"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    cap_add:
-      - SYS_ADMIN
-    env_file:
-      - ./config/anythingllm.env
-    volumes:
-      - anythingllm-data:/app/server/storage
-      - ./config/anythingllm.env:/app/server/.env
-
 volumes:
   open-webui-data:
-  anythingllm-data:

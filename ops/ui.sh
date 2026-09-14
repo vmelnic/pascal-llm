@@ -70,13 +70,6 @@ create_config \
   "${config_dir}/open-webui.env" \
   "${config_dir}/open-webui.env.example" \
   replace-with-openssl-rand-hex-32
-
-create_config \
-  "${config_dir}/anythingllm.env" \
-  "${config_dir}/anythingllm.env.example" \
-  replace-with-openssl-rand-hex-32 \
-  replace-with-openssl-rand-hex-32 \
-  replace-with-openssl-rand-hex-32
 REMOTE
 }
 

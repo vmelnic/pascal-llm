@@ -66,17 +66,16 @@ Only one profile is resident at a time. `start <profile>` and
 `restart <profile>` select the artifact transactionally; subsequent `start`
 without a profile reuses that selection.
 
-The optional web interfaces start automatically with Docker after they have
-been installed once:
+The optional web interface starts automatically with Docker after it has been
+installed once:
 
 ```bash
 ./ops/ui.sh start
 ```
 
 - Open WebUI: `http://<configured-host>:3000`
-- AnythingLLM: `http://<configured-host>:3001`
 
-See [web interfaces](docs/web-ui.md) for persistence and lifecycle details.
+See [web interface](docs/web-ui.md) for persistence and lifecycle details.
 
 From this repository or any real project, use Pi with its normal `AGENTS.md`,
 skills, tools and sessions intact:
@@ -124,6 +123,10 @@ North model     north-mini-code-1.0-q4-k-m
 GPT-OSS model   gpt-oss-20b-mxfp4
 Granite model   granite-4.0-h-small-q4-k-m
 ```
+
+Open WebUI discovers the currently resident model from the OpenAI-compatible
+endpoint; no UI configuration is tied to Qwen. See
+[web interface](docs/web-ui.md).
 
 The host uses upstream `llama.cpp` pinned by `ops/install-llama.sh`, CUDA SM60,
 NCCL 2.27.7, tensor split `1,1,1`, FlashAttention, continuous batching and a
