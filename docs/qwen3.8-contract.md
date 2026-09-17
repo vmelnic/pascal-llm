@@ -64,12 +64,18 @@ KV                   F16 K and F16 V
 context pool         262,144 positions shared by four unified slots
 batching             continuous
 reasoning            Pi default xhigh
+reasoning token cap  none; bounded by the request/context output ceiling
 speculative decode   embedded MTP, maximum four proposed tokens
 MTP KV               F16 K and F16 V
 MTP draft head       65,801-token pinned coding/Romanian subset
 service lifecycle    manual start; disabled at boot
 RAM prompt cache     24 GiB, exact target+draft state, process-local
 ```
+
+Do not send `reasoning_budget_tokens` for Qwen. A 16,384-token cap terminated
+thinking mid-plan and exposed incomplete tool-call markup instead of a valid
+tool call; convergence is governed by the project instructions and the normal
+request/context ceiling.
 
 The GGUF contains the model's MTP block. The pinned runtime supports it through
 `draft-mtp`; deployment configuration uses the same three P100s, exact-F16

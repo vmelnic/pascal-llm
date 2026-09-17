@@ -75,9 +75,11 @@ into evidence and a result, not reducing necessary investigation.
    write the requested artifact and stop. Do not inspect unrelated git history
    or expand scope merely because token budget remains. Do not stop early while
    a material finding is still unsupported or unresolved.
-8. `xhigh` means detailed reasoning, adversarial cross-checking and independent
-   evidence. The reasoning-token ceiling is only a runaway safeguard: never
-   trade away a necessary deep investigation merely to finish below it.
+8. Default to `xhigh`; token ceilings are runaway guards, not depth targets.
+   Keep a compact checkpoint of verified facts, gates, blocker and next action.
+   After failure, resume there and redo only invalidated dependencies. Restart
+   from zero ONLY when an upstream invariant was disproved; stop reasoning paths
+   that repeat without new evidence.
 
 ## Change loop
 
