@@ -1,16 +1,19 @@
 # Roadmap
 
-Status: dependency order, 2026-09-14.
+Status: dependency order, 2026-09-17.
 
 1. Completed: the custom runtime feasibility program was stopped after MLP
    plus populated-262K attention reached 87.298 ms/token before the rest of the
    model. Preserve the measurements; do not integrate those kernels.
-2. Completed: deploy pinned, unmodified upstream `llama.cpp` with the approved
-   Qwen3.8 UD-Q4_K_M artifact on the coherent three-P100 domain.
+2. Completed: deploy pinned `llama.cpp` v0.4.0 plus the pinned zero-fuzz SM60
+   patch set with the approved Qwen3.8 UD-Q4_K_M artifact on the coherent
+   three-P100 domain. Decode scheduler slots remain disabled after their real
+   tensor-split MTP crash.
 3. Completed: restore tensor mode with official NCCL 2.27.7; initialize the
    model and verify equal residency on all three P100s. P40 remains idle.
-4. Completed: qualify a real Pi instruction/tool flow. Measured decode is
-   25.4-25.5 tok/s at ordinary context.
+4. Completed: qualify a real Pi instruction/tool flow. The old unpatched
+   baseline was 25.4-25.5 tok/s. The production patched gate measured 40.1
+   tok/s on the initial/tool turn and 30.5 tok/s on the tool/final turn.
 5. Completed: qualify two concurrent independent Pi processes. Both completed
    correctly; observed overlapping decode was 14.0-18.8 tok/s per session.
 6. Completed: a controlled cold request populated 262,016 prompt tokens and
@@ -21,16 +24,19 @@ Status: dependency order, 2026-09-14.
    mode and a three-P100-plus-P40 layer pipeline were both already slower than
    the complete three-P100 tensor baseline before reaching 32,768 tokens. Do
    not build a layer-prefill-to-tensor-decode state converter.
-8. Open: qualify exact in-memory hybrid-prefix reuse on a real append-only
-   Pi-shaped request. Require reported cached tokens, suffix-only prefill,
-   coherent Gated DeltaNet state and no duplicated full-prefix KV across two
-   sessions. Size `cache-ram` from reported state bytes; do not enable disk
-   persistence before restore is proven on this hybrid model.
-9. Active but not yet qualified: the current service loads the embedded MTP
-   head with F16 draft KV and at most three proposals. Verify that the server
-   exposes speculative slots, then record acceptance, cold/reused prefill and
-   useful Pi decode separately. Do not infer the community RTX 5060 Ti result
-   on the three-P100 topology.
+8. Completed for process-local RAM: official Qwen now has a 24 GiB bound. A
+   Pi session was evicted from its GPU slot, restored into a different empty
+   slot and evaluated only the 28-token suffix of a 1,990-token resumed state.
+   The exact response remained coherent. Populated-262K restore, cross-process
+   disk persistence and physical sharing of one maximum prefix across active
+   users remain separate gates.
+9. Completed for ordinary context: the service uses F16 draft KV, at most four
+   proposals and a pinned 65,801-token reduced draft head with 97.8452%
+   held-out Romanian-plus-coding coverage. Two post-deploy Pi gates measured
+   38.68-44.14 decode tok/s and 57.16-79.17% draft acceptance. CPU sampler work
+   was bounded at 0.165 ms/generated token, so CUDA backend sampling was
+   rejected by its 1 ms prerequisite. Cold/reused populated-262K MTP behavior
+   remains unqualified.
 10. Open after real use exposes a failure: cancellation/recovery and sustained
     four-slot pressure. Do not add schedulers, caches or custom kernels in
     anticipation of an unobserved problem.

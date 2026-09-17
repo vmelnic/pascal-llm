@@ -36,8 +36,10 @@ ComfyUI and exposes `pascal-llm/realvisxl.safetensors`,
 Juggernaut and Animagine remain explicit manual choices. Qwen only prepares
 the text prompt. Open WebUI passes the selected checkpoint to ComfyUI, so no
 LLM-side model guess or family router is involved. The repository workflow
-uses tiled VAE decode because untiled FP32 SDXL decode already exhausted the
-P40.
+uses a `1024x1024` default and maps the request's explicit `size` field to the
+ComfyUI latent width and height. Dimensions written only inside the natural
+language prompt are not interpreted as request parameters. The workflow uses
+tiled VAE decode because untiled FP32 SDXL decode already exhausted the P40.
 
 Docker is enabled at boot and the container uses `restart: unless-stopped`.
 The Qwen systemd user service remains disabled at boot and is controlled

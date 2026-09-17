@@ -55,7 +55,8 @@ columns remain co-owned, avoiding movement of the large intermediate vector.
 ## Serving contract
 
 ```text
-runtime             upstream llama.cpp, commit 4a89937354190cef5a97baf8eeb17336105eb72d
+runtime             llama.cpp v0.4.0, commit 5266f24da75dc449bd56cbed7addb9c8e4a6a73e
+SM60 patch set       commit 52469952952ee6446207acc574c72055a0685ac4
 weight artifact     UD-Q4_K_M GGUF, 16,464,440,224 bytes
 compute devices     CUDA 0,1,2: three P100s, equal tensor split
 P40                  excluded from hot path
@@ -63,18 +64,22 @@ KV                   F16 K and F16 V
 context pool         262,144 positions shared by four unified slots
 batching             continuous
 reasoning            Pi default xhigh
-speculative decode   embedded MTP, maximum three proposed tokens
+speculative decode   embedded MTP, maximum four proposed tokens
 MTP KV               F16 K and F16 V
+MTP draft head       65,801-token pinned coding/Romanian subset
 service lifecycle    manual start; disabled at boot
+RAM prompt cache     24 GiB, exact target+draft state, process-local
 ```
 
 The GGUF contains the model's MTP block. The pinned runtime supports it through
-`draft-mtp`; deployment configuration now loads the embedded head completely
-on the same three P100s and limits a speculative cycle to three proposed tokens.
-The configuration change does not affect an already-running process. The
-non-MTP populated-262K run started before this change remains the baseline;
-MTP is not qualified until the next controlled service start reports a
-speculative context and real acceptance/timing telemetry.
+`draft-mtp`; deployment configuration uses the same three P100s, exact-F16
+draft KV, at most four proposals and a SHA-256-pinned 65,801-token reduced
+draft head. Independent Romanian-plus-coding holdout coverage is 97.8452%.
+Every proposal remains verified and sampled by the complete target head. Two
+post-deploy real Pi tool gates measured 38.68-44.14 decode tok/s and
+57.16-79.17% draft acceptance. This qualifies ordinary-context execution, not
+populated-262K MTP throughput. The non-MTP populated-262K run remains the
+maximum-context baseline.
 
 ## Optional abliterated profile
 

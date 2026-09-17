@@ -5,3 +5,4 @@ artifacts/
 build/
 out/
 work/
+ops/__pycache__

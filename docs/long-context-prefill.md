@@ -210,10 +210,12 @@ middle invalidates everything after the first difference. Marconi documents
 why in-place recurrent state makes partial rollback and hybrid-model cache
 admission materially harder than ordinary KV prefix caching.[^6]
 
-The deployed server already enables `--cache-prompt` and a 16 GiB host prompt
-cache. Current upstream llama.cpp exposes context checkpoints, a RAM cache and
-slot save/restore APIs.[^7] That is evidence for a mechanism, not evidence that
-our pinned hybrid path works correctly at 262K. Current llama.cpp bug reports
+The deployed server enables `--cache-prompt` and a 24 GiB host prompt cache.
+Current llama.cpp exposes context checkpoints, a RAM cache and slot
+save/restore APIs.[^7] The ordinary-context hybrid path now has a real Pi
+resume gate: after slot eviction, a 1,990-token target-plus-MTP state restored
+into an empty slot and only the 28-token suffix was evaluated. This is not yet
+evidence for a maximum-size 262K checkpoint. Current llama.cpp bug reports
 show successful-looking disk restores that subsequently re-prefill hybrid
 models, so disk persistence must be treated as unqualified until a real
 restore reports reuse and avoids computation.[^8]
@@ -222,12 +224,13 @@ The immediate design is therefore deliberately small:
 
 1. Preserve Pi's natural append-only token prefix; do not insert changing
    metadata before stable history.
-2. Qualify the existing in-memory hybrid checkpoint path before adding a new
-   cache implementation.
-3. Account the full state. One maximum prefix is already 16.148 GiB before
-   checkpoint metadata; the configured 16 GiB RAM cache cannot be assumed to
-   retain it. Select a host budget only after the server reports actual cache
-   bytes.
+2. Use the qualified in-memory hybrid checkpoint path before adding a new
+   cache implementation. Keep disk persistence disabled until it has its own
+   restore gate.
+3. Account the full state. One maximum prefix is approximately 17.148 GiB for
+   16 GiB target KV, 1 GiB MTP KV and 151.5 MiB recurrent target state before
+   checkpoint metadata. The 24 GiB bound admits one such anchor with headroom;
+   it does not promise multiple maximum-size sessions.
 4. Key reusable state by model artifact, tokenizer/template, runtime/state ABI,
    KV dtype, complete prefix tokens and tenant/session salt.
 5. For multi-user service, prove that a shared base prefix is physically shared
@@ -411,20 +414,19 @@ failures. No KV quantization is proposed under the current contract.
 
 ## Decision and dependency order
 
-1. **Qualify existing exact in-memory reuse.** Use one real append-only Pi-shaped
-   request, repeat it with a small suffix, and require server telemetry to show
-   cached tokens plus suffix-only prompt evaluation. This is an acceptance
-   gate, not a throughput sweep.
-2. **Verify hybrid correctness.** The cached arm must match a cold arm at the
-   state/logit boundary and produce coherent output; attention KV and Gated
-   DeltaNet state must resume together. One failure permits one local correction;
-   a second stops implementation and triggers an end-to-end reassessment.
-3. **Size the RAM cache from reported bytes.** The current 16 GiB cannot be
-   assumed to hold a 16.148 GiB maximum state plus checkpoints. Keep one useful
-   maximum project anchor first; do not promise four.
-4. **Make reuse survive real sessions.** Preserve deterministic prompt ordering,
-   bind state to model/template/runtime identity, isolate tenants and expose hit
-   tokens, restored bytes, suffix-prefill time and fallbacks.
+1. **Completed at ordinary context: exact in-memory reuse.** A real Pi session
+   was evicted, restored into a different empty slot and evaluated only a
+   28-token suffix of a 1,990-token state.
+2. **Completed at ordinary context: hybrid state.** The restored state included
+   both target and embedded-MTP data and produced the exact requested codeword.
+   A populated-262K numerical parity gate remains open.
+3. **Completed for one-anchor admission: RAM budget.** The Qwen profile now
+   allocates a bounded 24 GiB host cache. Oldest and obsolete entries are
+   removed automatically. Do not promise four maximum-size anchors.
+4. **Completed for a live server process: Pi resume.** Token-identical prefixes
+   survive Pi exit/resume. Cache entries remain bound implicitly to the loaded
+   model/runtime process and do not survive service restart. Disk persistence,
+   explicit tenant salts and restore-byte observability remain open.
 5. **Prove multi-user physical sharing.** Two Pi agents extending the same base
    prefix must not duplicate 16 GiB of device KV. If upstream cannot share it,
    long-context concurrency remains capacity-limited and must be stated.

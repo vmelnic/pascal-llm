@@ -14,6 +14,7 @@ set -a
 source "${config_file}"
 set +a
 
+PASCAL_DECODE_GRAPH_SLOTS="${PASCAL_DECODE_GRAPH_SLOTS:-0}"
 PASCAL_MODEL_ROOT="${PASCAL_MODEL_ROOT:-${repo_root}/work/models}"
 PASCAL_LLAMA_ROOT="${PASCAL_LLAMA_ROOT:-${repo_root}/work/llama.cpp}"
 active_profile_file="${PASCAL_ACTIVE_MODEL_FILE:-${HOME}/.config/pascal-llm/active-model}"
@@ -56,6 +57,7 @@ required_variables=(
   PASCAL_API_KEY
   PASCAL_THREADS
   PASCAL_BATCH_THREADS
+  PASCAL_DECODE_GRAPH_SLOTS
 )
 
 for variable_name in "${required_variables[@]}"; do
@@ -64,6 +66,11 @@ for variable_name in "${required_variables[@]}"; do
     exit 2
   }
 done
+
+[[ "${PASCAL_DECODE_GRAPH_SLOTS}" =~ ^[0-9]+$ ]] || {
+  echo "PASCAL_DECODE_GRAPH_SLOTS must be a non-negative integer" >&2
+  exit 2
+}
 
 case "${PASCAL_SPLIT_MODE}" in
   none|layer|row|tensor)
@@ -94,6 +101,7 @@ server_binary="${PASCAL_LLAMA_ROOT}/build/bin/llama-server"
 }
 
 declare -a model_arguments=()
+mtp_draft_vocab_path=""
 if [[ -n "${PASCAL_MMPROJ_PATH:-}" ]]; then
   [[ -f "${PASCAL_MMPROJ_PATH}" ]] || {
     echo "multimodal projector is missing: ${PASCAL_MMPROJ_PATH}" >&2
@@ -132,6 +140,31 @@ case "${PASCAL_SPEC_TYPE:-none}" in
       }
       model_arguments+=(--spec-draft-model "${PASCAL_SPEC_DRAFT_MODEL_PATH}")
     fi
+    if [[ -n "${PASCAL_MTP_DRAFT_VOCAB_PATH:-}" ]]; then
+      [[ -r "${PASCAL_MTP_DRAFT_VOCAB_PATH}" ]] || {
+        echo "MTP draft vocabulary is missing: ${PASCAL_MTP_DRAFT_VOCAB_PATH}" >&2
+        exit 2
+      }
+      [[ "${PASCAL_MTP_DRAFT_VOCAB_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "PASCAL_MTP_DRAFT_VOCAB_SHA256 must be a lowercase SHA-256 digest" >&2
+        exit 2
+      }
+      actual_draft_vocab_sha256="$(sha256sum "${PASCAL_MTP_DRAFT_VOCAB_PATH}" | awk '{print $1}')"
+      [[ "${actual_draft_vocab_sha256}" == "${PASCAL_MTP_DRAFT_VOCAB_SHA256}" ]] || {
+        echo "MTP draft vocabulary hash mismatch" >&2
+        exit 2
+      }
+      awk '
+        BEGIN { previous = -1 }
+        !/^[0-9]+$/ || $1 <= previous { exit 1 }
+        { previous = $1 }
+        END { if (NR == 0) exit 1 }
+      ' "${PASCAL_MTP_DRAFT_VOCAB_PATH}" || {
+        echo "MTP draft vocabulary must contain strictly increasing token IDs" >&2
+        exit 2
+      }
+      mtp_draft_vocab_path="${PASCAL_MTP_DRAFT_VOCAB_PATH}"
+    fi
     model_arguments+=(
       --spec-type draft-mtp
       --spec-draft-n-max "${PASCAL_SPEC_DRAFT_N_MAX}"
@@ -148,6 +181,17 @@ esac
 
 export CUDA_VISIBLE_DEVICES="${PASCAL_CUDA_DEVICES}"
 export GGML_CUDA_P2P="${PASCAL_CUDA_P2P}"
+export LLAMA_DEC_SLOTS="${PASCAL_DECODE_GRAPH_SLOTS}"
+
+# These patchset experiments are intentionally disabled: the patch author
+# reports non-deterministic MoE output when the graph fusions are enabled.
+export GGML_CUDA_FUSE_PRE_ADD=0
+export GGML_CUDA_FUSE_ADD_UNARY_MUL=0
+if [[ -n "${mtp_draft_vocab_path}" ]]; then
+  export LLAMA_MTP_DRAFT_VOCAB="${mtp_draft_vocab_path}"
+else
+  unset LLAMA_MTP_DRAFT_VOCAB
+fi
 
 exec "${server_binary}" \
   --model "${PASCAL_MODEL_PATH}" \

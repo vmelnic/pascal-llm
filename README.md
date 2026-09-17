@@ -14,18 +14,19 @@ Local multi-user LLM serving on three Tesla P100 GPUs, with isolated one-P40
 placement available per model profile. Qwen and Ornith have real Pi tool-flow
 evidence; North Mini Code, GPT-OSS and Granite H-Small have 64K direct-chat and
 minimal-Pi transport evidence on both placements. The production path is
-unmodified upstream `llama.cpp`; this repository owns artifact-driven
-profiles, deployment, Pi integration and the evidence ledger, not another
-inference engine.
+pinned `llama.cpp` v0.4.0 plus a pinned, zero-fuzz SM60 patch set; this
+repository owns its reproducible build, artifact-driven profiles, deployment,
+Pi integration and evidence ledger, not another inference engine.
 
 ## Verified status
 
-Measured on 2026-09-13 through the real Pi harness with project instructions
-and a tool round trip:
+Measured through the real Pi harness with project instructions and a tool
+round trip. The Qwen ordinary-context row was refreshed on 2026-09-17 after
+deploying the SM60 patch set; older rows retain their recorded runtime:
 
 | Model | Artifact | Compute | Context/KV | Prompt | Decode | Result |
 |---|---|---|---|---:|---:|---|
-| Qwen3.8-27B | UD-Q4_K_M, 15.33 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | 242-292 tok/s | 25.4-25.5 tok/s | Pi tool flow passed |
+| Qwen3.8-27B | UD-Q4_K_M, 15.33 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | 266.2 tok/s | 38.7-44.1 tok/s | patched Pi tool flow passed |
 | Qwen3.8-27B Abliterated | UD-Q4_K_XL, 16.19 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | 17.53 tok/s on uncached `hi` | 36.55 tok/s | direct and minimal Pi transport passed; coding quality unqualified |
 | Qwen3.8-27B, two Pi sessions | same | same | one shared unified pool | concurrent | 14.0-18.8 tok/s/session while overlapping | both sessions passed and remained isolated |
 | Qwen3.8-27B, populated maximum | same | same | 262,016-token cold prompt, F16 K/V | 63.81 tok/s; TTFT 4,106.2 s | 6.18 tok/s | capacity passed; performance failed |
@@ -46,6 +47,13 @@ CUDA P2P path to the P100 domain and made the measured hot path slower when
 host-staged. It now owns the independent image service instead. Qwen uses
 about 12.5-12.7 GiB per P100 with its MTP context; Ornith uses 8.7-9.2 GiB per
 P100 without MTP.
+
+Qwen keeps up to 24 GiB of exact target-plus-MTP session state in host RAM.
+This lets Pi resume an append-only session while the server process remains
+alive: a forced slot eviction followed by a resume restored a 1,990-token
+state into an empty slot and evaluated only the 28-token suffix. The cache is
+bounded and removes obsolete or oldest entries automatically. It is not a
+disk cache and does not survive a model-service restart.
 
 ## Operation
 
@@ -202,9 +210,13 @@ Open WebUI discovers the currently resident model from the OpenAI-compatible
 endpoint; no UI configuration is tied to Qwen. See
 [web interface](docs/web-ui.md).
 
-The host uses upstream `llama.cpp` pinned by `ops/install-llama.sh`, CUDA SM60,
-NCCL 2.27.7, tensor split `1,1,1`, FlashAttention, continuous batching and a
-shared F16 KV pool. The stable `quantum-llm` repository remains separate.
+The host uses `llama.cpp` v0.4.0 and the P100 patch set pinned by
+`ops/install-llama.sh`, CUDA SM60, NCCL 2.27.7, tensor split `1,1,1`,
+FlashAttention, continuous batching and a shared F16 KV pool. Decode graph
+slots are disabled because their tensor-split embedded-MTP path failed the
+real Pi gate; two optional graph fusions with reported non-deterministic MoE
+output are also disabled. The stable `quantum-llm` repository remains
+separate.
 
 See [hardware](docs/hardware.md), [feasibility](docs/feasibility.md),
 [Qwen contract](docs/qwen3.8-contract.md),

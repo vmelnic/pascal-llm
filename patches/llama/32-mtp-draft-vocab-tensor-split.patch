@@ -1,0 +1,23 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 8d7bfae..70cde14 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1963,11 +1963,17 @@ void llama_model::build_draft_head(const llama_model_loader & ml) {
+     {
+         // gather straight into the staging buffer: pulling the whole head down first would cost
+         // an extra full-size host allocation for a tensor that is the largest one in the model
+         const size_t nb_row = ggml_row_size(output->type, n_embd_out);
+ 
++        // A tensor-split meta buffer can only be read in complete distributed chunks. Reading one
++        // vocabulary row at a time therefore aborts even though the same access is valid on a
++        // simple backend. This is startup-only work, so stage the complete head once and gather
++        // the selected rows locally. The temporary host allocation is released before inference.
++        std::vector<uint8_t> src(ggml_nbytes(output));
+         std::vector<uint8_t> dst((size_t) n_sub*nb_row);
++        ggml_backend_tensor_get(output, src.data(), 0, src.size());
+         for (int64_t i = 0; i < n_sub; ++i) {
+-            ggml_backend_tensor_get(output, dst.data() + (size_t) i*nb_row, (size_t) ids[i]*nb_row, nb_row);
++            memcpy(dst.data() + (size_t) i*nb_row, src.data() + (size_t) ids[i]*nb_row, nb_row);
+         }
+         ggml_backend_tensor_set(head, dst.data(), 0, dst.size());
+     }

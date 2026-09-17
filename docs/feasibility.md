@@ -203,9 +203,13 @@ three P100s while the image process remained resident on P40.
 ## Qwen3.8 feasibility gate
 
 Status: the custom exact-component design fails the populated-262K 15 tok/s
-prerequisite. The upstream GGUF service is useful at ordinary context sizes;
-its populated-maximum gate passed capacity but failed performance at 63.81
-prompt tok/s, 4,106.2 s TTFT and 6.18 decode tok/s.
+prerequisite. The GGUF service is useful at ordinary context sizes. On
+2026-09-17, pinned llama.cpp v0.4.0 plus the pinned SM60 patch set passed a
+bounded real Pi read-tool flow at 40.07 tok/s on the initial/tool turn and
+30.47 tok/s on the tool/final turn. The older populated-maximum gate passed
+capacity but failed performance at 63.81 prompt tok/s, 4,106.2 s TTFT and
+6.18 decode tok/s; it has not been rerun and the short-context improvement
+must not be transferred to it.
 
 ## Nemotron-3.5-Lightning-30B-A3B admission
 
@@ -470,11 +474,12 @@ Each result is a design prerequisite, not a generic benchmark:
 Failure of the representative packed operation or the complete latency
 inequality stops the Qwen path before a full runtime is built.
 
-## Deployed upstream path
+## Deployed GGUF path
 
 The production service does not integrate the rejected experimental kernels.
-It uses the approved 16,464,440,224-byte `UD-Q4_K_M` GGUF in pinned upstream
-`llama.cpp`, equally tensor-sharded over three P100s:
+It uses the approved 16,464,440,224-byte `UD-Q4_K_M` GGUF in pinned
+`llama.cpp` v0.4.0 with the pinned SM60 patch set, equally tensor-sharded over
+three P100s:
 
 ```text
 quantized GGUF artifact              16,464,440,224 bytes = 15.3337 GiB
@@ -489,8 +494,10 @@ P100s. `--ctx-size 262144 --parallel 4 --kv-unified` creates one shared pool:
 aggregate live KV population must remain within the pool even though any one
 slot may grow toward the configured maximum when the others are small.
 
-Real Pi tool-flow decode measured 25.4-25.5 tok/s at a roughly 2.4K-token
-prompt. Two overlapping Pi sessions measured 14.0-18.8 tok/s per active slot.
+The historical unpatched Pi tool flow measured 25.4-25.5 tok/s at a roughly
+2.4K-token prompt. The deployed patched gate measured 40.07 and 30.47 tok/s on
+its two bounded Pi turns. Two overlapping Pi sessions on the older runtime
+measured 14.0-18.8 tok/s per active slot.
 At 262,016 populated prompt tokens, cold prefill measured 4,105.894 s and
 full-context decode measured 6.18 tok/s. Capacity is proven; maximum-context
 performance is not. See `long-context-prefill.md` for the measured scaling and

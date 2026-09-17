@@ -1,0 +1,14 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -680,6 +680,10 @@ struct server_slot {
+                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+         }
+ 
++        if (smpl) {
++            common_perf_print(nullptr, smpl.get());
++        }
++
+         common_speculative_print_stats(spec);
+     }
+ 

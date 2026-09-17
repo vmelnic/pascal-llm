@@ -47,7 +47,7 @@ def main() -> int:
         "ENABLE_IMAGE_GENERATION": "true",
         "IMAGE_GENERATION_ENGINE": "comfyui",
         "IMAGE_GENERATION_MODEL": "pascal-llm/realvisxl.safetensors",
-        "IMAGE_SIZE": "1216x832",
+        "IMAGE_SIZE": "1024x1024",
         "IMAGE_STEPS": "50",
         "ENABLE_IMAGE_PROMPT_GENERATION": "true",
         "COMFYUI_BASE_URL": "http://host.docker.internal:8188",

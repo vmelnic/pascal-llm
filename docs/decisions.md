@@ -1,6 +1,6 @@
 # Decision ledger
 
-Status: 2026-09-14.
+Status: 2026-09-17.
 
 ## Accepted
 
@@ -21,7 +21,9 @@ Status: 2026-09-14.
   layers. It measured 28.400 ms per full-MLP equivalent and makes the
   44-expanded/20-compact MLP layout pass at a projected 34.740 ms.
 - Stop developing a custom full-model runtime after the exact 262K component
-  inequality failed. Use pinned, unmodified upstream `llama.cpp` for serving.
+  inequality failed. Serve with pinned `llama.cpp` v0.4.0 plus the pinned
+  29-patch SM60 set. The installer accepts patches only at zero fuzz and zero
+  offset, then performs a clean CUDA build.
 - Use the approved `Qwen3.8-27B-UD-Q4_K_M.gguf` artifact. This changes weight
   fidelity relative to full precision; F16 refers only to the KV cache.
 - Keep Huihui Qwen3.8-27B Abliterated UD-Q4_K_XL as an explicitly selected
@@ -51,6 +53,22 @@ Status: 2026-09-14.
   keeping Juggernaut and Animagine explicitly selectable. Do not make Qwen
   infer the checkpoint. Frontend selection is deterministic and is passed to
   ComfyUI as workflow input.
+- Keep the patch set's decode scheduler slots disabled. With tensor split and
+  embedded MTP, the first real Pi request aborted in `ggml-backend-meta.cpp`
+  at `GGML_ASSERT(bcj.nodes[i])`. `LLAMA_DEC_SLOTS=0` passed the corrected Pi
+  gate; the two graph fusions documented upstream as non-deterministic on MoE
+  also remain disabled.
+- Use a 24 GiB process-local RAM prompt cache for official Qwen. It stores and
+  restores both target and MTP state and is consumed/re-published as slots are
+  reused. Admission removes an obsolete contained prefix first, then the
+  oldest entries until the byte budget fits. It survives Pi exit/resume but
+  not a server restart; disk persistence remains unqualified.
+- Use at most four embedded-MTP proposals and a SHA-256-pinned 65,801-token
+  draft vocabulary for official Qwen. Its independent Romanian-plus-coding
+  holdout coverage is 97.8452%. The full target head still verifies and samples
+  every accepted output; only proposal coverage changes. Tensor-split startup
+  gathers the reduced head from one complete host-staged read because partial
+  row reads are invalid on the distributed meta buffer.
 
 ## Not transferable as positive evidence
 
@@ -73,6 +91,10 @@ They may be reopened only through the explicit complete-latency gate in
   over PCIe.
 - Quality-changing KV quantization, sparsification or reduced model semantics
   without explicit user approval and a quality gate.
+- CUDA backend sampling for the current Qwen tensor-split path. A real Pi turn
+  bounded all CPU sampler work at 0.165 ms per generated token, already below
+  the approved 1 ms/token prerequisite. Removing the tensor-split safety guard
+  cannot produce a material decode gain on this evidence.
 - Three-P100 scalar packed-FP4 execution for the 15 tok/s Qwen target: the real
   MLP shapes alone project to 48.689 ms/token. An exact-product FP16x2 rewrite
   regressed to 71.623 ms and was rolled back.
@@ -109,16 +131,19 @@ They may be reopened only through the explicit complete-latency gate in
 ## Open decision
 
 The original `Qwen3.8-27B + populated 262K + exact-F16 KV + >=15 tok/s` target
-is closed for the custom runtime measured here. The upstream GGUF service is
-useful at ordinary Pi context sizes and measured 25.4-25.5 tok/s decode. Its
+is closed for the custom runtime measured here. The GGUF service is useful at
+ordinary Pi context sizes. The previous unpatched runtime measured 25.4-25.5
+tok/s; the active four-token/reduced-head MTP configuration measured
+38.68-44.14 tok/s across two bounded real Pi tool-flow runs. Its
 populated-262K run passed capacity but failed performance: 4,105.894 s cold
 prefill and 6.18 tok/s decode. Do not infer maximum-context throughput from the
 short-context result or reopen the rejected custom kernel path without a new
 quantitative prerequisite.
 
 The active exact-prefill direction is append-only hybrid-state reuse, not a
-new inference engine. Qualify the existing in-memory cache with both attention
-KV and Gated DeltaNet state before adding persistence. P40 and exact Pascal
+new inference engine. Process-local RAM restore now passes a Pi resume gate
+with target and MTP state and suffix-only evaluation; populated-262K restore
+and disk persistence remain separate, unqualified gates. P40 and exact Pascal
 kernel work remain rejected for this goal because their best quantitative
 bounds do not approach the required 6.84x cold-prefill speedup. See
 `long-context-prefill.md`.

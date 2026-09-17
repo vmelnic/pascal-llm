@@ -179,9 +179,81 @@ MTP `n_max=3`, three-P100 tensor split and an idle P40. The request measured
 This is a launcher regression gate, not a replacement for the representative
 Qwen measurements below.
 
-## Upstream service and Pi qualification
+## Patched production Qwen Pi gate
 
-Runtime: upstream `llama.cpp` commit
+Date: 2026-09-17. Runtime: llama.cpp v0.4.0 commit
+`5266f24da75dc449bd56cbed7addb9c8e4a6a73e` with the 29 patches from
+`llama-cpp-p100-patches` commit
+`52469952952ee6446207acc574c72055a0685ac4`, applied at zero fuzz and zero
+offset. Decode scheduler slots were disabled after the first tensor-split MTP
+Pi request hit `GGML_ASSERT(bcj.nodes[i])`; the corrected production build ran
+with `LLAMA_DEC_SLOTS=0`. The two optional fusions reported upstream as
+non-deterministic on MoE graphs were also disabled.
+
+A bounded real Pi request loaded project instructions, used the read tool once
+on `README.md`, returned one correct sentence and stopped. No context files,
+skills or normal Pi instructions were disabled; only the tool allowlist was
+restricted to `read` to keep the gate bounded.
+
+| Turn | Prompt | Prompt rate | Generated | Decode rate | MTP acceptance |
+|---|---:|---:|---:|---:|---:|
+| initial/tool | 2,231 tokens | 260.67 tok/s | 168 tokens | 40.07 tok/s | 119/150 = 79.33% |
+| tool/final | 59 tokens | 69.54 tok/s | 358 tokens | 30.47 tok/s | 245/336 = 72.92% |
+
+The previous ordinary-context Pi qualification below measured 25.4-25.5
+tok/s on the old unpatched commit. The new result is a real improvement on the
+active Pi path, but the prompts and output lengths differ, so it is not a
+controlled percentage speedup. The populated-262K gate was not rerun.
+
+The same production service was then configured with a 24 GiB RAM prompt
+cache. A Pi session containing the codeword `cedar` was evicted from its GPU
+slot by a forced task on another slot; `/slots` reported the original slot at
+zero prompt tokens. Resuming the Pi session selected a different empty slot,
+restored a 1,990-token state, evaluated only 28 suffix tokens in 856.23 ms and
+returned `cedar`. Source inspection confirms that the cache serializes and
+restores both target and embedded-MTP state. This qualifies process-local
+append-only resume at ordinary context. It does not qualify a maximum-size
+checkpoint, disk persistence or shared active GPU state across users.
+
+### Four-token MTP and reduced draft vocabulary
+
+The same bounded Pi gate was repeated after raising the embedded-MTP proposal
+limit from three to four. With the full draft head, the two turns measured
+40.85 and 34.88 decode tok/s. This passed functionally but did not establish a
+controlled speedup because the stochastic reasoning lengths differed from the
+three-token run.
+
+The draft vocabulary was then reduced to 65,801 token IDs. It contains IDs
+0-65,535, all distinct output IDs from two historical Qwen coding sessions and
+the tokenizer special IDs. A separate Romanian-plus-coding Pi session held out
+from construction contained 79,405 output-token occurrences; 77,694 were in
+the candidate set, for 97.8452% coverage. The file is SHA-256 pinned as
+`91114dcc3c08638d1316d6442a2bff6e88752bedaecd31526bbf09a50880d455`.
+The target model still verifies every proposal; this optimization can reduce
+MTP acceptance but cannot bypass target sampling.
+
+The original row-at-a-time draft-head gather was incompatible with the
+tensor-split meta buffer and aborted during model load. The deployed local
+patch reads the complete distributed output tensor once at startup and gathers
+the selected rows in host staging memory. A clean build then passed the same
+Pi read-tool request twice:
+
+| Run | Turn | Prompt rate | Generated | Decode rate | MTP acceptance |
+|---|---|---:|---:|---:|---:|
+| qualification | initial/tool | 266.28 tok/s | 94 tokens | 43.54 tok/s | 72/92 = 78.26% |
+| qualification | tool/final | 69.19 tok/s | 356 tokens | 40.11 tok/s | 252/416 = 60.58% |
+| telemetry repeat | initial/tool | 266.15 tok/s | 99 tokens | 44.14 tok/s | 76/96 = 79.17% |
+| telemetry repeat | tool/final | 69.15 tok/s | 608 tokens | 38.68 tok/s | 423/740 = 57.16% |
+
+The telemetry repeat also bounded CPU sampling. Its final turn spent 100.21 ms
+in all sampler work for 608 generated tokens, or at most 0.165 ms per generated
+token. That total includes prompt-token acceptance, so the decode-only sampler
+cost is lower. CUDA backend sampling therefore failed the precondition of more
+than 1 ms/token and was not enabled for tensor split.
+
+## Historical upstream service and Pi qualification
+
+Runtime: historical upstream `llama.cpp` commit
 `4a89937354190cef5a97baf8eeb17336105eb72d`, compiled for SM60 with NCCL
 2.27.7. Model: `Qwen3.8-27B-UD-Q4_K_M.gguf`, tensor split equally over the
 three P100s. The P40 was excluded. KV was F16 and the unified pool was
