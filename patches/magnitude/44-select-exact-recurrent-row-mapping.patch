@@ -1,0 +1,11 @@
+--- a/inference/engine/kernels/kernels/recurrent.seismic
++++ b/inference/engine/kernels/kernels/recurrent.seismic
+@@ -448,7 +448,7 @@
+     scratch mixed bytes (M * NV * W * 4)
+     scratch arrivals bytes (NV * 4) sync
+     launch gated_delta_step:
+-        params (code ROWS in [2, 4], code WARPS in [4, 8])
++        params (code ROWS in [4, 2], code WARPS in [8, 4])
+         threadgroups (NV, W / (ROWS * WARPS), B + 1)
+         threads_per_threadgroup (WARPS * 32, 1, 1)
+ 

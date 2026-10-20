@@ -1,0 +1,116 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -323,6 +323,84 @@
+         }
+     }
+ }
++
++// Paired SIMT projections share their activation read and bias sum. Product
++// and scale/bias accumulators keep each stream's original arithmetic order.
++// COLS fixes the common single/two-row loop; zero covers all other widths.
++template <int NB, int COLS, class WA, class WB, class Pro>
++__device__ __forceinline__ void gemv_accumulate_simt_pair(
++    float (&aa)[NB][4], float (&ab)[NB][4],
++    const typename WA::Raw &ra, const typename WB::Raw &rb,
++    const WA &wa, const WB &wb, const Coefficients<WA::GROUPS> &ca,
++    const Coefficients<WB::GROUPS> &cb, u32 M, u64 k0, const Pro &pro) {
++    static_assert(WA::GROUP == WB::GROUP, "shared activations need equal group widths");
++    const u32 t = threadIdx.x % 4;
++    constexpr int STEPS = WA::GROUP / 16;
++#pragma unroll
++    for (int group = 0; group < WA::GROUPS; ++group) {
++        float2 a[STEPS][4], b[STEPS][4];
++#pragma unroll
++        for (int j = 0; j < STEPS; ++j) {
++            wa.template decode<packets::OpSIMT<Act>>(ra, group * STEPS + j, a[j]);
++            wb.template decode<packets::OpSIMT<Act>>(rb, group * STEPS + j, b[j]);
++        }
++#pragma unroll
++        for (int nb = 0; nb < NB; ++nb)
++        for (u32 column = 0; column < (COLS ? COLS : 8) && 8 * nb + column < M; ++column) {
++            const u32 m = 8 * nb + column;
++            float p[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
++            float sum = 0.0f;
++#pragma unroll
++            for (int j = 0; j < STEPS; ++j) {
++                const u64 k = k0 + 16 * (group * STEPS + j) + 2 * t;
++                const float2 x[2] = {Op::unpack(pro.pair(nullptr, m, k)),
++                                     Op::unpack(pro.pair(nullptr, m, k + 8))};
++#pragma unroll
++                for (int half = 0; half < 2; ++half) {
++#pragma unroll
++                    for (int row = 0; row < 2; ++row) {
++                        const float2 va = a[j][2 * half + row];
++                        const float2 vb = b[j][2 * half + row];
++                        p[0][row] = seismic_fma_rn(va.x, x[half].x, p[0][row]);
++                        p[0][row] = seismic_fma_rn(va.y, x[half].y, p[0][row]);
++                        p[1][row] = seismic_fma_rn(vb.x, x[half].x, p[1][row]);
++                        p[1][row] = seismic_fma_rn(vb.y, x[half].y, p[1][row]);
++                    }
++                    if constexpr (WA::BIAS || WB::BIAS) {
++                        sum = seismic_add_rn(sum, x[half].x);
++                        sum = seismic_add_rn(sum, x[half].y);
++                    }
++                }
++            }
++#pragma unroll
++            for (u32 mask = 1; mask <= 2; mask *= 2) {
++#pragma unroll
++                for (int row = 0; row < 2; ++row) {
++                    p[0][row] = seismic_add_rn(p[0][row], seismic_shfl_xor_f32(p[0][row], mask));
++                    p[1][row] = seismic_add_rn(p[1][row], seismic_shfl_xor_f32(p[1][row], mask));
++                }
++                if constexpr (WA::BIAS || WB::BIAS)
++                    sum = seismic_add_rn(sum, seismic_shfl_xor_f32(sum, mask));
++            }
++            if (t == column / 2) {
++#pragma unroll
++                for (int row = 0; row < 2; ++row) {
++                    float av = column % 2 == 0 ? aa[nb][2 * row] : aa[nb][2 * row + 1];
++                    float bv = column % 2 == 0 ? ab[nb][2 * row] : ab[nb][2 * row + 1];
++                    av = seismic_fma_rn(ca.scale[row][group], p[0][row], av);
++                    bv = seismic_fma_rn(cb.scale[row][group], p[1][row], bv);
++                    if constexpr (WA::BIAS) av = seismic_fma_rn(-ca.bias[row][group], sum, av);
++                    if constexpr (WB::BIAS) bv = seismic_fma_rn(-cb.bias[row][group], sum, bv);
++                    if (column % 2 == 0) {
++                        aa[nb][2 * row] = av; ab[nb][2 * row] = bv;
++                    } else {
++                        aa[nb][2 * row + 1] = av; ab[nb][2 * row + 1] = bv;
++                    }
++                }
++            }
++        }
++    }
++}
+ #endif
+ 
+ template <int NB, class W>
+@@ -423,7 +501,6 @@
+ #pragma unroll
+                 for (int group = 0; group < WA::GROUPS; ++group)
+                     wa.coefficient(tile * 16 + g + 8 * r, kb, group, ca.scale[r][group], ca.bias[r][group]);
+-            gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
+             if constexpr (PAIR) {
+                 const auto raw_b = wb.fetch(tile, kb, lane);
+                 Coefficients<WB::GROUPS> cb;
+@@ -432,7 +509,19 @@
+ #pragma unroll
+                     for (int group = 0; group < WB::GROUPS; ++group)
+                         wb.coefficient(tile * 16 + g + 8 * r, kb, group, cb.scale[r][group], cb.bias[r][group]);
+-                gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
+             }
+         }
+     }

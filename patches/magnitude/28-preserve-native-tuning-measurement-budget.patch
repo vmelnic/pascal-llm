@@ -1,0 +1,137 @@
+--- a/inference/engine/executor/src/native/tuning/mod.rs
++++ b/inference/engine/executor/src/native/tuning/mod.rs
+@@ -211,6 +211,9 @@
+ pub const SEARCH_VERSION: u32 = 16;
+ /// The time one preparation spends tuning, on any device.
+ pub const TUNING_TIME: Duration = Duration::from_secs(60);
++/// Opt-in preparation for devices whose cold formation exceeds the normal
++/// search budget. Compilation remains visible in startup wall time.
++const EXTENDED_TUNING_TIME: Duration = Duration::from_secs(600);
+ /// A unit's search may take `1 / ADMISSION_SHARE` of its budget to admit
+ /// points beyond its census's, building them and measuring the defaults
+ /// there, leaving the rest to search: about as many evaluations of its
+@@ -1226,6 +1229,8 @@
+     phase: Phase,
+     /// When the census began: the start of the tuning time.
+     started: Instant,
++    extended: bool,
++    budget: Duration,
+     tuned: Vec<TunedEntry>,
+     chosen: HashMap<TuningKey, NativeSpecialization>,
+     /// The latest choice for each parameter declaration of an entry, a start
+@@ -1241,6 +1246,8 @@
+         limits: TuningLimits,
+         weights: TuningWeights<'a>,
+     ) -> Self {
++        let extended = std::env::var_os("MAGNITUDE_EXTENDED_TUNING")
++            .is_some_and(|value| value == "1");
+         Self {
+             device,
+             context,
+@@ -1255,6 +1262,8 @@
+                 searching: Vec::new(),
+             },
+             started: Instant::now(),
++            extended,
++            budget: if extended { EXTENDED_TUNING_TIME } else { TUNING_TIME },
+             tuned: Vec::new(),
+             chosen: HashMap::new(),
+             winners: HashMap::new(),
+@@ -1331,12 +1340,16 @@
+             searching,
+             unsearched,
+         };
++        if self.extended {
++            // Census preparation must not exhaust the search before it starts.
++            self.started = Instant::now();
++        }
+         self
+     }
+ 
+     /// Report the tuning time spent so far, of [`TUNING_TIME`].
+     fn report_progress(&self) {
+-        let total = TUNING_TIME.as_millis() as usize;
++        let total = self.budget.as_millis() as usize;
+         self.context.observer.event(&TuningEvent::Progress {
+             completed: (self.started.elapsed().as_millis() as usize).min(total),
+             total,
+@@ -1457,7 +1470,11 @@
+             return Ok(None);
+         }
+         let plan = CensusPlan {
+-            limit: TUNING_TIME.saturating_sub(self.started.elapsed()),
++            limit: if self.extended {
++                TUNING_TIME
++            } else {
++                self.budget.saturating_sub(self.started.elapsed())
++            },
+             min_sample_seconds: MIN_SAMPLE_SECONDS,
+         };
+         #[cfg(feature = "pinned-tuning")]
+@@ -1531,7 +1548,7 @@
+             .remove(&key)
+             .ok_or_else(|| failure("the tuning census did not measure this unit".into()))?;
+         let budget = if *unsearched > 0. {
+-            TUNING_TIME
++            self.budget
+                 .saturating_sub(self.started.elapsed())
+                 .mul_f64((unit.share / *unsearched).min(1.))
+         } else {
+@@ -1583,6 +1600,11 @@
+                 .map_err(failure)?
+             }
+         };
++        if self.extended {
++            // Formation is setup, not a kernel measurement. Keep the global
++            // allowance consistent with the factored search's paused clock.
++            self.started += Duration::from_secs_f64(result.time.forming_seconds);
++        }
+         #[cfg(feature = "tuning-survey")]
+         if surveyed {
+             survey::record(&key, budget, &result).map_err(failure)?;
+@@ -1636,7 +1658,17 @@
+         ));
+         let hit = cache
+             .tuning(&key)
+-            .filter(|result| case.stored_valid(self.device, &result.overall.specialization()));
++            .filter(|result| case.stored_valid(self.device, &result.overall.specialization()))
++            .filter(|result| {
++                !self.extended || !matches!(
++                    &result.method,
++                    seismic::TuningMethod::Census if result.configurations.is_empty()
++                ) && !matches!(
++                    &result.method,
++                    seismic::TuningMethod::Factored { complete: false, .. }
++                        if result.configurations.len() <= 1
++                )
++            });
+         Ok(Some((cache, key, hit)))
+     }
+ 
+--- a/inference/seismic/runtime/src/native/tune.rs
++++ b/inference/seismic/runtime/src/native/tune.rs
+@@ -2128,7 +2128,7 @@
+         implementation,
+         default,
+         search,
+-        window,
++        mut window,
+     } = request;
+     // Until the seed is measured, the whole window; then the window less
+     // what confirming the finalists against the seed needs.
+@@ -2150,7 +2150,14 @@
+         &partition.sources,
+     )
+     .map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(prepare_message(error))))?;
+-    time.forming_seconds += began.elapsed().as_secs_f64();
++    let forming = began.elapsed();
++    time.forming_seconds += forming.as_secs_f64();
++    if std::env::var_os("MAGNITUDE_EXTENDED_TUNING").is_some_and(|value| value == "1") {
++        // A cold all-variant compile can take longer than the entire normal
++        // allowance. Start the measurement window after that setup work.
++        window += forming;
++        deadline += forming;
++    }
+     let form = |specialization: &NativeSpecialization| {
+         NativePrepared::prepare_implementation(
+             device,

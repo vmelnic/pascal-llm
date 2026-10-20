@@ -1,0 +1,36 @@
+diff --git a/inference/engine/kernels/tests/cuda_recurrent.rs b/inference/engine/kernels/tests/cuda_recurrent.rs
+index 5b3fb65..e81cec5 100644
+--- a/inference/engine/kernels/tests/cuda_recurrent.rs
++++ b/inference/engine/kernels/tests/cuda_recurrent.rs
+@@ -517,6 +517,31 @@ fn cuda_chunk_every_catalog_value_head_count_matches_the_host_model() {
+     }
+ }
+ 
++/// The 32-row scan fits the 48 KiB shared-memory limit at width 128.
++/// Cover the served value-head counts, including 48, against the independent
++/// host model. This keeps the catalog test's oracle and numerical bounds.
++#[test]
++fn cuda_chunk_32_rows_matches_the_host_model() {
++    let Some(device) = cuda() else { return };
++    for value_heads in [16, 32, 48, 64] {
++        let geometry = Geometry {
++            value_heads,
++            ..QWEN_4B
++        };
++        let case =
++            Case::new(geometry, 128, vec![slot(128, 100, 1, 3)], false, 23).with_bf16_activations();
++        let host = case.host();
++        let chunked = case.cuda(&device, Element::bf16(), Mapping::Chunk(32));
++        check(
++            &format!("NK 16 NV {value_heads} prefill 128: cuda chunk ROWS 32"),
++            &case,
++            &chunked,
++            &host,
++            (1.5e-2, 3e-3),
++        );
++    }
++}
++
+ /// Device time per call at the 4B geometry (one layer), each slot in its own
+ /// bank pair: decode, MTP verify (2-16 rows per slot, alone and 8 batched)
+ /// and prefill, the step up to 16 rows per slot and the chunk from 2 rows. Calls

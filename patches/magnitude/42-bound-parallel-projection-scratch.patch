@@ -1,0 +1,129 @@
+--- a/inference/seismic/runtime/src/api.rs
++++ b/inference/seismic/runtime/src/api.rs
+@@ -357,6 +357,7 @@
+         pub(crate) native: crate::native::NativeQueue,
+         pub(crate) projection_peers: std::sync::Mutex<Vec<std::sync::Weak<DeviceInner>>>,
+         pub(crate) projection_constants: std::sync::Mutex<std::collections::HashMap<(u64,u64,u64),std::sync::Weak<Allocation>>>,
++        pub(crate) projection_scratch: std::sync::Mutex<std::collections::HashMap<u64,Arc<Allocation>>>,
+     }
+     impl DeviceInner {
+         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
+--- a/inference/seismic/runtime/src/backends.rs
++++ b/inference/seismic/runtime/src/backends.rs
+@@ -510,6 +510,7 @@
+         native: crate::native::NativeQueue::default(),
+         projection_peers: std::sync::Mutex::new(Vec::new()),
+         projection_constants: std::sync::Mutex::new(std::collections::HashMap::new()),
++        projection_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
+     }))
+ }
+ 
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -98,6 +98,24 @@
+     let allocation=device.kind.allocate(bytes.max(1),16).map_err(CallError::Execution)?;
+     builder.retain(allocation.clone());Ok(allocation)
+ }
++/// One arena per source queue and peer. Graph fork/join plus source-stream
++/// order serializes frame reuse; different source queues never share a frame.
++fn scratch(source:&Arc<DeviceInner>,peer:&Arc<DeviceInner>,bytes:u64,builder:&mut DirectGraphBuilder)->Result<Arc<Allocation>,CallError> {
++    let key=source.kind.identity().0;
++    let mut arenas=peer.projection_scratch.lock().expect("projection scratch cache lock poisoned");
++    if let Some(arena)=arenas.get(&key).filter(|arena|arena.bytes()>=bytes) {
++        builder.retain(arena.clone());return Ok(arena.clone());
++    }
++    let capacity=bytes.max(16).checked_next_power_of_two().ok_or_else(||invalid("projection scratch capacity overflows"))?;
++    let arena=allocate(peer,capacity,builder)?;
++    arenas.insert(key,arena.clone());Ok(arena)
++}
++fn frame_region(cursor:&mut u64,bytes:u64)->Result<u64,CallError> {
++    let offset=*cursor;
++    let aligned=bytes.checked_add(15).ok_or_else(||invalid("projection frame alignment overflows"))? & !15;
++    *cursor=cursor.checked_add(aligned).ok_or_else(||invalid("projection frame extent overflows"))?;
++    Ok(offset)
++}
+ fn constant(source:&Arc<DeviceInner>,peer:&Arc<DeviceInner>,allocation:&Allocation,offset:u64,bytes:u64,builder:&mut DirectGraphBuilder)->Result<Arc<Allocation>,CallError> {
+     let key=(allocation.identity(),offset,bytes);
+     let mut cache=peer.projection_constants.lock().expect("projection constant cache lock poisoned");
+@@ -125,6 +143,23 @@
+     let peers=source.projection_peers.lock().expect("projection peer registry lock poisoned").iter().map(std::sync::Weak::upgrade).collect::<Option<Vec<_>>>();
+     let Some(peers)=peers.filter(|peers|peers.len()>1) else {return Ok(false);};
+     let Some(spec)=Spec::from(dispatch,ordinal)? else {return Ok(false);};
++    let mut inputs=spec.inputs.clone();
++    inputs.extend(spec.constants.iter().filter(|v|v.extents.len()==1 && !buffers[v.buffer].0.storage().read_only() && v.bytes!=0).map(|v|(v.buffer,v.bytes)));
++    inputs.sort_unstable();inputs.dedup_by_key(|entry|entry.0);
++    let mut frame_bytes=0u64;let mut input_regions=Vec::new();
++    for (index,bytes) in inputs {
++        if bytes==0 {continue;}
++        let (allocation,offset)=buffers[index];let buffer=typed_buffer::<Cuda,Executor>(allocation);
++        if offset.checked_add(bytes).is_none_or(|end|end>buffer.len()) {return Err(invalid("projection input copy exceeds its sealed backing"));}
++        let frame_offset=frame_region(&mut frame_bytes,bytes)?;
++        input_regions.push((index,bytes,frame_offset));
++    }
++    let mut output_regions=std::collections::HashMap::new();
++    for output in &spec.outputs {
++        if output_regions.contains_key(&output.buffer) {continue;}
++        let bytes=output.rows.checked_mul(output.pitch).ok_or_else(||invalid("projection output scratch overflows"))?;
++        output_regions.insert(output.buffer,frame_region(&mut frame_bytes,bytes)?);
++    }
+     let source_cuda=cuda(source)?;let dependencies=builder.dependencies();let mut terminals=Vec::new();
+     for (owner,peer) in peers.iter().enumerate() {
+         let device=cuda(peer)?;device.enable_peer_reader(source_cuda).map_err(CallError::Execution)?;
+@@ -142,30 +177,17 @@
+                 pointers[view.buffer]=typed_buffer::<Cuda,Executor>(&copy).pointer();copied.push(copy);
+             }
+         }
++        let arena=if remote {Some(scratch(source,peer,frame_bytes,builder)?)} else {None};
++        let arena_base=arena.as_ref().map(|allocation|typed_buffer::<Cuda,Executor>(allocation).pointer()).unwrap_or(0);
+         if remote {
+-            let mut inputs=spec.inputs.clone();
+-            // Row-selector/other invocation arrays can be mapped host uploads.
+-            // Copy their exact view; residual F32 reads remain explicit peers.
+-            inputs.extend(spec.constants.iter().filter(|v|v.extents.len()==1 && !buffers[v.buffer].0.storage().read_only() && v.bytes!=0).map(|v|(v.buffer,v.bytes)));
+-            inputs.sort_unstable();inputs.dedup_by_key(|entry|entry.0);
+-            for (index,bytes) in inputs {
+-                if bytes==0 {continue;}
++            for &(index,bytes,frame_offset) in &input_regions {
+                 let (allocation,offset)=buffers[index];let buffer=typed_buffer::<Cuda,Executor>(allocation);
+-                if offset.checked_add(bytes).is_none_or(|end|end>buffer.len()) {return Err(invalid("projection input copy exceeds its sealed backing"));}
+-                let copy=allocate(peer,bytes,builder)?;let destination=typed_buffer::<Cuda,Executor>(&copy).pointer();
++                let destination=arena_base+frame_offset;
+                 let host=buffer.mapped_host_pointer().map(|host|host+offset);
+                 let node=builder.copy_after(device,buffer.pointer()+offset,host,destination,bytes,1,bytes,bytes,&dependencies).map_err(CallError::Execution)?;
+-                pointers[index]=destination;input_nodes.push(node);copied.push(copy);
+-            }
+-        }
+-        let mut output_buffers=std::collections::HashMap::<usize,Arc<Allocation>>::new();
+-        if remote {
+-            for output in &spec.outputs {
+-                let bytes=output.rows.checked_mul(output.pitch).ok_or_else(||invalid("projection output scratch overflows"))?;
+-                if !output_buffers.contains_key(&output.buffer) {
+-                    let copy=allocate(peer,bytes,builder)?;pointers[output.buffer]=typed_buffer::<Cuda,Executor>(&copy).pointer();output_buffers.insert(output.buffer,copy);
+-                }
+-            }
++                pointers[index]=destination;input_nodes.push(node);
++            }
++            for (&index,&frame_offset) in &output_regions {pointers[index]=arena_base+frame_offset;}
+         }
+         let mut before=dependencies.clone();before.extend(input_nodes);
+         let parallel=DirectLaunch {module:&module,function:launch.function,buffers:launch.buffers,pointer_overrides:Some(&pointers),words:launch.words,scalar_results:launch.scalar_results,grid:launch.grid,block:launch.block,shared_bytes:launch.shared_bytes};
+@@ -176,8 +198,8 @@
+             let (begin,end)=row_range(output.columns,owner,peers.len());if begin==end {continue;}
+             let offset=(output.first+begin).checked_mul(output.element_bytes).ok_or_else(||invalid("projection gather offset overflows"))?;
+             let width=(end-begin)*output.element_bytes;
+-            let allocation=output_buffers.get(&output.buffer).expect("projection output was allocated");
+-            let from=typed_buffer::<Cuda,Executor>(allocation).pointer()+offset;
++            let frame_offset=*output_regions.get(&output.buffer).expect("projection output frame was sealed");
++            let from=arena_base+frame_offset+offset;
+             let (target,target_offset)=buffers[output.buffer];let destination=typed_buffer::<Cuda,Executor>(target).pointer()+target_offset+offset;
+             let node=builder.copy_after(device,from,None,destination,width,output.rows,output.pitch,output.pitch,&[kernel]).map_err(CallError::Execution)?;
+             gathers.push(node);
+@@ -186,7 +208,7 @@
+         // The graph retains copied input and output allocations independently
+         // of the source session's invocation lifetime.
+         for allocation in copied {builder.retain(allocation);}
+-        for allocation in output_buffers.into_values() {builder.retain(allocation);}
++        if let Some(arena)=arena {builder.retain(arena);}
+     }
+     if !terminals.is_empty() {builder.join(terminals);}
+     Ok(true)

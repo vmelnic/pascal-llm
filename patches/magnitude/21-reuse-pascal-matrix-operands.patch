@@ -1,0 +1,43 @@
+--- a/inference/seismic/runtime/src/native/cuda_prelude.cuh
++++ b/inference/seismic/runtime/src/native/cuda_prelude.cuh
+@@ -532,22 +532,25 @@
+ __device__ __forceinline__ void seismic_mma_m16n8k16_simt(
+     float (&acc)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
+     const unsigned lane = seismic_lane_id();
++    // Share operands, not sums: each accumulator keeps its identical
++    // ascending-K FMA sequence while independent outputs are interleaved.
+     #pragma unroll
+-    for (unsigned output = 0; output < 4; ++output) {
+-        const unsigned row = lane / 4 + 8 * (output / 2);
+-        const unsigned column = 2 * (lane % 4) + output % 2;
+-        #pragma unroll
+-        for (unsigned k = 0; k < 16; ++k) {
+-            const unsigned ap = seismic_shfl_idx_u32(
+-                a[2 * (k / 8) + output / 2], (row % 8) * 4 + (k % 8) / 2);
+-            const unsigned bp = seismic_shfl_idx_u32(
+-                b[k / 8], column * 4 + (k % 8) / 2);
+-            const unsigned short av = (unsigned short)(ap >> (16 * (k % 2)));
+-            const unsigned short bv = (unsigned short)(bp >> (16 * (k % 2)));
+-            acc[output] = seismic_fma_rn(
+-                BF16 ? seismic_bf16_to_f32(av) : seismic_f16_to_f32(av),
+-                BF16 ? seismic_bf16_to_f32(bv) : seismic_f16_to_f32(bv), acc[output]);
+-        }
++    for (unsigned k = 0; k < 16; ++k) {
++        const unsigned source_a = (lane / 4) * 4 + (k % 8) / 2;
++        const unsigned source_b = (2 * (lane % 4)) * 4 + (k % 8) / 2;
++        const unsigned shift = 16 * (k % 2);
++        const unsigned short a0_bits = (unsigned short)(seismic_shfl_idx_u32(a[2 * (k / 8)], source_a) >> shift);
++        const unsigned short a1_bits = (unsigned short)(seismic_shfl_idx_u32(a[2 * (k / 8) + 1], source_a) >> shift);
++        const unsigned short b0_bits = (unsigned short)(seismic_shfl_idx_u32(b[k / 8], source_b) >> shift);
++        const unsigned short b1_bits = (unsigned short)(seismic_shfl_idx_u32(b[k / 8], source_b + 4) >> shift);
++        const float a0 = BF16 ? seismic_bf16_to_f32(a0_bits) : seismic_f16_to_f32(a0_bits);
++        const float a1 = BF16 ? seismic_bf16_to_f32(a1_bits) : seismic_f16_to_f32(a1_bits);
++        const float b0 = BF16 ? seismic_bf16_to_f32(b0_bits) : seismic_f16_to_f32(b0_bits);
++        const float b1 = BF16 ? seismic_bf16_to_f32(b1_bits) : seismic_f16_to_f32(b1_bits);
++        acc[0] = seismic_fma_rn(a0, b0, acc[0]);
++        acc[1] = seismic_fma_rn(a0, b1, acc[1]);
++        acc[2] = seismic_fma_rn(a1, b0, acc[2]);
++        acc[3] = seismic_fma_rn(a1, b1, acc[3]);
+     }
+ }
+ 

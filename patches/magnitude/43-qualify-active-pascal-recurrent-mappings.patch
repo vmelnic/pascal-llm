@@ -1,0 +1,30 @@
+--- a/inference/engine/kernels/tests/cuda_recurrent.rs
++++ b/inference/engine/kernels/tests/cuda_recurrent.rs
+@@ -628,3 +628,27 @@
+         chunk.call(t.chunk_args(&prefill)).unwrap();
+     }
+ }
++
++#[test]
++#[ignore = "active Pascal throughput gate; run explicitly on an idle device"]
++fn pascal_active_recurrent_mapping_gate() {
++    let Some(device) = cuda() else { panic!("CUDA gate device unavailable") };
++    let options=seismic::MeasureOptions {samples:7,min_sample_seconds:0.001};
++    for rows in [2usize,4] {
++        let geometry=Geometry {key_heads:16,value_heads:48,width:128,convolution:4,banks:4,tape:16};
++        let case=Case::new(geometry,rows,vec![slot(rows,1,1,2)],false,57).with_bf16_activations();
++        let reference=case.cuda(&device,Element::bf16(),Mapping::Step(2,4));
++        let mut rotation=(0..16).map(|_|case.tensors(&device,Element::bf16())).collect::<Vec<_>>();
++        for mapping in STEPS {
++            let actual=case.cuda(&device,Element::bf16(),Mapping::Step(mapping.0,mapping.1));
++            for (label,expected,found) in [("gated",&reference.gated,&actual.gated),("window",&reference.window,&actual.window),("state",&reference.delta,&actual.delta),("tape",&reference.tape,&actual.tape)] {
++                assert_eq!(expected.len(),found.len());
++                assert!(expected.iter().zip(found).all(|(a,b)|a.to_bits()==b.to_bits()),"{label} bits changed rows={rows} mapping={mapping:?}");
++            }
++            let kernel=case.cuda_step(&device,Element::bf16(),mapping);
++            let args=rotation.iter_mut().map(|t|t.step_args(&case)).collect();
++            let measured=kernel.measure(args,&options).unwrap();
++            println!("pascal-mapping rows={rows} ROWS={} WARPS={} seconds={:.9} exact_state_window_tape_gated=true",mapping.0,mapping.1,measured.median);
++        }
++    }
++}

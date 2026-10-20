@@ -1,0 +1,105 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -264,10 +264,8 @@
+ template <int NB, class W, class Pro>
+ __device__ __forceinline__ void gemv_accumulate_simt(
+     float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
+-    const typename W::Block &block, int q, u32 M, u64 k0, const Pro &pro) {
++    const Coefficients<W::GROUPS> &coefficients, u32 M, u64 k0, const Pro &pro) {
+     const u32 t = threadIdx.x % 4;
+-    Coefficients<W::GROUPS> coefficients;
+-    w.coefficients(block, q, coefficients);
+     constexpr int STEPS = W::GROUP / 16;
+ #pragma unroll
+     for (int group = 0; group < W::GROUPS; ++group) {
+@@ -372,10 +370,10 @@
+ // One warp of a tile group: tiles [tile0, tile0 + TPW) of a segment with
+ // `tiles` tiles and `rows` valid rows, superblock share `part` of KSPLIT, for
+ // M <= 8 * NB activation rows (column block nb holds rows 8 nb .. 8 nb + 7).
+-// Each iteration decodes one superblock (4 k-blocks) while the codes and
+-// packed coefficients of the next are in flight in registers. `ready()`
++// Tensor-core iterations pipeline superblocks (4 k-blocks); Pascal streams
++// one k-block to bound retained registers. `ready()`
+ // returns the activation source, which reads its A operands in place
+-// (`pair`); it runs once the first superblock's weight loads are issued, so
++// (`pair`); on the tensor-core path it follows the first weight loads, so
+ // it may wait for the previous launch (`seismic_dependency_wait`) while they
+ // are in flight. A group past the segment (tile0 >= tiles) loads nothing but
+ // still runs `ready()`, which may be block-collective. `reduce` is the
+@@ -403,6 +401,42 @@
+     const u64 superblocks = (kblocks + 3) / 4;
+     const u64 begin = superblocks * part / KSPLIT;
+     const u64 end = superblocks * (part + 1) / KSPLIT;
++#if __CUDA_ARCH__ < 800
++    // The SIMT path streams one k-block. Holding two superblocks for both
++    // streams limits Pascal occupancy through register pressure.
++    const auto pro = ready();
++    static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
++    if (tile0 >= tiles)
++        return;
++    const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
++#pragma unroll 1
++    for (u64 kb = 4 * begin; kb < last; ++kb) {
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto raw_a = wa.fetch(tile, kb, lane);
++            Coefficients<WA::GROUPS> ca;
++#pragma unroll
++            for (int r = 0; r < 2; ++r)
++#pragma unroll
++                for (int group = 0; group < WA::GROUPS; ++group)
++                    wa.coefficient(tile * 16 + g + 8 * r, kb, group, ca.scale[r][group], ca.bias[r][group]);
++            gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            if constexpr (PAIR) {
++                const auto raw_b = wb.fetch(tile, kb, lane);
++                Coefficients<WB::GROUPS> cb;
++#pragma unroll
++                for (int r = 0; r < 2; ++r)
++#pragma unroll
++                    for (int group = 0; group < WB::GROUPS; ++group)
++                        wb.coefficient(tile * 16 + g + 8 * r, kb, group, cb.scale[r][group], cb.bias[r][group]);
++                gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++            }
++        }
++    }
++#else
+     // Codes and packed coefficients of one superblock of the group's tiles.
+     struct Stage {
+         typename WA::Super ra[TPW];
+@@ -438,17 +472,6 @@
+             if (4 * sb + q >= kblocks)
+                 break;
+             const u64 k0 = (4 * sb + q) * 64;
+-#if __CUDA_ARCH__ < 800
+-#pragma unroll
+-            for (int i = 0; i < TPW; ++i)
+-                if (tile0 + i < tiles) {
+-                    gemv_accumulate_simt<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa,
+-                                            stage.ba[i], q, M, k0, pro);
+-                    if constexpr (PAIR)
+-                        gemv_accumulate_simt<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb,
+-                                                stage.bb[i], q, M, k0, pro);
+-                }
+-#else
+             u32 b[NB][4][2];
+ #pragma unroll
+             for (int nb = 0; nb < NB; ++nb) {
+@@ -493,7 +516,6 @@
+                     if constexpr (PAIR)
+                         gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums);
+                 }
+-#endif
+         }
+     };
+     for (u64 sb = begin; sb < end; ++sb) {
+@@ -503,6 +525,7 @@
+         compute(current, sb);
+         current = next;
+     }
++#endif
+     if constexpr (KSPLIT > 1) {
+         constexpr int VALUES = 2 * TPW * NB * 4;
+ #pragma unroll

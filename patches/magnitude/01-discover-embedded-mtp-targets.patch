@@ -1,0 +1,80 @@
+diff --git a/design/model-management/catalog-and-acquisition.md b/design/model-management/catalog-and-acquisition.md
+index f3d9b07..aa4c499 100644
+--- a/design/model-management/catalog-and-acquisition.md
++++ b/design/model-management/catalog-and-acquisition.md
+@@ -302,8 +302,10 @@ process-local download state to the [local-model product projection](./local-mod
+ They do not persist provider offerings or serving configurations.
+ 
+ Every independently servable, unambiguous external Hugging Face artifact contributes a discovery
+-row under its canonical `hf:` `ModelId`. Installed catalog targets are attributed to their complete
+-catalog `ModelId` by the exact mapping defined in
++row under its canonical `hf:` `ModelId`. A target containing embedded MTP remains a discovery
++candidate under its original filename; `mtp` in a filename does not establish a draft-only role.
++Explicit draft metadata still excludes a companion from standalone discovery. Installed catalog
++targets are attributed to their complete catalog `ModelId` by the exact mapping defined in
+ [Intrinsic catalog target mapping](./intrinsic-target-mapping.md). One catalog product row retains
+ curated presentation across target, repository, and drafter changes.
+ 
+diff --git a/inference/service/models/src/inventory.rs b/inference/service/models/src/inventory.rs
+index 14438aa..826f537 100644
+--- a/inference/service/models/src/inventory.rs
++++ b/inference/service/models/src/inventory.rs
+@@ -1569,10 +1569,12 @@ fn is_execution_companion(path: &Path, name: &str) -> bool {
+         || is_execution_companion_name(name)
+ }
+ 
++// Embedded MTP does not make a complete target a draft-only artifact.
++// The metadata role check above still excludes explicitly identified drafters.
+ fn is_execution_companion_name(name: &str) -> bool {
+     name.trim_end_matches(".gguf")
+         .split(|character: char| !character.is_ascii_alphanumeric())
+-        .any(|part| matches!(part, "dflash" | "dspark" | "draft" | "eagle3" | "mtp"))
++        .any(|part| matches!(part, "dflash" | "dspark" | "draft" | "eagle3"))
+ }
+ 
+ fn components_for_group(
+@@ -2441,7 +2443,10 @@ mod tests {
+             &temporary.path().join("unlabelled-eagle-companion.gguf"),
+             &[("general.architecture", "eagle3")],
+         );
+-        write_minimal_gguf(&temporary.path().join("qwen-MTP-BF16.gguf"));
++        write_minimal_gguf_with_string_metadata(
++            &temporary.path().join("qwen-MTP-BF16.gguf"),
++            &[("general.architecture", "eagle3")],
++        );
+ 
+         let groups = discover_groups(temporary.path(), temporary.path()).unwrap();
+ 
+@@ -2455,10 +2460,31 @@ mod tests {
+         assert!(is_execution_companion_name("laguna-s-2.1-dflash-bf16.gguf"));
+         assert!(is_execution_companion_name("qwen3.5-dspark-q8.gguf"));
+         assert!(is_execution_companion_name("eagle3-qwen-4b.gguf"));
+-        assert!(is_execution_companion_name("qwen-mtp-bf16.gguf"));
++        assert!(!is_execution_companion_name("qwen-mtp-bf16.gguf"));
+         assert!(!is_execution_companion_name("draftsmanship-q4.gguf"));
+     }
+ 
++    #[test]
++    fn discovers_complete_mtp_named_targets_without_renaming() {
++        let temporary = tempfile::tempdir().unwrap();
++        let target = temporary
++            .path()
++            .join("Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ2_S-mtp.gguf");
++        write_minimal_gguf_with_string_metadata(
++            &target,
++            &[("general.architecture", "qwen35")],
++        );
++        let draft = temporary.path().join("unlabelled-mtp-draft.gguf");
++        write_minimal_gguf_with_string_metadata(
++            &draft,
++            &[("general.architecture", "eagle3")],
++        );
++
++        let groups = discover_groups(temporary.path(), temporary.path()).unwrap();
++        assert_eq!(groups.len(), 1);
++        assert_eq!(groups[0].paths, vec![target]);
++    }
++
+     #[test]
+     fn parses_hugging_face_cache_repository_directory() {
+         assert_eq!(

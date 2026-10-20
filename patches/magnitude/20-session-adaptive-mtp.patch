@@ -1,0 +1,106 @@
+--- a/inference/engine/generation/src/mtp.rs
++++ b/inference/engine/generation/src/mtp.rs
+@@ -23,6 +23,7 @@
+ pub struct Mtp {
+     identity: String,
+     proposals: usize,
++    adaptive: bool,
+ }
+ 
+ impl Mtp {
+@@ -34,6 +35,7 @@
+         Ok(Self {
+             identity: format!("mtp:{artifact}:{proposals}"),
+             proposals,
++            adaptive: std::env::var("MAGNITUDE_ADAPTIVE_MTP").ok().as_deref() == Some("1"),
+         })
+     }
+ }
+@@ -56,11 +58,15 @@
+         &self,
+         checkpoint: Option<&MethodCheckpoint>,
+     ) -> Result<Box<dyn MethodState>, String> {
+-        Ok(Box::new(DrafterState::restore(
++        let mut state = DrafterState::restore(
+             Drafter::Mtp,
+             self.proposals,
+             checkpoint,
+-        )?))
++        )?;
++        if self.adaptive {
++            state.adaptive = Some(AdaptiveDepth::new(self.proposals));
++        }
++        Ok(Box::new(state))
+     }
+ }
+ 
+@@ -104,10 +110,40 @@
+     }
+ }
+ 
++/// Request-local hint only; target verification and configured capacity are
++/// unchanged. Efficient windows avoid paying for padded verification rows.
++#[derive(Clone)]
++struct AdaptiveDepth {
++    depth: usize,
++    full_rounds: u8,
++}
++
++impl AdaptiveDepth {
++    fn new(maximum: usize) -> Self {
++        Self { depth: maximum.min(3), full_rounds: 0 }
++    }
++
++    fn observe(&mut self, proposed: usize, accepted_rows: usize, maximum: usize) {
++        // An output-budget tail is not evidence about this window's survival.
++        if proposed != self.depth || proposed == 0 { return; }
++        if accepted_rows == proposed + 1 {
++            self.full_rounds += 1;
++            if self.full_rounds == 3 {
++                self.depth = ((self.depth + 1) * 2 - 1).min(maximum);
++                self.full_rounds = 0;
++            }
++        } else {
++            self.depth = (accepted_rows.next_power_of_two() - 1).max(1).min(maximum);
++            self.full_rounds = 0;
++        }
++    }
++}
++
+ #[derive(Clone)]
+ pub(crate) struct DrafterState {
+     drafter: Drafter,
+     proposals: usize,
++    adaptive: Option<AdaptiveDepth>,
+     /// Drafter rows entered so far; the next entry row's position.
+     position: usize,
+     /// Complete pairs not yet entered; the last is the anchor.
+@@ -142,6 +178,7 @@
+         Ok(Self {
+             drafter,
+             proposals,
++            adaptive: None,
+             position: checkpoint.position,
+             pending: checkpoint.pending,
+             open: checkpoint.open,
+@@ -341,7 +378,9 @@
+             tokens: pending.tokens.clone(),
+             conditioning: pending.features.clone(),
+             position: self.position,
+-            proposals: selects[..selects.len().min(self.proposals)].to_vec(),
++            proposals: selects[..selects.len().min(
++                self.adaptive.as_ref().map_or(self.proposals, |hint| hint.depth)
++            )].to_vec(),
+             form: self.drafter.form(),
+         };
+         if operation.validate().is_err() {
+@@ -371,6 +410,9 @@
+         if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len() {
+             return Err(format!("{name} verification prefix is invalid"));
+         }
++        if let Some(hint) = &mut self.adaptive {
++            hint.observe(verification.inputs.len() - 1, accepted, self.proposals);
++        }
+         // After a replay the last replayed row's feature selected the anchor.
+         if let Some(open) = self.open.take() {
+             self.append(vec![verification.inputs[0]], open)?;

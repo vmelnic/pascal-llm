@@ -1,0 +1,929 @@
+diff --git a/design/inference/seismic-language-and-capabilities.md b/design/inference/seismic-language-and-capabilities.md
+index 7caa009..c0bab0c 100644
+--- a/design/inference/seismic-language-and-capabilities.md
++++ b/design/inference/seismic-language-and-capabilities.md
+@@ -94,7 +94,13 @@ types, packed-weight decoders and layouts, weight slot bindings — which Seismi
+ representation semantics; library files are embedded in Seismic, inlined and hashed like any include,
+ and include only each other. A Metal implementation's
+ buffers, argument words and scalar slots must fit Metal's 31-entry argument table, checked at
+-build and at preparation.
++build and at preparation. CUDA's native prelude preserves its warp-fragment and
++copy-completion ABI on Pascal using convergent SIMT matrix products, explicit F32
++round-to-nearest accumulation, software BF16 round-to-nearest-even conversion and
++synchronous shared-memory copies. An implementation substitute does not advertise
++an unavailable hardware instruction. Independent numerical qualification precedes
++any device-floor change; matrix association remains subject to the entry's existing
++numerical gate. The existing SM80 hardware paths remain selected on SM80 and later.
+ 
+ A CPU native asset is Rust compiled into the embedding binary; generated bindings give each entry a
+ typed context over its ABI and include the authored file by its path. Elements the entry stores are
+@@ -322,8 +328,11 @@ For an intrinsic signature, availability is the intersection of:
+ - shader/PTX compiler and SDK support; and
+ - implemented Seismic backend support.
+ 
+-Hardware names and raw versions never appear in kernel source. When runtime queries are
+-insufficient, a narrow compile and native-pipeline probe establishes support before selection.
++Hardware names and raw versions never appear in portable kernel source. Backend-owned
++native libraries may select ISA alternatives at formation, preserving their ABI and
++numerical contracts; software emulation never advertises the corresponding physical
++instruction. When runtime queries are insufficient, a narrow compile and native-pipeline
++probe establishes support before selection.
+ 
+ Metal device opening creates the service/queue and device legality description.
+ Analytical characterization is acquired only for analytical evaluation; feedback
+diff --git a/inference/docs/compatibility.md b/inference/docs/compatibility.md
+index fbb9d92..cae6d8e 100644
+--- a/inference/docs/compatibility.md
++++ b/inference/docs/compatibility.md
+@@ -6,8 +6,8 @@ The CPU backend is always available as the fallback.
+ 
+ ## Principles
+ 
+-- **Scope:** desktop, laptop, workstation, and datacenter hardware from roughly the last
+-  7–8 years. Older hardware and phone/mobile GPUs are out of scope.
++- **Scope:** desktop, laptop, workstation, and datacenter hardware, including
++  Pascal through the locally qualified CUDA port. Phone/mobile GPUs are out of scope.
+ - **Justified requirements:** every hard requirement must be justified by what the kernels
+   need. Any feature a kernel can work without becomes an optional tier, selected per device
+   from probed facts.
+@@ -24,7 +24,7 @@ The CPU backend is always available as the fallback.
+ | Backend | Platforms | Hardware floor | Driver / OS floor |
+ | --- | --- | --- | --- |
+ | Metal | macOS arm64 | Any Apple silicon Mac running macOS 15 | macOS 15 |
+-| CUDA | Linux x64/arm64, Windows x64 | Compute capability 8.0 (Ampere) | NVIDIA R525 (CUDA 12.0) |
++| CUDA | Linux x64/arm64, Windows x64 | Compute capability 6.0 (Pascal; port qualification below) | NVIDIA R525 (CUDA 12.0) |
+ | Vulkan | Linux x64/arm64, Windows x64 | Vulkan 1.3 device meeting the Vulkan floor (below) | Current vendor driver reporting Vulkan 1.3 |
+ | CPU | All hosts | x86-64-v2 or AArch64 | glibc 2.35 (Linux), macOS 15 |
+ 
+@@ -41,10 +41,12 @@ The CPU backend is always available as the fallback.
+ 
+ ## CUDA
+ 
+-- **Compute capability 8.0 or newer.**
++- **Compute capability 6.0 or newer.**
+ 
+   | Compute capability | Hardware |
+   | --- | --- |
++  | 6.0 / 6.1 | Tesla P100 / Pascal (SIMT native path) |
++  | 7.0 / 7.5 | Volta / Turing (SIMT native path) |
+   | 8.0 | A100, A30 |
+   | 8.6 | RTX 30 series, RTX A-series, A10, A40 |
+   | 8.7 | Jetson Orin |
+@@ -54,10 +56,11 @@ The CPU backend is always available as the fallback.
+   | 12.0 | RTX 50 series |
+   | 12.1 | GB10 (DGX Spark) |
+ 
+-  The floor exists because the kernels rely on bf16 tensor-core MMA and asynchronous
+-  global-to-shared copies (`cp.async`), both introduced with sm_80.
+-- **Excluded architectures:** Turing (RTX 20, GTX 16, T4) and Volta (V100) are excluded from
+-  CUDA and served by Vulkan. Pascal and older are not served by CUDA.
++  Below SM80, native kernels preserve their fragment ABI using SIMT F32 accumulation,
++  software BF16 conversion and synchronous shared-memory copies. Compiler tensor
++  intrinsics and matrix characterization remain unavailable there; discovery does not
++  advertise tensor cores. Hardware below SM60 remains excluded.
++  This local port has a separate qualification status below.
+ - **Two compilation routes:**
+   - Model kernels are CUDA C++ that the bundled **NVRTC 12.9** compiles on the user's machine
+     into CUBIN for the device's exact architecture.
+@@ -70,7 +73,7 @@ The CPU backend is always available as the fallback.
+     version compatibility).
+   - Discovery rejects older drivers with a typed reason.
+ - **Optional tiers:**
+-  - Driver 12.1+: 32 KiB kernel parameter space.
++  - Driver 12.1+ on Volta or newer: 32 KiB kernel parameter space; Pascal stays at 4 KiB.
+   - Driver 12.9+ on the Blackwell 10.x family: the `sm_100f` target with tcgen05 and tensor
+     memory.
+ - **Not supported while NVRTC 12.9 is bundled:**
+@@ -181,6 +184,11 @@ Apple GPUs are served by Metal. MoltenVK is not a target.
+ 
+ ## Pending conformance
+ 
++- **Local Pascal CUDA port:** native helper numerics execute on P100 SM60 with the
++  existing NVRTC 12.4 development setting. Shipped operator coverage and whole-model
++  qualification are separate gates. No throughput, multi-device placement, exact-F16
++  KV or production concurrency claim follows from the helper gate.
++
+ - **Unqualified hardware:** the Vulkan paths for 64-wide hardware (AMD GCN), for devices without
+   fp16 arithmetic (NVIDIA Pascal/Maxwell), and for NVK have been validated offline but not yet run on
+   those devices.
+diff --git a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+index 7bceffe..a2110b9 100644
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -619,9 +619,18 @@ __device__ __forceinline__ typename W::Raw gemm_raw(const W &w, const u8 *staged
+ }
+ 
+ __device__ __forceinline__ void cp_async_4_zfill(void *shared, const void *global, u32 source_bytes) {
++#if __CUDA_ARCH__ >= 800
+     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(seismic_shared_address(shared)), "l"(global),
+                  "r"(source_bytes)
+                  : "memory");
++#else
++    u8* destination = (u8*)shared;
++    const u8* source = (const u8*)global;
++    #pragma unroll
++    for (u32 byte = 0; byte < 4; ++byte) {
++        destination[byte] = byte < source_bytes ? source[byte] : 0;
++    }
++#endif
+ }
+ 
+ // One stream's part of a stage: the code chunks (TILE bytes per tile) of tiles
+diff --git a/inference/engine/kernels/tests/cuda_attention.rs b/inference/engine/kernels/tests/cuda_attention.rs
+index 54171e0..581825d 100644
+--- a/inference/engine/kernels/tests/cuda_attention.rs
++++ b/inference/engine/kernels/tests/cuda_attention.rs
+@@ -6,10 +6,17 @@
+ include!("attention.rs");
+ 
+ fn cuda() -> Option<Device> {
+-    DeviceCatalog::discover()
+-        .ok()?
+-        .open_backend(BackendName::Cuda)
+-        .ok()
++    let selected = std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() == Some("cuda");
++    let catalog = match DeviceCatalog::discover() {
++        Ok(catalog) => catalog,
++        Err(error) if selected => panic!("selected CUDA discovery failed: {error}"),
++        Err(_) => return None,
++    };
++    match catalog.open_backend(BackendName::Cuda) {
++        Ok(device) => Some(device),
++        Err(error) if selected => panic!("selected CUDA backend did not open: {error}"),
++        Err(_) => None,
++    }
+ }
+ 
+ fn cuda_decode(
+diff --git a/inference/engine/kernels/tests/cuda_common/mod.rs b/inference/engine/kernels/tests/cuda_common/mod.rs
+index a977f2f..4905b7c 100644
+--- a/inference/engine/kernels/tests/cuda_common/mod.rs
++++ b/inference/engine/kernels/tests/cuda_common/mod.rs
+@@ -7,10 +7,17 @@ use seismic::{BackendName, Device, DeviceCatalog, Element, Layout, Tensor};
+ use seismic_lang::registry::{bf16_round, f16_bits};
+ 
+ pub fn cuda() -> Option<Device> {
+-    DeviceCatalog::discover()
+-        .ok()?
+-        .open_backend(BackendName::Cuda)
+-        .ok()
++    let selected = std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() == Some("cuda");
++    let catalog = match DeviceCatalog::discover() {
++        Ok(catalog) => catalog,
++        Err(error) if selected => panic!("selected CUDA discovery failed: {error}"),
++        Err(_) => return None,
++    };
++    match catalog.open_backend(BackendName::Cuda) {
++        Ok(device) => Some(device),
++        Err(error) if selected => panic!("selected CUDA backend did not open: {error}"),
++        Err(_) => None,
++    }
+ }
+ 
+ pub struct Rng(pub u64);
+diff --git a/inference/seismic/backends/cuda/src/capability/mod.rs b/inference/seismic/backends/cuda/src/capability/mod.rs
+index 24110ad..ae63519 100644
+--- a/inference/seismic/backends/cuda/src/capability/mod.rs
++++ b/inference/seismic/backends/cuda/src/capability/mod.rs
+@@ -122,13 +122,16 @@ fn subgroup_supported(
+         .collect()
+ }
+ 
+-/// `cuda.matrix` on this profile: every implemented signature (the `sm_80`
+-/// floor guarantees `mma.sync.m16n8k16`).
++/// `cuda.matrix` requires real SM80 tensor instructions. Native SIMT helpers
++/// do not make these compiler capability signatures available on Pascal.
+ fn matrix_supported(
+     facts: &crate::profile::CudaFacts,
+     _limits: &TargetLimits,
+     dtypes: &DataTypeSupport,
+ ) -> BTreeSet<IntrinsicId> {
++    if facts.compute_capability < crate::profile::ComputeCapability::SM80 {
++        return BTreeSet::new();
++    }
+     matrix::implemented()
+         .into_iter()
+         .filter(|id| {
+diff --git a/inference/seismic/backends/cuda/src/profile.rs b/inference/seismic/backends/cuda/src/profile.rs
+index d224b29..756603c 100644
+--- a/inference/seismic/backends/cuda/src/profile.rs
++++ b/inference/seismic/backends/cuda/src/profile.rs
+@@ -52,7 +52,7 @@ use std::time::Instant;
+ 
+ /// Revision of the CUDA backend implementation: changes whenever emission,
+ /// resource rules, or the implemented intrinsic set change (§15.1).
+-pub const BACKEND_REVISION: &str = "seismic-cuda-v12";
++pub const BACKEND_REVISION: &str = "seismic-cuda-v13-sm60";
+ 
+ /// CUDA kernels receive one pointer to the backend's canonical device-side
+ /// launch frame; every interface table is reached through that pointer.
+@@ -116,6 +116,14 @@ impl KernelAbiModel<Cuda> for CudaKernelAbi {
+ const KERNEL_PARAMETER_BYTES_LARGE: u64 = 32_764;
+ const KERNEL_PARAMETER_BYTES_CLASSIC: u64 = 4_096;
+ 
++fn parameter_space(capability: ComputeCapability, driver: DriverApiVersion) -> u64 {
++    if capability.major >= 7 && driver >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
++        KERNEL_PARAMETER_BYTES_LARGE
++    } else {
++        KERNEL_PARAMETER_BYTES_CLASSIC
++    }
++}
++
+ /// Documented per-thread local memory limit of every supported compute
+ /// capability (CUDA programming guide, compute capability 2.x and later).
+ const LOCAL_BYTES_PER_THREAD: u64 = 512 * 1024;
+@@ -138,8 +146,10 @@ pub struct ComputeCapability {
+ }
+ 
+ impl ComputeCapability {
+-    /// The emission floor: PTX for `sm_80` runs forward-compatibly on every
+-    /// later device.
++    /// Native SIMT emission floor. Matrix PTX capabilities remain SM80+.
++    pub const SM60: Self = Self { major: 6, minor: 0 };
++
++    /// Tensor-core emission tier.
+     pub const SM80: Self = Self { major: 8, minor: 0 };
+ 
+     /// The first member of NVIDIA's Blackwell 10.x family. Family-specific
+@@ -229,6 +239,14 @@ pub enum PtxFeatureSet {
+ }
+ 
+ impl PtxTarget {
++    /// Scalar PTX for Pascal; no tensor-core capabilities are advertised.
++    pub const PASCAL: Self = Self {
++        isa_major: 7,
++        isa_minor: 1,
++        architecture: 60,
++        feature_set: PtxFeatureSet::Baseline,
++    };
++
+     /// PTX 7.1 for `sm_80`: the scalar baseline plus `mma.sync` m16n8k16
+     /// and `cvt.bf16`.
+     pub const BASELINE: Self = Self {
+@@ -529,9 +547,9 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
+             TargetError::UnsupportedDevice(format!("compute capability minor {minor}"))
+         })?,
+     };
+-    if compute_capability < ComputeCapability::SM80 {
++    if compute_capability < ComputeCapability::SM60 {
+         return Err(TargetError::UnsupportedDevice(format!(
+-            "{hardware}: compute capability {compute_capability} is below the sm_80 emission floor"
++            "{hardware}: compute capability {compute_capability} is below the sm_60 emission floor"
+         )));
+     }
+     let driver_api =
+@@ -542,6 +560,8 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
+     let blackwell_100_family = in_blackwell_100_family(compute_capability, driver_api);
+     let ptx = if blackwell_100_family {
+         PtxTarget::BLACKWELL_100_FAMILY
++    } else if compute_capability < ComputeCapability::SM80 {
++        PtxTarget::PASCAL
+     } else {
+         PtxTarget::BASELINE
+     };
+@@ -561,11 +581,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
+     let warp_size = unsigned(attr::WARP_SIZE)?;
+     let multiprocessors = unsigned(attr::MULTIPROCESSOR_COUNT)?;
+     let cooperative_launch = unsigned(attr::COOPERATIVE_LAUNCH)? == 1;
+-    let kernel_parameter_bytes = if driver_api >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
+-        KERNEL_PARAMETER_BYTES_LARGE
+-    } else {
+-        KERNEL_PARAMETER_BYTES_CLASSIC
+-    };
++    let kernel_parameter_bytes = parameter_space(compute_capability, driver_api);
+     let global_memory_bytes = memory as u64;
+     let facts = CudaFacts {
+         device_ordinal: ordinal,
+@@ -955,20 +971,22 @@ fn acquire_services(
+         1,
+         compute_topology,
+     )?;
+-    // One `mma.sync` is one collective warp operation, whereas ordinary
+-    // probes count one operation per participant.
+-    add_kernel(
+-        SERVICE_MATRIX,
+-        "probe_matrix",
+-        [32, 1, 1],
+-        [128, 1, 1],
+-        32_768,
+-        32,
+-        ResourceTopology {
+-            resources: sms,
+-            max_concurrency: (lanes / 32).max(1),
+-        },
+-    )?;
++    if facts.compute_capability >= ComputeCapability::SM80 {
++        // One `mma.sync` is one collective warp operation, whereas ordinary
++        // probes count one operation per participant.
++        add_kernel(
++            SERVICE_MATRIX,
++            "probe_matrix",
++            [32, 1, 1],
++            [128, 1, 1],
++            32_768,
++            32,
++            ResourceTopology {
++                resources: sms,
++                max_concurrency: (lanes / 32).max(1),
++            },
++        )?;
++    }
+     add_kernel(
+         SERVICE_REPACK,
+         "probe_repack",
+@@ -1042,7 +1060,7 @@ fn acquire_services(
+ }
+ 
+ fn probe_source(target: PtxTarget) -> String {
+-    format!(
++    let mut source = format!(
+         "{}\
+ .visible .entry probe_empty(.param .u64 output) {{ ret; }}\n\
+ .visible .entry probe_instruction(.param .u64 output) {{\n\
+@@ -1057,10 +1075,13 @@ L_instruction: add.u32 %x, %x, 1; add.u32 %i, %i, 1; setp.lt.u32 %p0, %i, 167772
+ .visible .entry probe_atomic(.param .u64 output) {{ .reg .u64 %p; .reg .u32 %i, %x; .reg .pred %q; ld.param.u64 %p, [output]; mov.u32 %i, 0; L_atomic: atom.global.add.u32 %x, [%p], 1; add.u32 %i, %i, 1; setp.lt.u32 %q, %i, 65536; @%q bra L_atomic; ret; }}\n\
+ .visible .entry probe_barrier(.param .u64 output) {{ .reg .u32 %i; .reg .pred %q; mov.u32 %i, 0; L_barrier: bar.sync 0; add.u32 %i, %i, 1; setp.lt.u32 %q, %i, 65536; @%q bra L_barrier; ret; }}\n\
+ .visible .entry probe_subgroup(.param .u64 output) {{ .reg .u64 %p; .reg .u32 %i, %x, %y; .reg .pred %q; ld.param.u64 %p, [output]; mov.u32 %x, %laneid; mov.u32 %i, 0; L_subgroup: shfl.sync.idx.b32 %y, %x, 0, 31, 0xffffffff; mov.b32 %x, %y; add.u32 %i, %i, 1; setp.lt.u32 %q, %i, 268435456; @%q bra L_subgroup; st.global.u32 [%p], %x; ret; }}\n\
+-.visible .entry probe_matrix(.param .u64 output) {{ .reg .u64 %p; .reg .b32 %a<4>, %b<2>; .reg .f32 %d<4>; .reg .u32 %i; .reg .pred %q; ld.param.u64 %p, [output]; mov.b32 %a0, 0; mov.b32 %a1, 0; mov.b32 %a2, 0; mov.b32 %a3, 0; mov.b32 %b0, 0; mov.b32 %b1, 0; mov.f32 %d0, 0f00000000; mov.f32 %d1, 0f00000000; mov.f32 %d2, 0f00000000; mov.f32 %d3, 0f00000000; mov.u32 %i, 0; L_matrix: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%d0,%d1,%d2,%d3}}, {{%a0,%a1,%a2,%a3}}, {{%b0,%b1}}, {{%d0,%d1,%d2,%d3}}; add.u32 %i, %i, 1; setp.lt.u32 %q, %i, 32768; @%q bra L_matrix; st.global.f32 [%p], %d0; ret; }}\n\
+ .visible .entry probe_repack(.param .u64 output) {{ .reg .u64 %p, %o64; .reg .u32 %i, %x, %y, %bid, %lane, %off; .reg .pred %q; ld.param.u64 %p, [output]; mov.u32 %bid, %ctaid.x; mov.u32 %lane, %tid.x; mad.lo.u32 %off, %bid, 128, %lane; cvt.u64.u32 %o64, %off; add.u64 %p, %p, %o64; ld.global.u8 %x, [%p]; mov.u32 %i, 0; L_repack: shl.b32 %y, %x, 4; or.b32 %y, %y, %x; mov.b32 %x, %y; add.u32 %i, %i, 1; setp.lt.u32 %q, %i, 1048576; @%q bra L_repack; st.global.u8 [%p], %x; ret; }}\n",
+         target.header()
+-    )
++    );
++    if target.architecture >= 80 {
++        source.push_str(".visible .entry probe_matrix(.param .u64 output) { .reg .u64 %p; .reg .b32 %a<4>, %b<2>; .reg .f32 %d<4>; .reg .u32 %i; .reg .pred %q; ld.param.u64 %p, [output]; mov.b32 %a0, 0; mov.b32 %a1, 0; mov.b32 %a2, 0; mov.b32 %a3, 0; mov.b32 %b0, 0; mov.b32 %b1, 0; mov.f32 %d0, 0f00000000; mov.f32 %d1, 0f00000000; mov.f32 %d2, 0f00000000; mov.f32 %d3, 0f00000000; mov.u32 %i, 0; L_matrix: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0,%d1,%d2,%d3}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {%d0,%d1,%d2,%d3}; add.u32 %i, %i, 1; setp.lt.u32 %q, %i, 32768; @%q bra L_matrix; st.global.f32 [%p], %d0; ret; }\n");
++    }
++    source
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -2338,6 +2359,31 @@ mod acquisition_tests {
+ mod floor_tests {
+     use super::*;
+ 
++    #[test]
++    fn pascal_parameter_limit_stays_4k_on_new_drivers() {
++        assert_eq!(
++            parameter_space(ComputeCapability::SM60, DriverApiVersion(13_000)),
++            4096
++        );
++        assert_eq!(
++            parameter_space(ComputeCapability::SM80, DriverApiVersion(12_000)),
++            4096
++        );
++        assert_eq!(
++            parameter_space(ComputeCapability::SM80, DriverApiVersion(12_010)),
++            32764
++        );
++    }
++
++    #[test]
++    fn pascal_characterization_does_not_emit_tensor_instructions() {
++        let source = probe_source(PtxTarget::PASCAL);
++        assert!(source.contains(".target sm_60"));
++        assert!(!source.contains("mma.sync"));
++        assert!(!source.contains("probe_matrix"));
++        assert!(probe_source(PtxTarget::BASELINE).contains("mma.sync"));
++    }
++
+     #[test]
+     fn the_driver_floor_is_the_bundled_nvrtc_major() {
+         assert_eq!(DriverApiVersion::MINIMUM, DriverApiVersion(12_000));
+diff --git a/inference/seismic/backends/cuda/src/ptx.rs b/inference/seismic/backends/cuda/src/ptx.rs
+index 6aac07d..9fb0351 100644
+--- a/inference/seismic/backends/cuda/src/ptx.rs
++++ b/inference/seismic/backends/cuda/src/ptx.rs
+@@ -1885,10 +1885,7 @@ impl<'a> Emitter<'a> {
+             }
+             (DType::F16 | DType::BF16, RepackValue::Float(value)) => {
+                 let bits = self.h16();
+-                self.line(format!(
+-                    "cvt.rn{}.f32 {bits}, {value};",
+-                    dtype_suffix(dtype)
+-                ));
++                self.narrow_numeric(dtype, &bits, &value);
+                 self.line(format!("st.global.u16 [{plane_base}+{offset}], {bits};"));
+             }
+             (DType::I32 | DType::U32, RepackValue::Integer(value)) => {
+@@ -3492,13 +3489,44 @@ impl<'a> Emitter<'a> {
+             )),
+         }
+     }
++    /// Native BF16 RNE conversion where the ISA has no cvt.bf16. This is
++    /// physical rounding, not the source's separately expanded Cast recipe.
++    fn narrow_numeric(&mut self, dtype: DType, out: &str, value: &str) {
++        if dtype != DType::BF16 || self.facts.compute_capability.major >= 8 {
++            self.line(format!("cvt.rn{}.f32 {out}, {value};", dtype_suffix(dtype)));
++            return;
++        }
++        let word = self.t32();
++        let absolute = self.t32();
++        let tie = self.t32();
++        let rounded = self.t32();
++        let nan = self.pred();
++        self.line(format!("mov.b32 {word}, {value};"));
++        self.line(format!("and.b32 {absolute}, {word}, 2147483647;"));
++        self.line(format!("setp.gt.u32 {nan}, {absolute}, 2139095040;"));
++        self.line(format!("shr.u32 {tie}, {word}, 16;"));
++        self.line(format!("and.b32 {tie}, {tie}, 1;"));
++        self.line(format!("add.u32 {rounded}, {word}, 32767;"));
++        self.line(format!("add.u32 {rounded}, {rounded}, {tie};"));
++        self.line(format!("shr.u32 {rounded}, {rounded}, 16;"));
++        self.line(format!("selp.u32 {rounded}, 32767, {rounded}, {nan};"));
++        self.line(format!("cvt.u16.u32 {out}, {rounded};"));
++    }
++
+     /// Decode a semantic payload only at a physical arithmetic boundary.
+     fn numeric_operand(&mut self, dtype: DType, value: &str) -> String {
+         if matches!(dtype, DType::F16 | DType::BF16) {
+             let bits = self.h16();
+             let result = self.f32();
+             self.line(format!("cvt.u16.u32 {bits}, {value};"));
+-            self.line(format!("cvt.f32{} {result}, {bits};", dtype_suffix(dtype)));
++            if dtype == DType::BF16 && self.facts.compute_capability.major < 8 {
++                let word = self.t32();
++                self.line(format!("cvt.u32.u16 {word}, {bits};"));
++                self.line(format!("shl.b32 {word}, {word}, 16;"));
++                self.line(format!("mov.b32 {result}, {word};"));
++            } else {
++                self.line(format!("cvt.f32{} {result}, {bits};", dtype_suffix(dtype)));
++            }
+             result
+         } else {
+             value.to_owned()
+@@ -3514,10 +3542,7 @@ impl<'a> Emitter<'a> {
+     fn publish_numeric(&mut self, dtype: DType, out: &str, value: &str) {
+         if matches!(dtype, DType::F16 | DType::BF16) {
+             let bits = self.h16();
+-            self.line(format!(
+-                "cvt.rn{}.f32 {bits}, {value};",
+-                dtype_suffix(dtype)
+-            ));
++            self.narrow_numeric(dtype, &bits, value);
+             self.line(format!("cvt.u32.u16 {out}, {bits};"));
+         } else if out != value {
+             self.line(format!("mov{} {out}, {value};", scalar_suffix(dtype)));
+diff --git a/inference/seismic/lang/native-library/cuda/packets.cuh b/inference/seismic/lang/native-library/cuda/packets.cuh
+index 1f56186..02f437d 100644
+--- a/inference/seismic/lang/native-library/cuda/packets.cuh
++++ b/inference/seismic/lang/native-library/cuda/packets.cuh
+@@ -75,6 +75,7 @@ struct OpBF16 {
+     __device__ static __forceinline__ u32 pack(float low, float high) { return seismic_pack_bf16x2(low, high); }
+     // Two codes (bits 0..7 and 16..23, each < 128) minus `OFFSET`.
+     template <u32 OFFSET> __device__ static __forceinline__ u32 codes(u32 pair) {
++#if __CUDA_ARCH__ >= 800
+         const u32 biased = pair | 0x43004300u;     // 128 + code
+         constexpr u32 negative = 0xC300u + OFFSET; // -(128 + OFFSET), OFFSET < 128
+         u32 value;
+@@ -82,6 +83,10 @@ struct OpBF16 {
+             : "=r"(value)
+             : "r"(biased), "r"(0x3F803F80u), "r"(negative | (negative << 16)));
+         return value;
++#else
++        return pack((float)(pair & 255u) - (float)OFFSET,
++                    (float)((pair >> 16) & 255u) - (float)OFFSET);
++#endif
+     }
+     // Signed bytes `i` of `slots_low` and `slots_high`.
+     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
+diff --git a/inference/seismic/runtime/src/native/coverage.rs b/inference/seismic/runtime/src/native/coverage.rs
+index 7cb1e08..4f1e8fc 100644
+--- a/inference/seismic/runtime/src/native/coverage.rs
++++ b/inference/seismic/runtime/src/native/coverage.rs
+@@ -189,8 +189,8 @@ impl Former {
+         match backend {
+             BackendName::Vulkan => Ok(Self::Vulkan),
+             BackendName::Cuda => {
+-                let floor = u32::from(seismic_cuda::ComputeCapability::SM80.major) * 10
+-                    + u32::from(seismic_cuda::ComputeCapability::SM80.minor);
++                let floor = u32::from(seismic_cuda::ComputeCapability::SM60.major) * 10
++                    + u32::from(seismic_cuda::ComputeCapability::SM60.minor);
+                 let architectures = seismic_cuda::nvrtc::supported_architectures()
+                     .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?
+                     .into_iter()
+diff --git a/inference/seismic/runtime/src/native/cuda_prelude.cuh b/inference/seismic/runtime/src/native/cuda_prelude.cuh
+index 916f840..372f28d 100644
+--- a/inference/seismic/runtime/src/native/cuda_prelude.cuh
++++ b/inference/seismic/runtime/src/native/cuda_prelude.cuh
+@@ -12,9 +12,15 @@ __device__ __forceinline__ float seismic_bf16_to_f32(unsigned short value) {
+     return __uint_as_float(((unsigned int)value) << 16);
+ }
+ __device__ __forceinline__ unsigned short seismic_f32_to_bf16(float value) {
++#if __CUDA_ARCH__ >= 800
+     unsigned short result;
+     asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(result) : "f"(value));
+     return result;
++#else
++    const unsigned bits = __float_as_uint(value);
++    if ((bits & 0x7fffffffu) > 0x7f800000u) return 0x7fffu;
++    return (unsigned short)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
++#endif
+ }
+ __device__ __forceinline__ float seismic_f16_to_f32(unsigned short value) {
+     float result;
+@@ -30,14 +36,24 @@ __device__ __forceinline__ unsigned short seismic_f32_to_f16(float value) {
+ // Packed pairs: `lo` occupies bits 0..15 (the lower address in memory), `hi`
+ // bits 16..31. Packing rounds to nearest even.
+ __device__ __forceinline__ unsigned seismic_pack_bf16x2(float lo, float hi) {
++#if __CUDA_ARCH__ >= 800
+     unsigned result;
+     asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(result) : "f"(hi), "f"(lo));
+     return result;
++#else
++    return (unsigned)seismic_f32_to_bf16(lo)
++        | ((unsigned)seismic_f32_to_bf16(hi) << 16);
++#endif
+ }
+ __device__ __forceinline__ unsigned seismic_pack_f16x2(float lo, float hi) {
++#if __CUDA_ARCH__ >= 800
+     unsigned result;
+     asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(result) : "f"(hi), "f"(lo));
+     return result;
++#else
++    return (unsigned)seismic_f32_to_f16(lo)
++        | ((unsigned)seismic_f32_to_f16(hi) << 16);
++#endif
+ }
+ __device__ __forceinline__ float2 seismic_unpack_bf16x2(unsigned pair) {
+     return make_float2(__uint_as_float(pair << 16), __uint_as_float(pair & 0xffff0000u));
+@@ -91,9 +107,13 @@ __device__ __forceinline__ float seismic_rsqrt_approx(float x) {
+     return result;
+ }
+ __device__ __forceinline__ float seismic_tanh_approx(float x) {
++#if __CUDA_ARCH__ >= 750
+     float result;
+     asm("tanh.approx.f32 %0, %1;" : "=f"(result) : "f"(x));
+     return result;
++#else
++    return tanhf(x);
++#endif
+ }
+ 
+ // Address spaces.
+@@ -123,11 +143,15 @@ __device__ __forceinline__ uint4 seismic_ld_nc_v4(const void* global) {
+     return value;
+ }
+ __device__ __forceinline__ uint4 seismic_ld_nc_na_v4(const void* global) {
++#if __CUDA_ARCH__ >= 750
+     uint4 value;
+     asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+         : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+         : "l"(global));
+     return value;
++#else
++    return seismic_ld_nc_v4(global);
++#endif
+ }
+ 
+ // Prefetch the line holding `global` into L2.
+@@ -178,26 +202,51 @@ __device__ __forceinline__ void seismic_dependency_start() {
+ // A copy is complete for the issuing thread after the wait that retires its
+ // group; other threads observe it only after a following barrier.
+ __device__ __forceinline__ void seismic_cp_async_16(void* shared, const void* global) {
++#if __CUDA_ARCH__ >= 800
+     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                  ::"r"(seismic_shared_address(shared)), "l"(global)
+                  : "memory");
++#else
++    *(uint4*)shared = seismic_ld_nc_v4(global);
++#endif
+ }
+ __device__ __forceinline__ void seismic_cp_async_16_zfill(void* shared, const void* global,
+                                                           unsigned source_bytes) {
++#if __CUDA_ARCH__ >= 800
+     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                  ::"r"(seismic_shared_address(shared)), "l"(global), "r"(source_bytes)
+                  : "memory");
++#else
++    unsigned char* destination = (unsigned char*)shared;
++    const unsigned char* source = (const unsigned char*)global;
++    #pragma unroll
++    for (unsigned byte = 0; byte < 16; ++byte) {
++        destination[byte] = byte < source_bytes ? source[byte] : 0;
++    }
++#endif
+ }
+ __device__ __forceinline__ void seismic_cp_async_commit() {
++#if __CUDA_ARCH__ >= 800
+     asm volatile("cp.async.commit_group;" ::: "memory");
++#else
++    asm volatile("" ::: "memory");
++#endif
+ }
+ // Wait until at most `PENDING` committed groups are still in flight.
+ template <int PENDING>
+ __device__ __forceinline__ void seismic_cp_async_wait() {
++#if __CUDA_ARCH__ >= 800
+     asm volatile("cp.async.wait_group %0;" ::"n"(PENDING) : "memory");
++#else
++    asm volatile("" ::: "memory");
++#endif
+ }
+ __device__ __forceinline__ void seismic_cp_async_wait_all() {
++#if __CUDA_ARCH__ >= 800
+     asm volatile("cp.async.wait_all;" ::: "memory");
++#else
++    asm volatile("" ::: "memory");
++#endif
+ }
+ 
+ // Warp shuffles over the full warp. Out-of-range `up`/`down` sources return
+@@ -254,49 +303,116 @@ __device__ __forceinline__ float seismic_warp_max_f32(float value) {
+     return value;
+ }
+ 
+-// Integer warp reductions in one instruction; every lane receives the result.
++// Integer warp reductions; every lane receives the result. SM80 uses redux,
++// older devices use convergent shuffles and modulo-32-bit addition.
+ __device__ __forceinline__ unsigned seismic_redux_add_u32(unsigned value) {
++#if __CUDA_ARCH__ >= 800
+     unsigned result;
+     asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(result) : "r"(value));
+     return result;
++#else
++    for (unsigned mask = 16; mask > 0; mask >>= 1) {
++        const unsigned peer = (unsigned)seismic_shfl_xor_u32((unsigned)value, mask);
++        value = value + peer;
++    }
++    return value;
++#endif
+ }
+ __device__ __forceinline__ unsigned seismic_redux_min_u32(unsigned value) {
++#if __CUDA_ARCH__ >= 800
+     unsigned result;
+     asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(result) : "r"(value));
+     return result;
++#else
++    for (unsigned mask = 16; mask > 0; mask >>= 1) {
++        const unsigned peer = (unsigned)seismic_shfl_xor_u32((unsigned)value, mask);
++        value = value < peer ? value : peer;
++    }
++    return value;
++#endif
+ }
+ __device__ __forceinline__ unsigned seismic_redux_max_u32(unsigned value) {
++#if __CUDA_ARCH__ >= 800
+     unsigned result;
+     asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(result) : "r"(value));
+     return result;
++#else
++    for (unsigned mask = 16; mask > 0; mask >>= 1) {
++        const unsigned peer = (unsigned)seismic_shfl_xor_u32((unsigned)value, mask);
++        value = value > peer ? value : peer;
++    }
++    return value;
++#endif
+ }
+ __device__ __forceinline__ int seismic_redux_add_s32(int value) {
++#if __CUDA_ARCH__ >= 800
+     int result;
+     asm volatile("redux.sync.add.s32 %0, %1, 0xffffffff;" : "=r"(result) : "r"(value));
+     return result;
++#else
++    return (int)seismic_redux_add_u32((unsigned)value);
++#endif
+ }
+ __device__ __forceinline__ int seismic_redux_min_s32(int value) {
++#if __CUDA_ARCH__ >= 800
+     int result;
+     asm volatile("redux.sync.min.s32 %0, %1, 0xffffffff;" : "=r"(result) : "r"(value));
+     return result;
++#else
++    for (unsigned mask = 16; mask > 0; mask >>= 1) {
++        const int peer = (int)seismic_shfl_xor_u32((unsigned)value, mask);
++        value = value < peer ? value : peer;
++    }
++    return value;
++#endif
+ }
+ __device__ __forceinline__ int seismic_redux_max_s32(int value) {
++#if __CUDA_ARCH__ >= 800
+     int result;
+     asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(result) : "r"(value));
+     return result;
++#else
++    for (unsigned mask = 16; mask > 0; mask >>= 1) {
++        const int peer = (int)seismic_shfl_xor_u32((unsigned)value, mask);
++        value = value > peer ? value : peer;
++    }
++    return value;
++#endif
+ }
+ 
+ // Four-way byte dot products accumulated into `acc`: bytes of `a` and `b` in
+ // little-endian order, signed (s8) or unsigned (u8).
+ __device__ __forceinline__ int seismic_dp4a_s8(int a, int b, int acc) {
++#if __CUDA_ARCH__ >= 610
+     int result;
+     asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(result) : "r"(a), "r"(b), "r"(acc));
+     return result;
++#else
++    unsigned result = (unsigned)acc;
++    #pragma unroll
++    for (unsigned byte = 0; byte < 4; ++byte) {
++        const int av = (int)(signed char)((unsigned)a >> (8 * byte));
++        const int bv = (int)(signed char)((unsigned)b >> (8 * byte));
++        result += (unsigned)(av * bv);
++    }
++    return (int)result;
++#endif
+ }
+ __device__ __forceinline__ int seismic_dp4a_u8s8(unsigned a, int b, int acc) {
++#if __CUDA_ARCH__ >= 610
+     int result;
+     asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(result) : "r"(a), "r"(b), "r"(acc));
+     return result;
++#else
++    unsigned result = (unsigned)acc;
++    #pragma unroll
++    for (unsigned byte = 0; byte < 4; ++byte) {
++        const int av = (int)((a >> (8 * byte)) & 255u);
++        const int bv = (int)(signed char)((unsigned)b >> (8 * byte));
++        result += (unsigned)(av * bv);
++    }
++    return (int)result;
++#endif
+ }
+ 
+ // ldmatrix: 8x8 matrices of 16-bit elements from shared memory. Lane
+@@ -304,41 +420,96 @@ __device__ __forceinline__ int seismic_dp4a_u8s8(unsigned a, int b, int acc) {
+ // 0..7 for x1, 0..15 for x2, all for x4). Register i of lane l receives, from
+ // matrix i, row l/4, columns 2*(l%4) and 2*(l%4)+1 (low half first); with
+ // `_trans`, column l/4, rows 2*(l%4) and 2*(l%4)+1.
++__device__ __forceinline__ unsigned seismic_lane_id() {
++    unsigned lane;
++    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
++    return lane;
++}
++
++// SM60 shared-memory gather with the same convergent fragment ABI as ldmatrix.
++// Shuffle both pointer words; no assumption about generic shared pointer width.
++__device__ __forceinline__ const unsigned short* seismic_shared_row(
++    const void* shared, unsigned owner) {
++    const unsigned long long pointer = (unsigned long long)shared;
++    const unsigned long long lo = seismic_shfl_idx_u32((unsigned)pointer, owner);
++    const unsigned long long hi = seismic_shfl_idx_u32((unsigned)(pointer >> 32), owner);
++    return (const unsigned short*)(lo | (hi << 32));
++}
++template <int COUNT, bool TRANSPOSE>
++__device__ __forceinline__ void seismic_ldmatrix_simt(
++    unsigned (&fragment)[COUNT], const void* shared) {
++    const unsigned lane = seismic_lane_id();
++    #pragma unroll
++    for (unsigned matrix = 0; matrix < COUNT; ++matrix) {
++        const unsigned row = TRANSPOSE ? 2 * (lane % 4) : lane / 4;
++        const unsigned column = TRANSPOSE ? lane / 4 : 2 * (lane % 4);
++        const unsigned short* first = seismic_shared_row(shared, 8 * matrix + row);
++        const unsigned short* second = TRANSPOSE
++            ? seismic_shared_row(shared, 8 * matrix + row + 1) : first;
++        fragment[matrix] = (unsigned)first[column]
++            | ((unsigned)second[column + (TRANSPOSE ? 0 : 1)] << 16);
++    }
++}
++
+ __device__ __forceinline__ void seismic_ldmatrix_x1(unsigned (&fragment)[1], const void* shared) {
++#if __CUDA_ARCH__ >= 750
+     asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
+                  : "=r"(fragment[0])
+                  : "r"(seismic_shared_address(shared)));
++#else
++    seismic_ldmatrix_simt<1, false>(fragment, shared);
++#endif
+ }
+ __device__ __forceinline__ void seismic_ldmatrix_x2(unsigned (&fragment)[2], const void* shared) {
++#if __CUDA_ARCH__ >= 750
+     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                  : "=r"(fragment[0]), "=r"(fragment[1])
+                  : "r"(seismic_shared_address(shared)));
++#else
++    seismic_ldmatrix_simt<2, false>(fragment, shared);
++#endif
+ }
+ __device__ __forceinline__ void seismic_ldmatrix_x4(unsigned (&fragment)[4], const void* shared) {
++#if __CUDA_ARCH__ >= 750
+     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                  : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
+                  : "r"(seismic_shared_address(shared)));
++#else
++    seismic_ldmatrix_simt<4, false>(fragment, shared);
++#endif
+ }
+ __device__ __forceinline__ void seismic_ldmatrix_x1_trans(unsigned (&fragment)[1],
+                                                           const void* shared) {
++#if __CUDA_ARCH__ >= 750
+     asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];"
+                  : "=r"(fragment[0])
+                  : "r"(seismic_shared_address(shared)));
++#else
++    seismic_ldmatrix_simt<1, true>(fragment, shared);
++#endif
+ }
+ __device__ __forceinline__ void seismic_ldmatrix_x2_trans(unsigned (&fragment)[2],
+                                                           const void* shared) {
++#if __CUDA_ARCH__ >= 750
+     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+                  : "=r"(fragment[0]), "=r"(fragment[1])
+                  : "r"(seismic_shared_address(shared)));
++#else
++    seismic_ldmatrix_simt<2, true>(fragment, shared);
++#endif
+ }
+ __device__ __forceinline__ void seismic_ldmatrix_x4_trans(unsigned (&fragment)[4],
+                                                           const void* shared) {
++#if __CUDA_ARCH__ >= 750
+     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                  : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
+                  : "r"(seismic_shared_address(shared)));
++#else
++    seismic_ldmatrix_simt<4, true>(fragment, shared);
++#endif
+ }
+ 
+-// Warp-level tensor-core MMA, acc += A * B, with lane l = 4g + t (g = l/4,
++// Warp-level matrix product (tensor cores on SM80, SIMT below), acc += A * B, with lane l = 4g + t (g = l/4,
+ // t = l%4). Accumulator (16x8 f32 or s32): acc[0], acc[1] = row g, columns
+ // 2t, 2t+1; acc[2], acc[3] = row g+8, same columns.
+ //
+@@ -353,27 +524,83 @@ __device__ __forceinline__ void seismic_ldmatrix_x4_trans(unsigned (&fragment)[4
+ //   A (16x32): a[0] = row g, k 4t..4t+3; a[1] = row g+8, k 4t..4t+3;
+ //              a[2] = row g, k 4t+16..4t+19; a[3] = row g+8, k 4t+16..4t+19.
+ //   B (32x8):  b[0] = column g, k 4t..4t+3; b[1] = column g, k 4t+16..4t+19.
++// SM60 SIMT fallback. The exchanged operands have exactly the documented
++// m16n8k16 register interpretation. Each output accumulates in ascending k
++// using explicit F32 round-to-nearest FMA; association may differ from a
++// tensor core and must pass the operator's existing numerical gate.
++template <bool BF16>
++__device__ __forceinline__ void seismic_mma_m16n8k16_simt(
++    float (&acc)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
++    const unsigned lane = seismic_lane_id();
++    #pragma unroll
++    for (unsigned output = 0; output < 4; ++output) {
++        const unsigned row = lane / 4 + 8 * (output / 2);
++        const unsigned column = 2 * (lane % 4) + output % 2;
++        #pragma unroll
++        for (unsigned k = 0; k < 16; ++k) {
++            const unsigned ap = seismic_shfl_idx_u32(
++                a[2 * (k / 8) + output / 2], (row % 8) * 4 + (k % 8) / 2);
++            const unsigned bp = seismic_shfl_idx_u32(
++                b[k / 8], column * 4 + (k % 8) / 2);
++            const unsigned short av = (unsigned short)(ap >> (16 * (k % 2)));
++            const unsigned short bv = (unsigned short)(bp >> (16 * (k % 2)));
++            acc[output] = seismic_fma_rn(
++                BF16 ? seismic_bf16_to_f32(av) : seismic_f16_to_f32(av),
++                BF16 ? seismic_bf16_to_f32(bv) : seismic_f16_to_f32(bv), acc[output]);
++        }
++    }
++}
++
+ __device__ __forceinline__ void seismic_mma_m16n8k16_f16(float (&acc)[4], const unsigned (&a)[4],
+                                                          const unsigned (&b)[2]) {
++#if __CUDA_ARCH__ >= 800
+     asm volatile(
+         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+         "{%8, %9}, {%0, %1, %2, %3};"
+         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++#else
++    seismic_mma_m16n8k16_simt<false>(acc, a, b);
++#endif
+ }
+ __device__ __forceinline__ void seismic_mma_m16n8k16_bf16(float (&acc)[4], const unsigned (&a)[4],
+                                                           const unsigned (&b)[2]) {
++#if __CUDA_ARCH__ >= 800
+     asm volatile(
+         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+         "{%8, %9}, {%0, %1, %2, %3};"
+         : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++#else
++    seismic_mma_m16n8k16_simt<true>(acc, a, b);
++#endif
+ }
+ __device__ __forceinline__ void seismic_mma_m16n8k32_s8(int (&acc)[4], const unsigned (&a)[4],
+                                                         const unsigned (&b)[2]) {
++#if __CUDA_ARCH__ >= 800
+     asm volatile(
+         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+         "{%8, %9}, {%0, %1, %2, %3};"
+         : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++#else
++    const unsigned lane = seismic_lane_id();
++    #pragma unroll
++    for (unsigned output = 0; output < 4; ++output) {
++        const unsigned row = lane / 4 + 8 * (output / 2);
++        const unsigned column = 2 * (lane % 4) + output % 2;
++        unsigned result = (unsigned)acc[output];
++        #pragma unroll
++        for (unsigned k = 0; k < 32; ++k) {
++            const unsigned ap = seismic_shfl_idx_u32(
++                a[2 * (k / 16) + output / 2], (row % 8) * 4 + (k % 16) / 4);
++            const unsigned bp = seismic_shfl_idx_u32(
++                b[k / 16], column * 4 + (k % 16) / 4);
++            const int av = (int)(signed char)(ap >> (8 * (k % 4)));
++            const int bv = (int)(signed char)(bp >> (8 * (k % 4)));
++            result += (unsigned)(av * bv);
++        }
++        acc[output] = (int)result;
++    }
++#endif
+ }

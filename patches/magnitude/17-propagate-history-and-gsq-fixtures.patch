@@ -1,0 +1,151 @@
+--- a/inference/engine/executor/src/native/target.rs
++++ b/inference/engine/executor/src/native/target.rs
+@@ -16,7 +16,7 @@
+     routed_select, routed_up, state_space_chunk, state_space_gate, state_space_step, tap_rows,
+ };
+ use magnitude_kernels::{short_conv_project, short_conv_rows};
+-use seismic::NativeKernel;
++use seismic::{Element, NativeKernel};
+ use std::collections::HashMap;
+ 
+ /// Immutable decoder-stage specializations keyed by semantic bindings.
+@@ -191,6 +191,8 @@
+ #[derive(Clone, Debug)]
+ pub enum AttentionHistoryKernels {
+     Dense {
++        /// The history representation declared by these entries.
++        element: Element,
+         decode: NativeKernel<attention_decode::Entry>,
+         /// The multi-row decode (draft blocks, verification), tuned on its
+         /// own row classes so it can read each history tile once for all
+@@ -220,6 +222,7 @@
+                 decode,
+                 verify,
+                 prefill,
++                ..
+             } => {
+                 decode
+                     .invocation_workspace_bytes()
+--- a/inference/engine/executor/src/native/preparation.rs
++++ b/inference/engine/executor/src/native/preparation.rs
+@@ -694,9 +694,12 @@
+                 epsilon: self.epsilon,
+             },
+         )?;
++        let history_element = if binding.history == KvCodec::DenseF16 {
++            Element::f16()
++        } else { activation };
+         let mix = || AttentionMix {
+             activation,
+-            history: if binding.history == KvCodec::DenseF16 { Element::f16() } else { activation },
++            history: history_element,
+             shape,
+             scopes: scopes.clone(),
+             epsilon: self.epsilon,
+@@ -734,6 +737,7 @@
+                 decode
+                     .zip(prefill)
+                     .map(|(decode, prefill)| AttentionHistoryKernels::Dense {
++                        element: history_element,
+                         decode,
+                         verify,
+                         prefill,
+--- a/inference/engine/executor/src/native/attestation.rs
++++ b/inference/engine/executor/src/native/attestation.rs
+@@ -1843,6 +1843,7 @@
+                         decode,
+                         verify,
+                         prefill,
++                        ..
+                     } => {
+                         charge!(decode);
+                         if let Some(verify) = verify {
+--- a/inference/engine/executor/src/operators/attention/graph.rs
++++ b/inference/engine/executor/src/operators/attention/graph.rs
+@@ -49,6 +49,7 @@
+ 
+ pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
+     Dense {
++        element: Element,
+         decode: G::Binding<'a, attention_decode::Entry>,
+         verify: Option<G::Binding<'a, attention_decode::Entry>>,
+         prefill: G::Binding<'a, attention_prefill::Entry>,
+@@ -76,10 +77,12 @@
+     fn from(kernels: &'a AttentionKernels) -> Self {
+         let history = match &kernels.history {
+             AttentionHistoryKernels::Dense {
++                element,
+                 decode,
+                 verify,
+                 prefill,
+             } => AttentionHistoryEntries::Dense {
++                element: *element,
+                 decode,
+                 verify: verify.as_ref(),
+                 prefill,
+@@ -160,6 +163,7 @@
+     pub(crate) fn entries(&self) -> Result<AttentionGraphEntries<'_, NativeGraphMetadata>, String> {
+         let history = match self.history {
+             KvCodec::Dense | KvCodec::DenseF16 => AttentionHistoryEntries::Dense {
++                element: self.dense_mix[1].1,
+                 decode: &self.dense_mix[..],
+                 verify: None,
+                 prefill: &self.dense_mix[..],
+@@ -519,9 +523,9 @@
+         graph.port(element, &[block.history_rows, shape.kv_heads, elements])
+     };
+     let mut planes = match &history {
+-        AttentionHistoryEntries::Dense { .. } => vec![
+-            plane(block.activation, width)?,
+-            plane(block.activation, width)?,
++        AttentionHistoryEntries::Dense { element, .. } => vec![
++            plane(*element, width)?,
++            plane(*element, width)?,
+         ],
+         AttentionHistoryEntries::AffineK8V4 { .. } => vec![
+             plane(Element::u32(), width / 4)?,
+--- a/inference/engine/executor/src/native/qualification/helpers.rs
++++ b/inference/engine/executor/src/native/qualification/helpers.rs
+@@ -438,6 +438,24 @@
+ /// layout's geometry.
+ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
+     let (source, packet) = match representation {
++        // GGML IQ1 grid point 1029 contains eight zeros. Positive delta
++        // and base d=8 yield 1; only the grid high bits are populated.
++        "iq1g32" => ("gguf_iq1_s", unit_packet(50, &[
++            (0, &[0x00, 0x48]), (2, &[5; 32]),
++            (34, &[0x24,0x09,0x24,0x09,0x24,0x09,0x24,0x09,
++                   0x24,0x09,0x24,0x09,0x24,0x09,0x24,0x09]),
++        ])),
++        "iq1g16" => ("gguf_iq1_m", unit_packet(56, &[
++            (0, &[5; 32]), (32, &[0x44; 16]), (53, &[0x80]), (55, &[0x40]),
++        ])),
++        // Grid point zero contains eight 8s (IQ2) or four 4s (IQ3).
++        // d=1, no signs/local scales: 8/8 or 4/4 equals one.
++        "iq2g32" => ("gguf_iq2_xxs", unit_packet(66, &[(0, &[0x00,0x3c])])),
++        "iq2g16" => ("gguf_iq2_s", unit_packet(82, &[(0, &[0x00,0x3c])])),
++        "iq3g32" => ("gguf_iq3_xxs", unit_packet(98, &[(0, &[0x00,0x3c])])),
++        "q2k4" => ("gguf_q2_k", unit_packet(84, &[
++            (0, &[1;16]), (16, &[0x55;64]), (80, &[0x00,0x3c]),
++        ])),
+         "q8g32s" => (
+             "gguf_q8_0",
+             unit_packet(34, &[(0, &[0x00, 0x3c]), (2, &[1; 32])]),
+@@ -726,7 +744,7 @@
+         let mut compared = Vec::new();
+         for representation in [
+             "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32", "mxfp4g32",
+-            "nvfp4g16",
++            "nvfp4g16", "iq1g32", "iq1g16", "iq2g32", "iq2g16", "iq3g32", "q2k4",
+         ] {
+             let (source, packet) = pattern_source(representation).unwrap();
+             for layout in [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16] {
+@@ -760,7 +778,7 @@
+     fn every_packed_representation_has_a_unit_fixture() {
+         let representations = [
+             "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32s", "q5g32", "mxfp4g32",
+-            "nvfp4g16",
++            "nvfp4g16", "iq1g32", "iq1g16", "iq2g32", "iq2g16", "iq3g32", "q2k4",
+         ];
+         for representation in representations {
+             let (source, packet) = pattern_source(representation)

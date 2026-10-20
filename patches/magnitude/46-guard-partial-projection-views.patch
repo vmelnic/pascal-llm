@@ -1,0 +1,21 @@
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -150,6 +150,18 @@
+     let peers=source.projection_peers.lock().expect("projection peer registry lock poisoned").iter().map(std::sync::Weak::upgrade).collect::<Option<Vec<_>>>();
+     let Some(peers)=peers.filter(|peers|peers.len()>1) else {return Ok(false);};
+     let Some(spec)=Spec::from(dispatch,ordinal)? else {return Ok(false);};
++    // Local aliases belong to the allocation's complete row partition.
++    // A prefix/slice may have different cuts; its original canonical module
++    // remains valid and must not receive partial physical aliases.
++    for view in spec.constants.iter().filter(|view|spec.weight_ports.contains(&view.buffer)) {
++        let (allocation,offset)=buffers[view.buffer];
++        let buffer=typed_buffer::<Cuda,Executor>(allocation);
++        if let Some(plan)=buffer.row_shard_plan() {
++            if offset!=0 || view.extents[0]!=plan.rows || view.bytes!=plan.canonical_bytes {
++                return Ok(false);
++            }
++        }
++    }
+     let mut inputs=spec.inputs.clone();
+     inputs.extend(spec.constants.iter().filter(|v|v.extents.len()==1 && !buffers[v.buffer].0.storage().read_only() && v.bytes!=0).map(|v|(v.buffer,v.bytes)));
+     inputs.sort_unstable();inputs.dedup_by_key(|entry|entry.0);

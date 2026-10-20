@@ -1,0 +1,63 @@
+--- a/inference/engine/kernels/kernels/cuda/attention_project.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_project.cu
+@@ -88,23 +88,27 @@
+     const auto x = projection::source_after_dependency(pro, row, M, D, staged);
+     switch (segment) {
+     case 0:
+-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query,
++        if constexpr (SEISMIC_DIM_Q != 0)
++            projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query,
+                                               projection::NoWeight{}, s.out[0]);
+         break;
+     case 1:
+-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[1], s.gate,
++        if constexpr (SEISMIC_DIM_GR != 0)
++            projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[1], s.gate,
+                                               projection::NoWeight{}, s.out[1]);
+         break;
+     case 2:
+-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[2], s.key,
++        if constexpr (SEISMIC_DIM_K != 0)
++            projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[2], s.key,
+                                               projection::NoWeight{}, s.out[2]);
+         break;
+     case 3:
+-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[3], s.value,
++        if constexpr (SEISMIC_DIM_V != 0)
++            projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[3], s.value,
+                                               projection::NoWeight{}, s.out[3]);
+         break;
+     default:
+-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, 0, 0, s.value, projection::NoWeight{}, s.out[3]);
++        // No tile belongs to a zero-row segment; no matrix body is needed.
+         break;
+     }
+ }
+@@ -131,19 +135,23 @@
+     }
+     switch (segment) {
+     case 0:
+-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[0], s.query,
++        if constexpr (SEISMIC_DIM_Q != 0)
++            projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[0], s.query,
+                                        projection::NoWeight{}, s.out[0]);
+         break;
+     case 1:
+-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[1], s.gate,
++        if constexpr (SEISMIC_DIM_GR != 0)
++            projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[1], s.gate,
+                                        projection::NoWeight{}, s.out[1]);
+         break;
+     case 2:
+-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[2], s.key,
++        if constexpr (SEISMIC_DIM_K != 0)
++            projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[2], s.key,
+                                        projection::NoWeight{}, s.out[2]);
+         break;
+     case 3:
+-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[3], s.value,
++        if constexpr (SEISMIC_DIM_V != 0)
++            projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[3], s.value,
+                                        projection::NoWeight{}, s.out[3]);
+         break;
+     }

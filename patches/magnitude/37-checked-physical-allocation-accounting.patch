@@ -1,0 +1,63 @@
+--- a/inference/engine/executor/src/resident_weights.rs
++++ b/inference/engine/executor/src/resident_weights.rs
+@@ -194,31 +194,28 @@
+     }
+ 
+     pub(crate) fn storage_bytes(&self) -> Result<u64, &'static str> {
++        self.unique_storage_bytes(seismic::Tensor::physical_storage_bytes)
++    }
++
++    pub(crate) fn storage_bytes_on(&self, device: &seismic::Device) -> Result<u64, &'static str> {
++        self.unique_storage_bytes(|tensor| tensor.physical_storage_bytes_on(device))
++    }
++
++    fn unique_storage_bytes(&self, physical_bytes: impl Fn(&seismic::Tensor) -> u64) -> Result<u64, &'static str> {
+         let mut seen = Vec::<&seismic::Tensor>::new();
+         let mut total = Some(0u64);
+         self.visit_weights(|weight| {
+-            let tensor = weight.tensor();
+-            if seen.iter().any(|other| other.shares_allocation(tensor)) {
+-                return;
++            for tensor in std::iter::once(weight.tensor()).chain(weight.scale()) {
++                if seen.iter().any(|other| other.shares_allocation(tensor)) {
++                    continue;
++                }
++                total = total.and_then(|bytes| bytes.checked_add(physical_bytes(tensor)));
++                seen.push(tensor);
+             }
+-            total = total.and_then(|bytes| bytes.checked_add(weight.tensor().physical_storage_bytes()+weight.scale().map_or(0,Tensor::physical_storage_bytes)));
+-            seen.push(tensor);
+         });
+         total.ok_or("resident target charge overflows")
+     }
+-    pub(crate) fn storage_bytes_on(&self,device:&seismic::Device) -> Result<u64, &'static str> {
+-        let mut seen = Vec::<&seismic::Tensor>::new();
+-        let mut total = Some(0u64);
+-        self.visit_weights(|weight| {
+-            let tensor=weight.tensor();
+-            if seen.iter().any(|other| other.shares_allocation(tensor)) {
+-                return;
+-            }
+-            total = total.and_then(|bytes| bytes.checked_add(weight.tensor().physical_storage_bytes_on(device)+weight.scale().map_or(0,|scale|scale.physical_storage_bytes_on(device))));
+-            seen.push(tensor);
+-        });
+-        total.ok_or("resident target charge overflows")
+-    }
++
+ }
+ 
+ pub(crate) fn import_target(
+--- a/inference/engine/executor/src/planning/placement.rs
++++ b/inference/engine/executor/src/planning/placement.rs
+@@ -60,9 +60,9 @@
+ impl LayerPlacement {
+     /// Replace serial-owner weights with exact page charges and a conservative
+     /// bound for small immutable peer copies. State ownership stays unchanged.
+-    pub fn with_projection_weights(mut self,load:&ModelLoadPlan,devices:&[std::rc::Rc<seismic::Device>])->Result<Self,String> {
++    pub fn with_projection_weights(mut self,load:&ModelLoadPlan,devices:&[seismic::Device])->Result<Self,String> {
+         if devices.len()!=self.stages.len() {return Err("projection physical owners differ from placement".into());}
+-        let peers=devices.iter().map(|device|device.as_ref()).collect::<Vec<_>>();
++        let peers=devices.iter().collect::<Vec<_>>();
+         let mut costs=vec![0u64;devices.len()];let mut seen=HashSet::new();
+         let add=|target:&mut u64,bytes:u64|->Result<(),String> {*target=target.checked_add(bytes).ok_or("projection weight charge overflows")?;Ok(())};
+         for weight in load.weights() {

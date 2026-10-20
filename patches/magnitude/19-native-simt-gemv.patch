@@ -1,0 +1,183 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -256,6 +256,77 @@
+     float quarter[NB][4][2];
+ };
+ 
++#if __CUDA_ARCH__ < 800
++// Native SIMT GEMV: four lanes own a weight row's interleaved K values.
++// Only actual activation rows are evaluated. Every row uses the same fixed
++// group association at every M; resident decoding and F32 scale/bias folds
++// are shared with the tensor-core path.
++template <int NB, class W, class Pro>
++__device__ __forceinline__ void gemv_accumulate_simt(
++    float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
++    const typename W::Block &block, int q, u32 M, u64 k0, const Pro &pro) {
++    const u32 t = threadIdx.x % 4;
++    Coefficients<W::GROUPS> coefficients;
++    w.coefficients(block, q, coefficients);
++    constexpr int STEPS = W::GROUP / 16;
++#pragma unroll
++    for (int group = 0; group < W::GROUPS; ++group) {
++        u32 a[STEPS][4];
++#pragma unroll
++        for (int j = 0; j < STEPS; ++j)
++            w.template decode<Op>(raw, group * STEPS + j, a[j]);
++#pragma unroll
++        for (int nb = 0; nb < NB; ++nb)
++        for (u32 column = 0; column < 8 && 8 * nb + column < M; ++column) {
++            const u32 m = 8 * nb + column;
++            float p[2] = {0.0f, 0.0f};
++            float sum = 0.0f;
++#pragma unroll
++            for (int j = 0; j < STEPS; ++j) {
++                const u64 k = k0 + 16 * (group * STEPS + j) + 2 * t;
++                const float2 x[2] = {Op::unpack(pro.pair(nullptr, m, k)),
++                                     Op::unpack(pro.pair(nullptr, m, k + 8))};
++#pragma unroll
++                for (int half = 0; half < 2; ++half) {
++#pragma unroll
++                    for (int row = 0; row < 2; ++row) {
++                        const float2 code = Op::unpack(a[j][2 * half + row]);
++                        p[row] = seismic_fma_rn(code.x, x[half].x, p[row]);
++                        p[row] = seismic_fma_rn(code.y, x[half].y, p[row]);
++                    }
++                    if constexpr (W::BIAS) {
++                        sum = seismic_add_rn(sum, x[half].x);
++                        sum = seismic_add_rn(sum, x[half].y);
++                    }
++                }
++            }
++#pragma unroll
++            for (u32 mask = 1; mask <= 2; mask *= 2) {
++#pragma unroll
++                for (int row = 0; row < 2; ++row)
++                    p[row] = seismic_add_rn(p[row], seismic_shfl_xor_f32(p[row], mask));
++                if constexpr (W::BIAS)
++                    sum = seismic_add_rn(sum, seismic_shfl_xor_f32(sum, mask));
++            }
++            // Keep the existing C-fragment layout and cross-part reduction.
++            if (t == column / 2) {
++#pragma unroll
++                for (int row = 0; row < 2; ++row) {
++                    // Fixed register indices: dynamic indexing would spill
++                    // the C fragment into thread-local memory.
++                    float out = column % 2 == 0 ? acc[nb][2 * row] : acc[nb][2 * row + 1];
++                    out = seismic_fma_rn(coefficients.scale[row][group], p[row], out);
++                    if constexpr (W::BIAS)
++                        out = seismic_fma_rn(-coefficients.bias[row][group], sum, out);
++                    if (column % 2 == 0) acc[nb][2 * row] = out;
++                    else acc[nb][2 * row + 1] = out;
++                }
++            }
++        }
++    }
++}
++#endif
++
+ template <int NB, class W>
+ __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
+                                                 const typename W::Block &block, int q, const u32 (&b)[NB][4][2],
+@@ -367,6 +438,17 @@
+             if (4 * sb + q >= kblocks)
+                 break;
+             const u64 k0 = (4 * sb + q) * 64;
++#if __CUDA_ARCH__ < 800
++#pragma unroll
++            for (int i = 0; i < TPW; ++i)
++                if (tile0 + i < tiles) {
++                    gemv_accumulate_simt<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa,
++                                            stage.ba[i], q, M, k0, pro);
++                    if constexpr (PAIR)
++                        gemv_accumulate_simt<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb,
++                                                stage.bb[i], q, M, k0, pro);
++                }
++#else
+             u32 b[NB][4][2];
+ #pragma unroll
+             for (int nb = 0; nb < NB; ++nb) {
+@@ -411,6 +493,7 @@
+                     if constexpr (PAIR)
+                         gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums);
+                 }
++#endif
+         }
+     };
+     for (u64 sb = begin; sb < end; ++sb) {
+--- a/inference/engine/kernels/tests/cuda_projection.rs
++++ b/inference/engine/kernels/tests/cuda_projection.rs
+@@ -1701,3 +1701,74 @@
+         }
+     }
+ }
++
++
++/// The changed Pascal GEMV route: original source formats, independent F64
++/// projection bounds and exact row/batch invariance at real proposal widths.
++#[test]
++fn cuda_pascal_gemv_actual_rows_match_host_and_single_bits() {
++    let Some(device) = cuda() else { return };
++    let mut rng = Rng(20261010);
++    let (h, f) = (512, 512);
++    let formats = [Format::Iq1S, Format::Iq1M, Format::Iq2Xxs, Format::Iq2Xs,
++        Format::Iq2S, Format::Iq3Xxs, Format::Q2K, Format::Q4K,
++        Format::Q6K, Format::Iq4];
++    for format in formats {
++        let gate = weight(&device, format, f, h, &mut rng);
++        let up = weight(&device, format, f, h, &mut rng);
++        let down = weight(&device, format, h, f, &mut rng);
++        for &mapping in &[GEMV_MAPPINGS[0], GEMV_MAPPINGS[1]] {
++            for o in [1, 3, 11] {
++                let case = DenseCase::new(o, h, f, &mut rng);
++                let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
++                let norm = f32_tensor(&device, &[h as u64], &case.norm);
++                let indices = i32_tensor(&device, &[o as u64], &case.out_rows);
++                let expand = expand_kernel(&device, format, &case, mapping);
++                let empty = f32_tensor(&device, &[0], &[]);
++                let product = expand.call(dense_expand::Args {
++                    residual: &residual, norm: &norm, gate_weight: &gate.tensor,
++                    up_weight: &up.tensor, out_rows: &indices, eps: EPSILON,
++                    activation: 0, gate_scale: &empty, up_scale: &empty,
++                }).unwrap().value;
++                let actual = read_bf16(&product);
++                let (expected, tolerance) = case.expand(&gate, &up, mapping);
++                check(&format!("Pascal expand {format:?} M={o} {mapping:?}"),
++                    &actual, &expected, &tolerance);
++                let output = output_kernel(&device, format, h, f, mapping);
++                let zeros = f32_tensor(&device, &[o as u64, h as u64], &vec![0.0; o*h]);
++                let contiguous = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
++                let result = output.call(dense_output::Args {
++                    residual: &zeros, product: &product, down_weight: &down.tensor,
++                    out_rows: &contiguous, down_scale: &empty,
++                }).unwrap().value;
++                let projected = read_f32(&result);
++                let (expected, magnitude) = project(&actual, &down.values, o, h, f);
++                let tolerance: Vec<f64> = (0..o*h).map(|i|
++                    expected[i].abs()/256.0 + magnitude[i]*2e-5 + 1e-6).collect();
++                check(&format!("Pascal output {format:?} M={o} {mapping:?}"),
++                    &projected, &expected, &tolerance);
++                for row in 0..o {
++                    let selected = i32_tensor(&device, &[1], &[case.out_rows[row]]);
++                    let single = expand.call(dense_expand::Args {
++                        residual: &residual, norm: &norm, gate_weight: &gate.tensor,
++                        up_weight: &up.tensor, out_rows: &selected, eps: EPSILON,
++                        activation: 0, gate_scale: &empty, up_scale: &empty,
++                    }).unwrap().value;
++                    let single_values = read_bf16(&single);
++                    assert_eq!(single_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
++                        actual[row*f..(row+1)*f].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
++                        "Pascal expand row/batch {format:?} M={o} row={row}");
++                    let zero = f32_tensor(&device, &[1, h as u64], &vec![0.0; h]);
++                    let one_index = i32_tensor(&device, &[1], &[0]);
++                    let single_output = output.call(dense_output::Args {
++                        residual: &zero, product: &single, down_weight: &down.tensor,
++                        out_rows: &one_index, down_scale: &empty,
++                    }).unwrap().value;
++                    assert_eq!(read_f32(&single_output).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
++                        projected[row*h..(row+1)*h].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
++                        "Pascal output row/batch {format:?} M={o} row={row}");
++                }
++            }
++        }
++    }
++}

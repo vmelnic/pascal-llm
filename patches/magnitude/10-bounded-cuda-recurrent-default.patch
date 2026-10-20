@@ -1,0 +1,12 @@
+diff --git a/inference/engine/kernels/kernels/recurrent.seismic b/inference/engine/kernels/kernels/recurrent.seismic
+--- a/inference/engine/kernels/kernels/recurrent.seismic
++++ b/inference/engine/kernels/kernels/recurrent.seismic
+@@ -627,7 +627,7 @@
+         threadgroups (ceil_div(M, 16) + B, NK, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch gated_delta_chunk_scan:
+-        params (code ROWS in [128, 64, 32])
++        params (code ROWS in [32, 64, 128])
+         threadgroups (W / ROWS, NV, B + 1)
+         threads_per_threadgroup (2 * ROWS, 1, 1)
+         shared_bytes (3 * (96 * W + 32 * ROWS + 1680) + ROWS / 16 * 16 * 17 * 4)

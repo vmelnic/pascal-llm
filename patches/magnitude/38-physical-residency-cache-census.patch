@@ -1,0 +1,34 @@
+--- a/inference/engine/executor/src/residency.rs
++++ b/inference/engine/executor/src/residency.rs
+@@ -409,11 +409,26 @@
+     /// share one key and one allocation; a failed component import may leave
+     /// a partial set, which this observation still counts exactly.
+     pub fn resident_bytes(&self) -> Result<u64, &'static str> {
+-        self.resident.values().try_fold(self.peers.iter().map(Self::resident_bytes).sum::<Result<u64,_>>()?, |bytes, weight| {
+-            bytes
+-                .checked_add(weight.storage_bytes())
+-                .ok_or("resident cache charge overflows")
+-        })
++        self.resident_bytes_unique(&mut Vec::new())
++    }
++
++    fn resident_bytes_unique<'a>(&'a self, seen: &mut Vec<&'a Tensor>) -> Result<u64, &'static str> {
++        let mut bytes = 0u64;
++        for weight in self.resident.values() {
++            for tensor in std::iter::once(weight.tensor()).chain(weight.scale()) {
++                if seen.iter().any(|other| other.shares_allocation(tensor)) {
++                    continue;
++                }
++                bytes = bytes.checked_add(tensor.physical_storage_bytes())
++                    .ok_or("resident cache charge overflows")?;
++                seen.push(tensor);
++            }
++        }
++        for peer in &self.peers {
++            bytes = bytes.checked_add(peer.resident_bytes_unique(seen)?)
++                .ok_or("resident cache charge overflows")?;
++        }
++        Ok(bytes)
+     }
+ 
+     pub fn mapped_import_report(&self) -> MappedImportReport {

@@ -1,0 +1,126 @@
+--- a/inference/seismic/runtime/src/native/cuda.rs
++++ b/inference/seismic/runtime/src/native/cuda.rs
+@@ -42,7 +42,9 @@
+     // Attribute a real sealed-model submission with the existing CUDA event
+     // machinery. This diagnostic deliberately disables graph replay; it is
+     // never used as the production throughput measurement.
+-    let diagnose = std::env::var_os("MAGNITUDE_PROFILE_CUDA").is_some()
++    let graph_profile = std::env::var_os("MAGNITUDE_PROFILE_CUDA_GRAPHS").is_some()
++        && list.plans().is_some();
++    let diagnose = (std::env::var_os("MAGNITUDE_PROFILE_CUDA").is_some() || graph_profile)
+         && list.plans().is_some();
+     let anchor = diagnose.then(|| TimelineAnchor::record(device, super::trace::host_seconds))
+         .transpose().map_err(CallError::Execution)?;
+@@ -53,6 +55,7 @@
+         DirectBatch::new(device)
+     }
+     .map_err(CallError::Execution)?;
++    let mut diagnostic_graphs=Vec::new();
+     match list.plans().filter(|_| !timed) {
+         Some(mut key) => {
+             key.extend(addresses(list));
+@@ -81,8 +84,21 @@
+         }
+         None => {
+             for _ in 0..repetitions {
+-                each_launch(list, |_,_,_,launch| match launch {
+-                    Some(launch) => batch.launch(launch).map_err(CallError::Execution),
++                each_launch(list, |dispatch,ordinal,buffers,launch| match launch {
++                    Some(launch) => {
++                        if graph_profile {
++                            let mut builder=DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
++                            if projection::capture(&mut builder,dispatch,ordinal,buffers,launch)? {
++                                let graph=builder.instantiate().map_err(CallError::Execution)?;
++                                batch.replay(&graph).map_err(CallError::Execution)?;
++                                // Diagnostic allocation/module lifetime must
++                                // include the root completion of every peer.
++                                diagnostic_graphs.push(graph);
++                                return Ok(());
++                            }
++                        }
++                        batch.launch(launch).map_err(CallError::Execution)
++                    },
+                     None => {
+                         batch.skip();
+                         Ok(())
+@@ -100,7 +116,7 @@
+             .expect("diagnostic CUDA batches have launch marks");
+         for ((entry, launch), interval) in labels.iter().zip(intervals) {
+             if let Some((start, end)) = interval {
+-                eprintln!("magnitude-cuda-profile entry={entry} launch={launch} seconds={:.9}", end-start);
++                eprintln!("magnitude-cuda-profile entry={entry} launch={launch} parallel_graph={} seconds={:.9}", graph_profile, end-start);
+             }
+         }
+     }
+--- a/inference/seismic/backends/cuda/src/direct.rs
++++ b/inference/seismic/backends/cuda/src/direct.rs
+@@ -353,6 +353,7 @@
+     /// For a timed batch, per `launch` call, the event recorded just before
+     /// the launch (absent for an empty launch).
+     marks: Option<Vec<Option<Event>>>,
++    replay_ends: Vec<(usize, Event)>,
+ }
+ 
+ impl DirectBatch {
+@@ -363,6 +364,7 @@
+             device: device.clone(),
+             start,
+             marks: None,
++            replay_ends: Vec::new(),
+         })
+     }
+ 
+@@ -421,11 +423,18 @@
+     /// Queue every launch of `graph`, in its order. A timed batch launches
+     /// individually instead, so it never replays.
+     pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
+-        assert!(
+-            self.marks.is_none(),
+-            "DirectBatch::replay precondition: a timed batch times each launch"
+-        );
+-        graph.exec.launch(self.device.stream()).map_err(submission)
++        if let Some(marks) = &mut self.marks {
++            let mark = Event::new(self.device.context()).map_err(submission)?;
++            mark.record(self.device.stream()).map_err(submission)?;
++            marks.push(Some(mark));
++        }
++        graph.exec.launch(self.device.stream()).map_err(submission)?;
++        if let Some(marks) = &self.marks {
++            let end=Event::new(self.device.context()).map_err(submission)?;
++            end.record(self.device.stream()).map_err(submission)?;
++            self.replay_ends.push((marks.len()-1,end));
++        }
++        Ok(())
+     }
+ 
+     /// Record completion without waiting.
+@@ -436,6 +445,7 @@
+             start: self.start,
+             end,
+             marks: self.marks,
++            replay_ends: self.replay_ends,
+         })
+     }
+ }
+@@ -479,6 +489,7 @@
+     start: Event,
+     end: Event,
+     marks: Option<Vec<Option<Event>>>,
++    replay_ends: Vec<(usize, Event)>,
+ }
+ 
+ // Events are driver objects usable from any thread with their context made
+@@ -529,11 +540,8 @@
+                 intervals.push(None);
+                 continue;
+             };
+-            let end = marks[index + 1..]
+-                .iter()
+-                .flatten()
+-                .next()
+-                .unwrap_or(&self.end);
++            let end = self.replay_ends.iter().find(|(ordinal,_)|*ordinal==index).map(|(_,end)|end)
++                .unwrap_or_else(|| marks[index + 1..].iter().flatten().next().unwrap_or(&self.end));
+             intervals.push(Some((anchor.place(mark)?, anchor.place(end)?)));
+         }
+         Ok(Some(intervals))

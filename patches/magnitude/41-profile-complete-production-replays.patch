@@ -1,0 +1,146 @@
+--- a/inference/seismic/backends/cuda/src/driver.rs
++++ b/inference/seismic/backends/cuda/src/driver.rs
+@@ -132,6 +132,7 @@
+         graph_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuGraphCreate",
+         graph_add_kernel_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const KernelNodeParams) -> ResultCode => "cuGraphAddKernelNode_v2",
+         graph_add_memcpy_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const Copy3D, Handle) -> ResultCode => "cuGraphAddMemcpyNode",
++        graph_add_event_record_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, Handle) -> ResultCode => "cuGraphAddEventRecordNode",
+         graph_instantiate: unsafe extern "system" fn(*mut Handle, Handle, u64) -> ResultCode => "cuGraphInstantiateWithFlags",
+         graph_launch: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuGraphLaunch",
+         graph_exec_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphExecDestroy",
+@@ -1022,6 +1023,14 @@
+         let add=graph_symbol(self.context.driver.graph_add_kernel_node)?;let _current=self.context.enter()?;let mut raw=std::ptr::null_mut();
+         unsafe {self.context.driver.check(add(&mut raw,self.raw,dependencies.as_ptr(),dependencies.len(),node),"parallel projection kernel")?;}
+         Ok(raw)
++    }
++    pub(crate) fn event_record_node(&mut self,event:&Event)->Result<(),DriverError> {
++        let add=graph_symbol(self.context.driver.graph_add_event_record_node)?;
++        let _current=self.context.enter()?;
++        let dependencies=self.dependencies();let mut node=std::ptr::null_mut();
++        unsafe {self.context.driver.check(add(&mut node,self.raw,dependencies.as_ptr(),dependencies.len(),event.raw),"graph event record")?;}
++        drop(_current);
++        self.join(vec![node]);Ok(())
+     }
+     pub(crate) fn copy_after(&mut self,node:&Copy3D,context:&Arc<Context>,dependencies:&[Handle])->Result<Handle,DriverError> {
+         let add=graph_symbol(self.context.driver.graph_add_memcpy_node)?;let _current=self.context.enter()?;let mut raw=std::ptr::null_mut();
+--- a/inference/seismic/backends/cuda/src/direct.rs
++++ b/inference/seismic/backends/cuda/src/direct.rs
+@@ -276,6 +276,7 @@
+     device: Device,
+     graph: driver::Graph,
+     retained:Vec<Arc<dyn std::any::Any+Send+Sync>>,
++    profile_spans:Vec<Arc<GraphProfileSpan>>,
+ }
+ 
+ impl DirectGraphBuilder {
+@@ -284,6 +285,7 @@
+             device: device.clone(),
+             graph: driver::Graph::new(device.context()).map_err(submission)?,
+             retained:Vec::new(),
++            profile_spans:Vec::new(),
+         })
+     }
+ 
+@@ -311,6 +313,15 @@
+             .map_err(submission)
+     }
+ 
++    pub fn profile_begin(&mut self,label:String)->Result<Arc<GraphProfileSpan>,ExecutionError> {
++        let span=Arc::new(GraphProfileSpan {label,start:Event::new(self.device.context()).map_err(submission)?,end:Event::new(self.device.context()).map_err(submission)?});
++        self.graph.event_record_node(&span.start).map_err(submission)?;
++        Ok(span)
++    }
++    pub fn profile_end(&mut self,span:Arc<GraphProfileSpan>)->Result<(),ExecutionError> {
++        self.graph.event_record_node(&span.end).map_err(submission)?;
++        self.profile_spans.push(span);Ok(())
++    }
+     pub fn retain(&mut self,owner:Arc<dyn std::any::Any+Send+Sync>) {self.retained.push(owner);}
+     pub fn dependencies(&self)->Vec<GraphNode> {self.graph.dependencies().into_iter().map(GraphNode).collect()}
+     pub fn join(&mut self,nodes:Vec<GraphNode>) {self.graph.join(nodes.into_iter().map(|n|n.0).collect());}
+@@ -333,6 +344,7 @@
+         Ok(DirectGraph {
+             exec: self.graph.instantiate().map_err(submission)?,
+             _retained:self.retained,
++            profile_spans:self.profile_spans,
+         })
+     }
+ }
+@@ -343,6 +355,21 @@
+ pub struct DirectGraph {
+     exec: driver::GraphExec,
+     _retained:Vec<Arc<dyn std::any::Any+Send+Sync>>,
++    profile_spans:Vec<Arc<GraphProfileSpan>>,
++}
++
++/// Event spans are owned by one serialized queue's immutable graph. Read
++/// only after its root completion; reuse records the next invocation.
++pub struct GraphProfileSpan {pub label:String,start:Event,end:Event}
++unsafe impl Send for GraphProfileSpan {}
++unsafe impl Sync for GraphProfileSpan {}
++impl GraphProfileSpan {
++    pub fn seconds(&self)->Result<f64,ExecutionError> {
++        Event::elapsed_ns(&self.start,&self.end).map(|ns|ns/1e9).map_err(submission)
++    }
++}
++impl DirectGraph {
++    pub fn profile_spans(&self)->Vec<Arc<GraphProfileSpan>> {self.profile_spans.clone()}
+ }
+ 
+ /// Launches issued in order on the device's stream. The stream orders each
+--- a/inference/seismic/runtime/src/native/cuda.rs
++++ b/inference/seismic/runtime/src/native/cuda.rs
+@@ -39,6 +39,10 @@
+     timed: bool,
+     retained: &Arc<dyn Any + Send + Sync>,
+ ) -> Result<RouteSubmission, CallError> {
++    let production_profile=std::env::var_os("MAGNITUDE_PROFILE_CUDA_REPLAYS").is_some() && list.plans().is_some();
++    let encoding_started=std::time::Instant::now();
++    let mut graph_construction_seconds=0.0;
++    let mut production_spans=Vec::new();
+     // Attribute a real sealed-model submission with the existing CUDA event
+     // machinery. This diagnostic deliberately disables graph replay; it is
+     // never used as the production throughput measurement.
+@@ -63,18 +67,25 @@
+                 key,
+                 retained,
+                 || {
++                    let constructing=std::time::Instant::now();
+                     let mut builder =
+                         DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
+                     each_launch(list, |dispatch,ordinal,buffers,launch| {
+                         if let Some(launch)=launch {
+-                            if projection::capture(&mut builder,dispatch,ordinal,buffers,launch)? {return Ok(());}
+-                            builder.launch(launch).map_err(CallError::Execution)?;
++                            let span=if production_profile {Some(builder.profile_begin(format!("entry={} launch={ordinal}",dispatch.kernel.name)).map_err(CallError::Execution)?)} else {None};
++                            if !projection::capture(&mut builder,dispatch,ordinal,buffers,launch)? {
++                                builder.launch(launch).map_err(CallError::Execution)?;
++                            }
++                            if let Some(span)=span {builder.profile_end(span).map_err(CallError::Execution)?;}
+                         }
+                         Ok(())
+                     })?;
+-                    builder.instantiate().map_err(CallError::Execution)
++                    let graph=builder.instantiate().map_err(CallError::Execution)?;
++                    graph_construction_seconds=constructing.elapsed().as_secs_f64();
++                    Ok(graph)
+                 },
+                 |graph| {
++                    if production_profile {production_spans.extend(graph.profile_spans());}
+                     for _ in 0..repetitions {
+                         batch.replay(graph).map_err(CallError::Execution)?;
+                     }
+@@ -108,6 +119,14 @@
+         }
+     }
+     let submission = batch.commit().map_err(CallError::Execution)?;
++    let encode_seconds=encoding_started.elapsed().as_secs_f64();
++    if production_profile {
++        submission.finish().map_err(CallError::Execution)?;
++        for span in production_spans {
++            eprintln!("magnitude-cuda-replay-profile {} seconds={:.9} repetitions={repetitions}",span.label,span.seconds().map_err(CallError::Execution)?);
++        }
++        eprintln!("magnitude-cuda-replay-submission entries={} gpu_seconds={:.9} encode_seconds={encode_seconds:.9} construct_seconds={graph_construction_seconds:.9}",list.count(),submission.device_seconds().map_err(CallError::Execution)?);
++    }
+     if let Some(anchor) = anchor {
+         submission.finish().map_err(CallError::Execution)?;
+         let labels = super::launch_labels(list, repetitions);

@@ -11,9 +11,10 @@ image-service URLs in the ignored `.env`; never commit that file. No host
 identity or installation path is compiled into the scripts.
 
 Local multi-user LLM serving on three Tesla P100 GPUs, with isolated one-P40
-placement available per model profile. Qwen and Ornith have real Pi tool-flow
-evidence; North Mini Code, GPT-OSS and Granite H-Small have 64K direct-chat and
-minimal-Pi transport evidence on both placements. The production path is
+placement available per model profile. Qwen, Ornith, Swift GSQ and Swift
+Heretic have real Pi tool-flow evidence; North Mini Code, GPT-OSS and Granite
+H-Small have 64K direct-chat and minimal-Pi transport evidence on both
+placements. The production path is
 pinned `llama.cpp` v0.4.0 plus a pinned, zero-fuzz SM60 patch set; this
 repository owns its reproducible build, artifact-driven profiles, deployment,
 Pi integration and evidence ledger, not another inference engine.
@@ -31,6 +32,8 @@ deploying the SM60 patch set; older rows retain their recorded runtime:
 | Qwen3.8-27B, two Pi sessions | same | same | one shared unified pool | concurrent | 14.0-18.8 tok/s/session while overlapping | both sessions passed and remained isolated |
 | Qwen3.8-27B, populated maximum | same | same | 262,016-token cold prompt, F16 K/V | 63.81 tok/s; TTFT 4,106.2 s | 6.18 tok/s | capacity passed; performance failed |
 | Ornith-1.5-35B-A3B | official Q4_K_M, 20.22 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | 592-612 tok/s in Pi | 38.5-40.2 tok/s | direct chat and Pi tool flow passed |
+| Swift 1.5 Qwen3.8 GSQ-RCO | IQ2_S with embedded MTP, 8.95 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 46.37 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
+| Swift 1.5 Qwen3.8 Heretic | i1 Q4_K_M with embedded MTP, 15.66 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 40.55 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | North Mini Code 1.0 | Q4_K_M, 17.46 GiB | 3 x P100 tensor / 1 x P40 | 65,536 shared, F16 K/V | 200.63 / 47.67 tok/s | 45.11 / 30.42 tok/s | direct and minimal Pi transport passed |
 | GPT-OSS-20B | native MXFP4, 11.28 GiB | 3 x P100 tensor / 1 x P40 | 65,536 shared, F16 K/V | 165.07 / 96.08 tok/s | 70.71 / 47.94 tok/s | direct and minimal Pi transport passed |
 | Granite 4.0 H-Small | Q4_K_M, 18.14 GiB | 3 x P100 layer / 1 x P40 | 65,536 shared, F16 K/V | 42.09 / 25.20 tok/s | 28.55 / 16.05 tok/s | direct and minimal Pi transport passed |
@@ -64,6 +67,8 @@ The service is manual, not enabled at boot:
 ./ops/model.sh download qwen-abliterated
 ./ops/model.sh start qwen
 ./ops/model.sh start qwen-abliterated
+./ops/model.sh start swift-gsq
+./ops/model.sh start swift-heretic
 ./ops/model.sh restart ornith
 ./ops/model.sh start nemotron
 ./ops/model.sh start north
@@ -163,6 +168,8 @@ skills, tools and sessions intact:
 ```bash
 ./ops/pi.sh qwen
 ./ops/pi.sh qwen-abliterated
+./ops/pi.sh swift-gsq
+./ops/pi.sh swift-heretic
 ./ops/pi.sh ornith
 ./ops/pi.sh nemotron
 ./ops/pi.sh north
@@ -170,8 +177,10 @@ skills, tools and sessions intact:
 ./ops/pi.sh granite
 ```
 
-Each `config/models/<profile>.env` owns its context and placement. The new
-profiles default to 64K on the three P100s:
+Each `config/models/<profile>.env` owns its context and placement. North,
+GPT-OSS and Granite default to 64K on the three P100s; Qwen, Ornith, Nemotron
+and both Swift profiles declare a 262K shared context pool. The 64K defaults
+are:
 
 ```text
 PASCAL_CUDA_DEVICES=0,1,2
@@ -199,6 +208,8 @@ base URL       ${PASCAL_SERVER_URL}/v1
 API key        local
 Qwen model     qwen3.8-27b-ud-q4-k-m
 Qwen abliterated model qwen3.8-27b-abliterated-ud-q4-k-xl
+Swift GSQ model swift-1.5-qwen3.8-27b-gsq-rco-iq2-s-mtp
+Swift Heretic model swift-1.5-qwen3.8-27b-heretic-i1-q4-k-m
 Ornith model   ornith-1.5-35b-a3b-q4-k-m
 Nemotron model nvidia-nemotron-3.5-lightning-30b-a3b-q4-0 (prepared, unqualified)
 North model     north-mini-code-1.0-q4-k-m

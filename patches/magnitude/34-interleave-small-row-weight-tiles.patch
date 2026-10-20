@@ -1,0 +1,128 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -671,7 +671,9 @@
+     __device__ static __forceinline__ u32 group() { return threadIdx.x / 32 / KSPLIT; }
+     __device__ static __forceinline__ u32 part() { return threadIdx.x / 32 % KSPLIT; }
+     // Global tile-group index of this warp.
+-    __device__ static __forceinline__ u64 tile_group() { return (u64)blockIdx.x * GROUPS + group(); }
++    __device__ static __forceinline__ u64 tile_group() {
++        return (u64)(SPLIT_ROWS ? blockIdx.y : blockIdx.x) * GROUPS + group();
++    }
+ };
+ 
+ // Shared memory of a GEMV block: the KSPLIT reduction of each tile group.
+@@ -709,7 +711,7 @@
+ __device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
+                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
+     if constexpr (Shape::SPLIT_ROWS) {
+-        const u32 row = blockIdx.y;
++        const u32 row = blockIdx.x;
+         if (row >= M)
+             return;
+         const auto row_ready = [&] { return GemvRowSource<decltype(ready())>{ready(), row}; };
+--- a/inference/engine/kernels/kernels/cuda/attention_project.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_project.cu
+@@ -79,7 +79,7 @@
+     const int segment = projection::locate_segment(group, groups);
+     if (project_mode != 0 && segment < 2) {
+         seismic_dependency_start();
+-        const unsigned row_start = SPLIT_ROWS ? blockIdx.y : 0;
++        const unsigned row_start = SPLIT_ROWS ? blockIdx.x : 0;
+         const unsigned row_count = SPLIT_ROWS ? 1 : M;
+         project_zero(s.out[segment], M, s.rows[segment], row_start, row_count, group * Shape::TPW * 16,
+                      Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+--- a/inference/engine/kernels/kernels/cuda_dense.seismic
++++ b/inference/engine/kernels/kernels/cuda_dense.seismic
+@@ -59,11 +59,11 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + 2 * max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 2 * 4096)
+     launch dense_expand_gemv_rows2 when O == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 2, 1)
++        threadgroups (2, ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_expand_gemv_rows4 when O == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 4, 1)
++        threadgroups (4, ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # `dense_expand`'s bands with one weight stream.
+@@ -237,9 +237,9 @@
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_output_gemv_rows2 when O == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 2, 1)
++        threadgroups (2, ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_output_gemv_rows4 when O == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 4, 1)
+-        threads_per_threadgroup (256, 1, 1)
++        threadgroups (4, ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1)
++        threads_per_threadgroup (256, 1, 1)
+--- a/inference/engine/kernels/kernels/attention.seismic
++++ b/inference/engine/kernels/kernels/attention.seismic
+@@ -170,11 +170,11 @@
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_output_gemv_rows2 when M == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 2, 1)
++        threadgroups (2, ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_output_gemv_rows4 when M == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 4, 1)
++        threadgroups (4, ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # Vulkan: the K1 projection (see `attention_project`): GEMV to 8 rows,
+@@ -363,11 +363,11 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 4096)
+     launch attention_project_gemv_rows2 when M == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 2, 1)
++        threadgroups (2, ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_project_gemv_rows4 when M == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 4, 1)
++        threadgroups (4, ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ native attention_project for vulkan from "vulkan/attention_project.comp":
+--- a/inference/engine/kernels/kernels/recurrent.seismic
++++ b/inference/engine/kernels/kernels/recurrent.seismic
+@@ -159,13 +159,13 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 4096)
+     launch gated_delta_project_gemv_rows2 when M == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
+-            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 2, 1)
++        threadgroups (2, ceil_div(ceil_div((2 * NK + NV) * W, 16)
++            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch gated_delta_project_gemv_rows4 when M == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
+-            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 4, 1)
++        threadgroups (4, ceil_div(ceil_div((2 * NK + NV) * W, 16)
++            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Rows
+--- a/inference/engine/kernels/kernels/readout.seismic
++++ b/inference/engine/kernels/kernels/readout.seismic
+@@ -132,11 +132,11 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 4096)
+     launch readout_head_rows_gemv_rows2 when O == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 2, 1)
++        threadgroups (2, ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch readout_head_rows_gemv_rows4 when O == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 4, 1)
++        threadgroups (4, ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Output

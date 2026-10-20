@@ -1,0 +1,140 @@
+--- a/inference/seismic/lang/native-library/cuda/packets.cuh
++++ b/inference/seismic/lang/native-library/cuda/packets.cuh
+@@ -72,6 +72,7 @@
+ // subtracting that power (plus the representation's code offset) exactly.
+ 
+ struct OpBF16 {
++    using Pair = u32;
+     __device__ static __forceinline__ u32 pack(float low, float high) { return seismic_pack_bf16x2(low, high); }
+     // Two codes (bits 0..7 and 16..23, each < 128) minus `OFFSET`.
+     template <u32 OFFSET> __device__ static __forceinline__ u32 codes(u32 pair) {
+@@ -102,6 +103,7 @@
+ };
+ 
+ struct OpF16 {
++    using Pair = u32;
+     __device__ static __forceinline__ u32 pack(float low, float high) { return seismic_pack_f16x2(low, high); }
+     template <u32 OFFSET> __device__ static __forceinline__ u32 codes(u32 pair) {
+         const u32 biased = pair | 0x64006400u;     // 1024 + code
+@@ -126,6 +128,25 @@
+     }
+     __device__ static __forceinline__ float2 unpack(u32 pair) { return seismic_unpack_f16x2(pair); }
+     static constexpr u32 ONES = 0x3C003C00u;
++};
++
++// SIMT packed-weight codes are exact small integers in both 16-bit
++// activation elements. Keep them widened instead of packing and unpacking.
++// Dense weights still receive the declared activation rounding in pack().
++template <class E> struct OpSIMT {
++    using Pair = float2;
++    __device__ static __forceinline__ Pair pack(float low, float high) {
++        return make_float2(E::round(low), E::round(high));
++    }
++    template <u32 OFFSET> __device__ static __forceinline__ Pair codes(u32 pair) {
++        return make_float2((float)(pair & 255u) - (float)OFFSET,
++                          (float)((pair >> 16) & 255u) - (float)OFFSET);
++    }
++    __device__ static __forceinline__ Pair bytes(u32 low, u32 high, int i) {
++        const int first = ((int)(low << (24 - 8 * i))) >> 24;
++        const int second = ((int)(high << (24 - 8 * i))) >> 24;
++        return make_float2((float)first, (float)second);
++    }
+ };
+ 
+ // The MMA operand type of a 16-bit dense element. An F32 element has no exact
+@@ -260,7 +281,7 @@
+         return raw;
+     }
+     // A registers of k16 step `step`.
+-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
++    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+         const u32 word = word_of(raw.low, step);
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) {
+@@ -442,7 +463,7 @@
+     __device__ static __forceinline__ u32 high_bits(const Raw &raw, int step) {
+         return ((step < 2 ? raw.high.x : raw.high.y) >> (16 * (step % 2))) & 0xFFFFu;
+     }
+-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
++    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+         const u32 word = word_of(raw.low, step);
+         const u32 high = high_bits(raw, step);
+ #pragma unroll
+@@ -568,7 +589,7 @@
+         low = step % 2 == 0 ? half.x : half.z;
+         high = step % 2 == 0 ? half.y : half.w;
+     }
+-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
++    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+         u32 low, high;
+         slots(raw, step, low, high);
+ #pragma unroll
+@@ -666,7 +687,7 @@
+         const u32 high = prmt(W2, W3, codes & 0x7777u);
+         return prmt(low, high, 0x3210u | ((codes & 0x8888u) >> 1));
+     }
+-    template <class O> __device__ static __forceinline__ void decode(u32 word, u32 (&a)[4]) {
++    template <class O> __device__ static __forceinline__ void decode(u32 word, typename O::Pair (&a)[4]) {
+         const u32 low = values(word & 0xFFFFu), high = values(word >> 16);
+ #pragma unroll
+         for (int i = 0; i < 4; ++i)
+@@ -690,7 +711,7 @@
+ // with the offset subtracted exactly (`O::codes<OFFSET>`, a bytewise s8
+ // subtraction) instead of a table lookup.
+ template <u32 OFFSET> struct LinearCodebook {
+-    template <class O> __device__ static __forceinline__ void decode(u32 word, u32 (&a)[4]) {
++    template <class O> __device__ static __forceinline__ void decode(u32 word, typename O::Pair (&a)[4]) {
+ #pragma unroll
+         for (int i = 0; i < 4; ++i)
+             a[i] = O::template codes<OFFSET>((word >> (4 * i)) & 0x000F000Fu);
+@@ -854,7 +875,7 @@
+         return super;
+     }
+     __device__ __forceinline__ Raw raw(const Super &super, int q, u32) const { return Raw{super.low[q]}; }
+-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
++    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+         C::template decode<O>(word_of(raw.low, step), a);
+     }
+     __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const { return C::s8(word_of(raw.low, step)); }
+@@ -963,7 +984,7 @@
+         return super;
+     }
+     __device__ __forceinline__ Raw raw(const Super &super, int q, u32) const { return super.raw[q]; }
+-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
++    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+         const u32 word = word_of(raw.low, step);
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) {
+@@ -1139,7 +1160,7 @@
+         else
+             return E::unpack2(raw.w[step][i][0]);
+     }
+-    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
++    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) {
+             if constexpr (NativeOperand<O, E>::value) {
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -271,10 +271,10 @@
+     constexpr int STEPS = W::GROUP / 16;
+ #pragma unroll
+     for (int group = 0; group < W::GROUPS; ++group) {
+-        u32 a[STEPS][4];
++        float2 a[STEPS][4];
+ #pragma unroll
+         for (int j = 0; j < STEPS; ++j)
+-            w.template decode<Op>(raw, group * STEPS + j, a[j]);
++            w.template decode<packets::OpSIMT<Act>>(raw, group * STEPS + j, a[j]);
+ #pragma unroll
+         for (int nb = 0; nb < NB; ++nb)
+         for (u32 column = 0; column < 8 && 8 * nb + column < M; ++column) {
+@@ -290,7 +290,7 @@
+                 for (int half = 0; half < 2; ++half) {
+ #pragma unroll
+                     for (int row = 0; row < 2; ++row) {
+-                        const float2 code = Op::unpack(a[j][2 * half + row]);
++                        const float2 code = a[j][2 * half + row];
+                         p[row] = seismic_fma_rn(code.x, x[half].x, p[row]);
+                         p[row] = seismic_fma_rn(code.y, x[half].y, p[row]);
+                     }

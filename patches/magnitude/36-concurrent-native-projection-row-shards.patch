@@ -1,0 +1,1306 @@
+--- a/inference/engine/executor/src/planning/placement.rs
++++ b/inference/engine/executor/src/planning/placement.rs
+@@ -58,6 +58,34 @@
+ }
+ 
+ impl LayerPlacement {
++    /// Replace serial-owner weights with exact page charges and a conservative
++    /// bound for small immutable peer copies. State ownership stays unchanged.
++    pub fn with_projection_weights(mut self,load:&ModelLoadPlan,devices:&[std::rc::Rc<seismic::Device>])->Result<Self,String> {
++        if devices.len()!=self.stages.len() {return Err("projection physical owners differ from placement".into());}
++        let peers=devices.iter().map(|device|device.as_ref()).collect::<Vec<_>>();
++        let mut costs=vec![0u64;devices.len()];let mut seen=HashSet::new();
++        let add=|target:&mut u64,bytes:u64|->Result<(),String> {*target=target.checked_add(bytes).ok_or("projection weight charge overflows")?;Ok(())};
++        for weight in load.weights() {
++            let owner=block_index(weight.role.scope).and_then(|block|self.block_owner(block)).unwrap_or(0);
++            if !seen.insert((owner,weight.storage_identity())) {continue;}
++            if let Some(charges)=devices[owner].projection_weight_costs(weight.resident,&weight.shape,&peers).map_err(|e|e.to_string())? {
++                for (cost,bytes) in costs.iter_mut().zip(charges) {add(cost,bytes)?;}
++                if let Some(scale)=&weight.scale {for cost in &mut costs {add(cost,scale.resident_bytes)?;}}
++            } else {
++                // Every original small weight remains owner-local. A shared
++                // projection may retain a local readonly copy on other cards;
++                // bound all of them instead of assuming cache reuse/capacity.
++                for cost in &mut costs {add(cost,weight.storage_bytes()?)?;}
++            }
++        }
++        for (stage,bytes) in self.stages.iter_mut().zip(costs) {
++            stage.charge.weights=bytes;
++            if stage.charge.total()?.checked_add(stage.budget.reserved_bytes).ok_or("projection peak overflows")?>stage.budget.capacity_bytes {
++                return Err(format!("projection pages/state/reserve exceed physical capacity on {}",stage.budget.device));
++            }
++        }
++        Ok(self)
++    }
+     /// Search nonempty contiguous stages, keeping entry/readout/drafter on
+     /// stage zero. The exact importer roles and state descriptors are the
+     /// authority; model names and GGUF filename patterns are not inspected.
+--- a/inference/engine/executor/src/residency.rs
++++ b/inference/engine/executor/src/residency.rs
+@@ -306,6 +306,7 @@
+     execution: ExecutionPlan,
+     domain: ResourceDomainId,
+     peers: Vec<ResidencyStore>,
++    projection_owners:Vec<Rc<Device>>,
+     placement: Option<crate::LayerPlacement>,
+     resident: HashMap<ResidencyKey, ResidentWeight>,
+     mapped_import: MappedImportReport,
+@@ -333,6 +334,7 @@
+             execution,
+             domain,
+             peers: Vec::new(),
++            projection_owners:Vec::new(),
+             placement: None,
+             resident: HashMap::new(),
+             mapped_import: MappedImportReport::default(),
+@@ -349,6 +351,10 @@
+         let mut store=Self::new(devices[0].clone(),programs.clone(),execution.clone(),domain.clone())?;
+         store.peers=devices.iter().skip(1).zip(programs.peers()).map(|(device,programs)|
+             Self::new(device.clone(),programs.clone(),execution.clone(),domain.clone())).collect::<Result<Vec<_>,_>>()?;
++        if std::env::var_os("MAGNITUDE_PARALLEL_PROJECTIONS").is_some() {
++            store.projection_owners=devices.to_vec();
++            for peer in &mut store.peers {peer.projection_owners=devices.to_vec();}
++        }
+         store.placement=Some(placement.clone());Ok(store)
+     }
+     pub(crate) fn import_role(&mut self, role: WeightRole,artifact: &GgufArtifact,
+@@ -369,7 +375,11 @@
+     }
+ 
+     /// Cache a completed import, counting it toward the import in progress.
+-    fn publish(&mut self, key: ResidencyKey, weight: ResidentWeight) {
++    fn publish(&mut self, key: ResidencyKey, weight: ResidentWeight)->Result<(),WeightImportError> {
++        if !self.projection_owners.is_empty() {
++            weight.tensor.publish_immutable().map_err(|e|WeightImportError::Device(e.to_string()))?;
++            if let Some(scale)=&weight.scale {scale.publish_immutable().map_err(|e|WeightImportError::Device(e.to_string()))?;}
++        }
+         if let Some(progress) = &mut self.import_progress {
+             // Planned and allocated storage agree; the bound keeps a
+             // disagreement from reporting past completion.
+@@ -379,7 +389,7 @@
+                 .min(progress.total);
+             (progress.observer)(progress.completed, progress.total);
+         }
+-        self.resident.insert(key, weight);
++        self.resident.insert(key, weight);Ok(())
+     }
+ 
+     pub fn device(&self) -> &Device {
+@@ -477,7 +487,7 @@
+             tensor,
+             scale: None,
+         };
+-        self.publish(key, weight.clone());
++        self.publish(key, weight.clone())?;
+         Ok(weight)
+     }
+ 
+@@ -536,7 +546,7 @@
+             tensor: destination.into_tensor(),
+             scale,
+         };
+-        self.publish(key, weight.clone());
++        self.publish(key, weight.clone())?;
+         Ok(weight)
+     }
+ 
+@@ -626,6 +636,11 @@
+             // Metal import kernels write every physical byte, including the
+             // packed layout's row and plane padding, before submission returns.
+             unsafe { Tensor::uninitialized(&self.device, planned.resident, &planned.shape) }
++        } else if !self.projection_owners.is_empty() {
++            let owners=self.projection_owners.iter().map(|device|device.as_ref()).collect::<Vec<_>>();
++            if self.device.projection_weight_costs(planned.resident,&planned.shape,&owners).map_err(|e|WeightImportError::Device(e.to_string()))?.is_some() {
++                Tensor::row_sharded(&self.device,planned.resident,&planned.shape,&owners)
++            } else {Tensor::zeros(&self.device,planned.resident,&planned.shape)}
+         } else {
+             Tensor::zeros(&self.device, planned.resident, &planned.shape)
+         }
+@@ -875,7 +890,7 @@
+                             tensor: destination.into_tensor(),
+                             scale,
+                         },
+-                    );
++                    )?;
+                 }
+                 report.publishing += publishing.elapsed();
+             }
+--- a/inference/engine/executor/src/resident_weights.rs
++++ b/inference/engine/executor/src/resident_weights.rs
+@@ -201,7 +201,7 @@
+             if seen.iter().any(|other| other.shares_allocation(tensor)) {
+                 return;
+             }
+-            total = total.and_then(|bytes| bytes.checked_add(weight.storage_bytes()));
++            total = total.and_then(|bytes| bytes.checked_add(weight.tensor().physical_storage_bytes()+weight.scale().map_or(0,Tensor::physical_storage_bytes)));
+             seen.push(tensor);
+         });
+         total.ok_or("resident target charge overflows")
+@@ -211,11 +211,10 @@
+         let mut total = Some(0u64);
+         self.visit_weights(|weight| {
+             let tensor=weight.tensor();
+-            if !tensor.belongs_to(device) { return; }
+             if seen.iter().any(|other| other.shares_allocation(tensor)) {
+                 return;
+             }
+-            total = total.and_then(|bytes| bytes.checked_add(weight.storage_bytes()));
++            total = total.and_then(|bytes| bytes.checked_add(weight.tensor().physical_storage_bytes_on(device)+weight.scale().map_or(0,|scale|scale.physical_storage_bytes_on(device))));
+             seen.push(tensor);
+         });
+         total.ok_or("resident target charge overflows")
+--- a/inference/engine/kernels/kernels/cuda/attention_project.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_project.cu
+@@ -78,6 +78,7 @@
+         projection::gemv_groups<Shape>(s.rows[2]), projection::gemv_groups<Shape>(s.rows[3])};
+     const int segment = projection::locate_segment(group, groups);
+     if (project_mode != 0 && segment < 2) {
++        if(!projection::owns_projection_rows(group*Shape::TPW*16,s.rows[segment]))return;
+         seismic_dependency_start();
+         project_zero(s.out[segment], M, s.rows[segment], 0, M, group * Shape::TPW * 16,
+                      Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -52,7 +52,23 @@
+ #include <seismic/packets.cuh>
+ #include "../core/reduce.cuh"
+ 
++// Original modules keep count=0. The graph owns separate immutable copies
++// of a projection module on each physical device and sets these two symbols
++// before its first launch. Import and numerical-oracle modules stay full.
++extern "C" {
++__device__ __constant__ unsigned long long seismic_projection_shard_index = 0;
++__device__ __constant__ unsigned long long seismic_projection_shard_count = 0;
++}
+ namespace projection {
++__device__ __forceinline__ bool owns_projection_rows(unsigned long long first,unsigned long long rows) {
++    const auto count=seismic_projection_shard_count;
++    if(count==0)return true;
++    const auto index=seismic_projection_shard_index;
++    const auto groups=(rows+127)/128;
++    const auto begin=128*(groups*index/count);
++    const auto end=128*(groups*(index+1)/count);
++    return first>=begin && first<end && first<rows;
++}
+ 
+ using element::u8;
+ using element::u16;
+@@ -907,6 +923,9 @@
+ template <class Shape, class Ready, class WA, class WB, class Epi, class Shared>
+ __device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
+                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
++    // The decision is uniform across every KSPLIT warp cohort. No skipped
++    // cohort enters its named barrier or reads an unmapped local view.
++    if(!owns_projection_rows(group*Shape::TPW*16,rows))return;
+     gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB>(ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows,
+                                                      wa, wb, epi, shared.reduce[Shape::group()], 1 + Shape::group(),
+                                                      Shape::part());
+@@ -1754,6 +1773,8 @@
+ __device__ __forceinline__ void gemm_run(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
+                                          u64 K, u64 nblock, u64 rows, const WA &wa, const WB &wb, const Epi &epi,
+                                          u64 part = 0, u64 parts = 1) {
++    // Retain the original grid coordinates and all row-band/rotation logic.
++    if(!owns_projection_rows(nblock*128,rows))return;
+     if constexpr (S8)
+         gemm_segment_s8<Shape>(shared, QuantizedRows{act, K, reinterpret_cast<const float2 *>(groups)}, M, K, nblock,
+                                rows, wa, wb, epi, part, parts);
+--- a/inference/engine/src/execution.rs
++++ b/inference/engine/src/execution.rs
+@@ -131,10 +131,10 @@
+         budgets.push(magnitude_executor::PhysicalStageBudget { device:peer.info.selector,capacity_bytes:peer.assessment_capacity_bytes,reserved_bytes:1<<30 });
+         selected_peers.push(peer);
+     }
+-    let placement=if selected_peers.is_empty() { None } else { Some(magnitude_executor::LayerPlacement::derive(
++    let mut placement=if selected_peers.is_empty() { None } else { Some(magnitude_executor::LayerPlacement::derive(
+         &manifest.definition,draft.load(),draft.policy().method(),manifest.model.kv_codec,&budgets,
+         3+usize::from(draft.policy().limits().lookahead)).map_err(internal)?) };
+-    let state=match &placement {
++    let mut state=match &placement {
+         Some(placement)=>ResourcePlanner::state_plan_placed(&manifest.definition,draft.load(),draft.policy().method(),
+             manifest.model.kv_codec,draft.policy().limits(),placement,capacity.tensor_operations),
+         None=>ResourcePlanner::state_plan(&manifest.definition,draft.load(),draft.policy().method(),
+@@ -186,6 +186,14 @@
+             cache:kernel_cache.as_deref(),error_classes:&error_classes,
+         }).map_err(|error|LoadError::from(classify_catalog(error)))?;
+         peer_programs.push(Rc::new(attested));peers.push(opened_peer);
++    }
++    if std::env::var_os("MAGNITUDE_PARALLEL_PROJECTIONS").is_some() {
++        if let Some(original)=placement.take() {
++            let devices=std::iter::once(opened.device().clone()).chain(peers.iter().map(|peer|peer.device().clone())).collect::<Vec<_>>();
++            let adjusted=original.with_projection_weights(draft.load(),&devices).map_err(internal)?;
++            state=ResourcePlanner::state_plan_placed(&manifest.definition,draft.load(),draft.policy().method(),manifest.model.kv_codec,draft.policy().limits(),&adjusted,capacity.tensor_operations).map_err(internal)?;
++            placement=Some(adjusted);
++        }
+     }
+     if let Some(placement)=&placement { programs.install_layer_placement(placement,peer_programs).map_err(internal)?; }
+     let tuned = programs.tuned();
+--- a/inference/seismic/api/src/lib.rs
++++ b/inference/seismic/api/src/lib.rs
+@@ -255,6 +255,10 @@
+     pub fn capabilities(&self) -> &[String] {
+         self.inner.capabilities()
+     }
++    pub fn projection_weight_costs(&self,element:Element,extents:&[u64],owners:&[&Device])->Result<Option<Vec<u64>>,TensorError> {
++        let owners=owners.iter().map(|device|device.inner().clone()).collect::<Vec<_>>();
++        self.inner.projection_weight_costs(element.id(),extents,&owners)
++    }
+     pub fn backend(&self) -> BackendName {
+         self.inner.info().backend
+     }
+@@ -667,6 +671,14 @@
+             inner: Arc::new(inner),
+         })
+     }
++    pub fn row_sharded(device:&Device,element:Element,extents:&[u64],owners:&[&Device])->Result<Tensor,TensorError> {
++        let owners=owners.iter().map(|device|device.inner().clone()).collect::<Vec<_>>();
++        seismic_runtime::api::tensor::TensorInner::row_sharded(device.inner(),element.id(),extents,&owners)
++            .map(|inner|Tensor {inner:Arc::new(inner)})
++    }
++    pub fn physical_storage_bytes_on(&self,device:&Device)->u64 {self.inner.physical_storage_bytes_on(device.inner())}
++    pub fn physical_storage_bytes(&self)->u64 {self.inner.physical_storage_bytes()}
++    pub fn publish_immutable(&self)->Result<(),ExecutionError> {self.inner.publish_immutable()}
+     /// A zero-filled tensor over `extents` whose leading-axis rows
+     /// `[0, committed)` are physically backed and charged. The rest of the
+     /// leading extent is reserved address space: graphs are sealed over the
+--- a/inference/seismic/backends/cuda/src/buffer.rs
++++ b/inference/seismic/backends/cuda/src/buffer.rs
+@@ -2,16 +2,20 @@
+ //! pinned host memory mapped into the device address space, or the backed
+ //! prefix of a reserved device address range.
+ 
+-use crate::driver::{self, Allocation, DriverError, HostMapped, Reservation};
++use crate::driver::{self, Allocation, DriverError, HostMapped, Reservation, RowShards, RowShardPlan};
+ use std::sync::Arc;
++use seismic_compiler::errors::ExecutionError;
++use std::sync::atomic::{AtomicBool,Ordering};
+ 
+ #[derive(Clone)]
+ pub struct Buffer {
+     memory: Arc<Memory>,
++    immutable: Arc<AtomicBool>,
+ }
+ 
+ enum Memory {
+     Device(Allocation),
++    RowShards(Arc<RowShards>),
+     /// Host-written inputs: filled by the host without a driver call.
+     Mapped(HostMapped),
+     /// The leading `bytes` of a reservation, which are backed. Buffers of
+@@ -26,17 +30,43 @@
+     pub(crate) fn device(allocation: Allocation) -> Self {
+         Self {
+             memory: Arc::new(Memory::Device(allocation)),
++            immutable: Arc::new(AtomicBool::new(false)),
+         }
+     }
+     pub(crate) fn mapped(mapped: HostMapped) -> Self {
+         Self {
+             memory: Arc::new(Memory::Mapped(mapped)),
++            immutable: Arc::new(AtomicBool::new(false)),
+         }
+     }
+     pub(crate) fn reserved(reservation: Arc<Reservation>, bytes: usize) -> Self {
+         Self {
+             memory: Arc::new(Memory::Reserved { reservation, bytes }),
++            immutable: Arc::new(AtomicBool::new(false)),
+         }
++    }
++    pub(crate) fn row_sharded(shards: RowShards) -> Self {
++        let immutable=shards.frozen.clone();
++        Self {memory:Arc::new(Memory::RowShards(Arc::new(shards))),immutable}
++    }
++    pub fn sharded_physical_bytes_on(&self,ordinal:u32)->Option<u64> {
++        match &*self.memory {Memory::RowShards(shards)=>Some(shards.physical_bytes_on(ordinal as i32)),_=>None}
++    }
++    pub fn row_shard_plan(&self) -> Option<&RowShardPlan> {
++        match &*self.memory {Memory::RowShards(shards)=>Some(&shards.plan),_=>None}
++    }
++    /// A partial view is permitted only after canonical import and boundary
++    /// publication, and only for the caller's sealed projection row range.
++    pub fn projection_pointer(&self,ordinal:u32) -> Result<u64,ExecutionError> {
++        match &*self.memory {Memory::RowShards(shards)=>shards.view(ordinal as i32).map_err(|e|ExecutionError::SubmissionFailed(e.to_string())),_=>Ok(self.pointer())}
++    }
++    pub fn mapped_host_pointer(&self)->Option<u64> {
++        match &*self.memory {Memory::Mapped(mapped)=>Some(mapped.host_pointer()),_=>None}
++    }
++    pub fn immutable_flag(&self) -> Arc<AtomicBool> {self.immutable.clone()}
++    pub fn publish_immutable(&self) -> Result<(),ExecutionError> {
++        if let Memory::RowShards(shards)=&*self.memory {shards.publish().map_err(|e|ExecutionError::SubmissionFailed(e.to_string()))?;}
++        self.immutable.store(true,Ordering::Release);Ok(())
+     }
+     /// Whether this buffer is the backed prefix of a reservation, which
+     /// `Device::recommit` resizes in place.
+@@ -47,12 +77,13 @@
+     pub(crate) fn reservation(&self) -> Option<&Arc<Reservation>> {
+         match &*self.memory {
+             Memory::Reserved { reservation, .. } => Some(reservation),
+-            Memory::Device(_) | Memory::Mapped(_) => None,
++            Memory::Device(_) | Memory::Mapped(_) | Memory::RowShards(_) => None,
+         }
+     }
+     pub fn len(&self) -> u64 {
+         match &*self.memory {
+             Memory::Device(allocation) => allocation.bytes as u64,
++            Memory::RowShards(shards) => shards.plan.canonical_bytes,
+             Memory::Mapped(mapped) => mapped.bytes as u64,
+             Memory::Reserved { bytes, .. } => *bytes as u64,
+         }
+@@ -61,6 +92,7 @@
+     pub fn pointer(&self) -> u64 {
+         match &*self.memory {
+             Memory::Device(allocation) => allocation.pointer,
++            Memory::RowShards(shards) => shards.master,
+             Memory::Mapped(mapped) => mapped.device,
+             Memory::Reserved { reservation, .. } => reservation.base,
+         }
+@@ -69,8 +101,15 @@
+     /// on the non-blocking transfer stream, ordered only by the caller's
+     /// access fence; mapped memory is written in place.
+     pub(crate) fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), DriverError> {
++        if self.immutable.load(Ordering::Acquire) {
++            return Err(DriverError {operation:"weight upload",code:-1,description:"immutable weight is already published".into()});
++        }
+         match &*self.memory {
+             Memory::Device(allocation) => allocation.upload_at(offset, bytes),
++            Memory::RowShards(shards) => {
++                assert_within(offset,bytes.len(),shards.plan.canonical_bytes as usize,"upload_at");
++                driver::upload(shards.context(),shards.master+offset as u64,bytes)
++            },
+             Memory::Mapped(mapped) => {
+                 mapped.write_at(offset, bytes);
+                 Ok(())
+@@ -92,6 +131,10 @@
+     pub(crate) fn download_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DriverError> {
+         match &*self.memory {
+             Memory::Device(allocation) => allocation.download_at(offset, bytes),
++            Memory::RowShards(shards) => {
++                assert_within(offset,bytes.len(),shards.plan.canonical_bytes as usize,"download_at");
++                driver::download(shards.context(),shards.master+offset as u64,bytes)
++            },
+             Memory::Mapped(mapped) => {
+                 mapped.read_at(offset, bytes);
+                 Ok(())
+--- a/inference/seismic/backends/cuda/src/direct.rs
++++ b/inference/seismic/backends/cuda/src/direct.rs
+@@ -22,6 +22,9 @@
+     /// Keeps the functions' module loaded.
+     _module: Arc<Module>,
+     functions: Vec<DirectFunction>,
++    image: Arc<Vec<u8>>,
++    symbols: Vec<String>,
++    projection_modules: std::sync::Mutex<std::collections::HashMap<(u32,u64,u64),Arc<DirectModule>>>,
+     /// How a replayed launch of this module depends on the launch before
+     /// it: programmatic when the source declares
+     /// `SEISMIC_PROGRAMMATIC_DEPENDENCY` (every kernel waits for its
+@@ -122,10 +125,26 @@
+         Ok(Self {
+             _module: Arc::new(module),
+             functions,
++            image:Arc::new(image.to_vec()),
++            symbols:kernels.iter().map(|name|name.to_string()).collect(),
++            projection_modules:std::sync::Mutex::new(std::collections::HashMap::new()),
+             edge,
+         })
+     }
+ 
++    /// Separate modules keep validation/import functions unpartitioned. Their
++    /// row controls are immutable for the lifetime of every captured graph.
++    pub fn projection_module(&self,device:&Device,index:u64,count:u64)->Result<Arc<DirectModule>,ExecutionError> {
++        if count<2 || index>=count {return Err(ExecutionError::SubmissionFailed("invalid projection device index".into()));}
++        let key=(device.ordinal(),index,count);
++        let mut modules=self.projection_modules.lock().expect("projection module cache lock poisoned");
++        if let Some(module)=modules.get(&key) {return Ok(module.clone());}
++        let names=self.symbols.iter().map(String::as_str).collect::<Vec<_>>();
++        let module=Self::load(device,&self.image,&names).map_err(|e|ExecutionError::SubmissionFailed(e.to_string()))?;
++        driver::module_u64(&module._module,"seismic_projection_shard_index",index).map_err(submission)?;
++        driver::module_u64(&module._module,"seismic_projection_shard_count",count).map_err(submission)?;
++        let module=Arc::new(module);modules.insert(key,module.clone());Ok(module)
++    }
+     pub fn max_threads_per_block(&self, function: usize) -> u64 {
+         self.functions[function].max_threads
+     }
+@@ -142,6 +161,7 @@
+     pub function: usize,
+     /// Buffer arguments in ABI order, as `(buffer, byte offset)`.
+     pub buffers: &'a [(&'a Buffer, u64)],
++    pub pointer_overrides: Option<&'a [u64]>,
+     /// The argument words, passed by value as one struct parameter.
+     pub words: &'a [u8],
+     pub scalar_results: (&'a Buffer, u64),
+@@ -193,12 +213,12 @@
+                 .fetch_max(launch.shared_bytes, Ordering::AcqRel);
+         }
+         let mut pointers = Vec::with_capacity(launch.buffers.len() + 1);
+-        pointers.extend(
+-            launch
+-                .buffers
+-                .iter()
+-                .map(|(buffer, offset)| buffer.pointer() + offset),
+-        );
++        if let Some(overrides)=launch.pointer_overrides {
++            if overrides.len()!=launch.buffers.len() {return Err(ExecutionError::SubmissionFailed("projection pointer override ABI differs".into()));}
++            pointers.extend_from_slice(overrides);
++        } else {
++            pointers.extend(launch.buffers.iter().map(|(buffer,offset)|buffer.pointer()+offset));
++        }
+         pointers.push(launch.scalar_results.0.pointer() + launch.scalar_results.1);
+         // The prefix declares at least one word, so an entry without words
+         // still passes one zeroed word.
+@@ -250,9 +270,12 @@
+ }
+ 
+ /// Forms a [`DirectGraph`]: the launches of one submission, in order.
++#[derive(Clone,Copy)]
++pub struct GraphNode(Handle);
+ pub struct DirectGraphBuilder {
+     device: Device,
+     graph: driver::Graph,
++    retained:Vec<Arc<dyn std::any::Any+Send+Sync>>,
+ }
+ 
+ impl DirectGraphBuilder {
+@@ -260,6 +283,7 @@
+         Ok(Self {
+             device: device.clone(),
+             graph: driver::Graph::new(device.context()).map_err(submission)?,
++            retained:Vec::new(),
+         })
+     }
+ 
+@@ -287,9 +311,28 @@
+             .map_err(submission)
+     }
+ 
++    pub fn retain(&mut self,owner:Arc<dyn std::any::Any+Send+Sync>) {self.retained.push(owner);}
++    pub fn dependencies(&self)->Vec<GraphNode> {self.graph.dependencies().into_iter().map(GraphNode).collect()}
++    pub fn join(&mut self,nodes:Vec<GraphNode>) {self.graph.join(nodes.into_iter().map(|n|n.0).collect());}
++    pub fn kernel_after(&mut self,device:&Device,launch:&DirectLaunch<'_>,dependencies:&[GraphNode])->Result<Option<GraphNode>,ExecutionError> {
++        let Some(mut formed)=FormedLaunch::form(device,launch)? else {return Ok(None);};let mut parameters=formed.parameters();
++        let params=driver::KernelNodeParams {function:formed.function,grid:formed.grid,block:formed.block,shared_bytes:formed.shared_bytes,parameters:parameters.as_mut_ptr(),extra:std::ptr::null_mut(),kernel:std::ptr::null_mut(),context:std::ptr::null_mut()};
++        let dependencies=dependencies.iter().map(|n|n.0).collect::<Vec<_>>();
++        self.graph.kernel_after(&params,&dependencies).map(GraphNode).map(Some).map_err(submission)
++    }
++    /// A pitched device/portable-host input or device output copy. Its
++    /// producer dependencies and destination context are explicit.
++    pub fn copy_after(&mut self,device:&Device,source:u64,source_host:Option<u64>,destination:u64,width:u64,height:u64,source_pitch:u64,destination_pitch:u64,dependencies:&[GraphNode])->Result<GraphNode,ExecutionError> {
++        let size=|v|usize::try_from(v).map_err(|_|ExecutionError::SubmissionFailed("projection copy exceeds host address space".into()));
++        let mut copy=driver::Copy3D::device(source,destination,size(width)?,size(height)?,size(source_pitch)?,size(destination_pitch)?);
++        if let Some(host)=source_host {copy.src_kind=1;copy.src_device=0;copy.src_host=host as *const c_void;}
++        let dependencies=dependencies.iter().map(|n|n.0).collect::<Vec<_>>();
++        self.graph.copy_after(&copy,device.context(),&dependencies).map(GraphNode).map_err(submission)
++    }
+     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
+         Ok(DirectGraph {
+             exec: self.graph.instantiate().map_err(submission)?,
++            _retained:self.retained,
+         })
+     }
+ }
+@@ -299,6 +342,7 @@
+ /// runs them in order, as the stream would.
+ pub struct DirectGraph {
+     exec: driver::GraphExec,
++    _retained:Vec<Arc<dyn std::any::Any+Send+Sync>>,
+ }
+ 
+ /// Launches issued in order on the device's stream. The stream orders each
+--- a/inference/seismic/backends/cuda/src/driver.rs
++++ b/inference/seismic/backends/cuda/src/driver.rs
+@@ -14,6 +14,7 @@
+ //! ([`Context::enter`]); the context object itself may be shared between
+ //! threads, which is why the handles below are `Send + Sync`.
+ 
++use std::ffi::CString;
+ use libloading::Library;
+ use std::ffi::{c_char, c_int, c_uchar, c_uint, c_void, CStr};
+ use std::fmt;
+@@ -130,6 +131,7 @@
+         // Driver API 12.0+: explicitly built kernel graphs (direct-native replay).
+         graph_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuGraphCreate",
+         graph_add_kernel_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const KernelNodeParams) -> ResultCode => "cuGraphAddKernelNode_v2",
++        graph_add_memcpy_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const Copy3D, Handle) -> ResultCode => "cuGraphAddMemcpyNode",
+         graph_instantiate: unsafe extern "system" fn(*mut Handle, Handle, u64) -> ResultCode => "cuGraphInstantiateWithFlags",
+         graph_launch: unsafe extern "system" fn(Handle, Handle) -> ResultCode => "cuGraphLaunch",
+         graph_exec_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuGraphExecDestroy",
+@@ -940,6 +942,7 @@
+ pub(crate) struct Graph {
+     raw: Handle,
+     last: Option<Handle>,
++    frontier: Vec<Handle>,
+     context: Arc<Context>,
+ }
+ 
+@@ -956,6 +959,7 @@
+         Ok(Self {
+             raw,
+             last: None,
++            frontier: Vec::new(),
+             context: context.clone(),
+         })
+     }
+@@ -967,11 +971,11 @@
+         let add = graph_symbol(self.context.driver.graph_add_kernel_node)?;
+         let _current = self.context.enter()?;
+         let mut raw = std::ptr::null_mut();
+-        let programmatic = edge == Edge::Programmatic && self.last.is_some();
++        let programmatic = edge == Edge::Programmatic && self.last.is_some() && self.frontier.len()==1;
+         let dependencies = if programmatic {
+             &[][..]
+         } else {
+-            self.last.as_slice()
++            self.frontier.as_slice()
+         };
+         unsafe {
+             self.context.driver.check(
+@@ -1006,9 +1010,24 @@
+             }
+         }
+         self.last = Some(raw);
++        self.frontier=vec![raw];
+         Ok(())
+     }
+ 
++    pub(crate) fn dependencies(&self)->Vec<Handle> {self.frontier.clone()}
++    pub(crate) fn join(&mut self,nodes:Vec<Handle>) {
++        self.last=if nodes.len()==1 {Some(nodes[0])} else {None};self.frontier=nodes;
++    }
++    pub(crate) fn kernel_after(&mut self,node:&KernelNodeParams,dependencies:&[Handle])->Result<Handle,DriverError> {
++        let add=graph_symbol(self.context.driver.graph_add_kernel_node)?;let _current=self.context.enter()?;let mut raw=std::ptr::null_mut();
++        unsafe {self.context.driver.check(add(&mut raw,self.raw,dependencies.as_ptr(),dependencies.len(),node),"parallel projection kernel")?;}
++        Ok(raw)
++    }
++    pub(crate) fn copy_after(&mut self,node:&Copy3D,context:&Arc<Context>,dependencies:&[Handle])->Result<Handle,DriverError> {
++        let add=graph_symbol(self.context.driver.graph_add_memcpy_node)?;let _current=self.context.enter()?;let mut raw=std::ptr::null_mut();
++        unsafe {self.context.driver.check(add(&mut raw,self.raw,dependencies.as_ptr(),dependencies.len(),node,context.raw),"parallel projection copy")?;}
++        Ok(raw)
++    }
+     pub fn instantiate(self) -> Result<GraphExec, DriverError> {
+         let instantiate = graph_symbol(self.context.driver.graph_instantiate)?;
+         let _current = self.context.enter()?;
+@@ -1091,6 +1110,7 @@
+ unsafe impl Sync for HostMapped {}
+ 
+ impl HostMapped {
++    pub(crate) fn host_pointer(&self)->u64 {self.host as u64}
+     pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
+         // CU_MEMHOSTALLOC_DEVICEMAP
+         const DEVICE_MAP: c_uint = 2;
+@@ -1539,3 +1559,38 @@
+         description: "driver returned a negative active-block count".into(),
+     })
+ }
++
++mod row_shards;
++pub use row_shards::RowShardPlan;
++pub(crate) use row_shards::RowShards;
++
++/// Set an immutable control symbol before a private projection module is used.
++pub(crate) fn module_u64(module:&Module,name:&str,value:u64)->Result<(),DriverError> {
++    let name=CString::new(name).expect("native symbol has no NUL");
++    let _current=module.context.enter()?;let mut pointer=0;let mut bytes=0;
++    unsafe {module.context.driver.check((module.context.driver.module_global)(&mut pointer,&mut bytes,module.raw,name.as_ptr()),"projection control symbol")?;}
++    if bytes!=8 {return Err(DriverError {operation:"projection control symbol",code:-1,description:"native projection control ABI is not a u64".into()});}
++    upload(&module.context,pointer,&value.to_le_bytes())
++}
++
++#[repr(C)]
++pub(crate) struct Copy3D {
++    pub src_x:usize,pub src_y:usize,pub src_z:usize,pub src_lod:usize,pub src_kind:c_uint,
++    pub src_host:*const c_void,pub src_device:u64,pub src_array:Handle,pub reserved0:*mut c_void,pub src_pitch:usize,pub src_height:usize,
++    pub dst_x:usize,pub dst_y:usize,pub dst_z:usize,pub dst_lod:usize,pub dst_kind:c_uint,
++    pub dst_host:*mut c_void,pub dst_device:u64,pub dst_array:Handle,pub reserved1:*mut c_void,pub dst_pitch:usize,pub dst_height:usize,
++    pub width:usize,pub height:usize,pub depth:usize,
++}
++impl Copy3D {
++    pub(crate) fn device(source:u64,destination:u64,width:usize,height:usize,source_pitch:usize,destination_pitch:usize)->Self {
++        Self {src_x:0,src_y:0,src_z:0,src_lod:0,src_kind:2,src_host:std::ptr::null(),src_device:source,src_array:std::ptr::null_mut(),reserved0:std::ptr::null_mut(),src_pitch:source_pitch,src_height:height,
++            dst_x:0,dst_y:0,dst_z:0,dst_lod:0,dst_kind:2,dst_host:std::ptr::null_mut(),dst_device:destination,dst_array:std::ptr::null_mut(),reserved1:std::ptr::null_mut(),dst_pitch:destination_pitch,dst_height:height,width,height,depth:1}
++    }
++}
++
++pub(crate) fn enable_peer_reader(source:&Context,destination:&Context)->Result<(),DriverError> {
++    let driver=&destination.driver;let _current=destination.enter()?;
++    let enable=driver.context_enable_peer_access.ok_or(DriverError {operation:"projection peer access",code:-1,description:"CUDA peer access is unavailable".into()})?;
++    let result=unsafe {enable(source.raw,0)};
++    if result==704 {Ok(())} else {driver.check(result,"projection peer access")}
++}
+--- /dev/null
++++ b/inference/seismic/backends/cuda/src/driver/row_shards.rs
+@@ -0,0 +1,156 @@
++//! Immutable canonical matrices with physically local row-shard views.
++//! The full master is used only by import/inspection. Each published partial
++//! view is valid only for a dispatch whose row range was sealed by the plan.
++use super::*;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++#[derive(Clone, Debug)]
++pub struct RowShardPlan {
++    pub rows: u64,
++    pub row_stride: u64,
++    pub canonical_bytes: u64,
++    pub granularity: u64,
++    pub reserved_bytes: u64,
++    pub row_ranges: Vec<(u64,u64)>,
++    pub physical_bytes: Vec<u64>,
++    page_ranges: Vec<(u64,u64)>,
++}
++impl RowShardPlan {
++    pub(crate) fn new(rows:u64,row_stride:u64,bytes:u64,owners:usize,granularity:u64) -> Result<Self,DriverError> {
++        if rows==0 || row_stride==0 || owners<2 || !granularity.is_power_of_two() {
++            return Err(invalid("invalid row-shard geometry"));
++        }
++        let covered=rows.checked_mul(row_stride).ok_or_else(||invalid("row-shard size overflows"))?;
++        if covered>bytes { return Err(invalid("canonical row range exceeds its weight storage")); }
++        let pages=bytes.checked_add(granularity-1).ok_or_else(||invalid("row-shard page count overflows"))?/granularity;
++        let reserved_bytes=pages.checked_mul(granularity).ok_or_else(||invalid("row-shard reservation overflows"))?;
++        let tiles=rows.div_ceil(128);
++        let mut cuts=Vec::with_capacity(owners+1);
++        for i in 0..=owners {
++            let groups=(u128::from(tiles)*i as u128/owners as u128) as u64;
++            cuts.push(groups.saturating_mul(128).min(rows));
++        }
++        let mut row_ranges=Vec::new();let mut page_ranges=Vec::new();let mut physical_bytes=Vec::new();
++        for i in 0..owners {
++            row_ranges.push((cuts[i],cuts[i+1]));
++            let start=cuts[i]*row_stride;
++            let end=if i+1==owners { bytes } else { cuts[i+1]*row_stride };
++            let range=if cuts[i]==cuts[i+1] { (0,0) } else { (start/granularity,end.div_ceil(granularity)) };
++            page_ranges.push(range);
++            physical_bytes.push((range.1-range.0)*granularity);
++        }
++        Ok(Self {rows,row_stride,canonical_bytes:bytes,granularity,reserved_bytes,row_ranges,physical_bytes,page_ranges})
++    }
++}
++fn invalid(message:&str) -> DriverError {
++    DriverError {operation:"row-shard allocation",code:-1,description:message.into()}
++}
++struct Boundary { source:usize,destination:usize,page:u64 }
++pub(crate) struct RowShards {
++    pub master:u64,
++    pub plan:RowShardPlan,
++    bases:Vec<u64>,
++    contexts:Vec<Arc<Context>>,
++    home:Arc<Context>,
++    mappings:Vec<u64>,
++    handles:Vec<u64>,
++    boundaries:Vec<Boundary>,
++    pub frozen:Arc<AtomicBool>,
++    publish:std::sync::Mutex<()>,
++}
++unsafe impl Send for RowShards {}
++unsafe impl Sync for RowShards {}
++impl RowShards {
++    pub fn granularity(contexts:&[Arc<Context>]) -> Result<u64,DriverError> {
++        let mut result=0u64;
++        for context in contexts {
++            let _current=context.enter()?;
++            let get=memory_management_symbol(context.driver.memory_granularity)?;
++            let mut value=0usize;let properties=AllocationProperties::device(context.ordinal());
++            unsafe { context.driver.check(get(&mut value,&properties,0),"row-shard granularity")?; }
++            if value==0 || !value.is_power_of_two() { return Err(invalid("invalid driver granularity")); }
++            result=result.max(value as u64);
++        }
++        Ok(result)
++    }
++    pub fn new(home:&Arc<Context>,contexts:&[Arc<Context>],plan:RowShardPlan) -> Result<Self,DriverError> {
++        if contexts.len()!=plan.row_ranges.len() || !contexts.iter().any(|c|c.ordinal()==home.ordinal()) {
++            return Err(invalid("row-shard owners differ from the prepared plan"));
++        }
++        let mut ordinals=std::collections::HashSet::new();
++        if contexts.iter().any(|c|!ordinals.insert(c.ordinal())) { return Err(invalid("row-shard physical owners repeat")); }
++        let granularity=Self::granularity(contexts)?;
++        if plan.granularity!=granularity { return Err(invalid("row-shard plan uses another physical granularity")); }
++        usize::try_from(plan.reserved_bytes).map_err(|_|invalid("row-shard reservation exceeds host address space"))?;
++        let mut result=Self {master:0,plan,bases:Vec::new(),contexts:contexts.to_vec(),home:home.clone(),mappings:Vec::new(),handles:Vec::new(),boundaries:Vec::new(),frozen:Arc::new(AtomicBool::new(false)),publish:std::sync::Mutex::new(())};
++        let driver=&home.driver;let _current=home.enter()?;
++        let reserve=memory_management_symbol(driver.address_reserve)?;
++        for _ in 0..=contexts.len() {
++            let mut base=0;unsafe {driver.check(reserve(&mut base,result.plan.reserved_bytes as usize,granularity as usize,0,0),"row-shard address reservation")?;}
++            result.bases.push(base);
++        }
++        result.master=result.bases[0];
++        let create=memory_management_symbol(driver.physical_create)?;let map=memory_management_symbol(driver.map)?;
++        let mut actual=vec![0u64;contexts.len()];
++        for page in 0..result.plan.reserved_bytes/granularity {
++            let candidates=(0..contexts.len()).filter(|&i| {let (a,b)=result.plan.page_ranges[i];a<=page && page<b}).collect::<Vec<_>>();
++            if candidates.is_empty() {return Err(invalid("canonical page has no physical row owner"));}
++            let middle=contexts.len()/2;let primary=if candidates.contains(&middle) {middle} else {candidates[0]};
++            for owner in candidates {
++                let properties=AllocationProperties::device(contexts[owner].ordinal());let mut handle=0;
++                unsafe {driver.check(create(&mut handle,granularity as usize,&properties,0),"row-shard physical page")?;}
++                result.handles.push(handle);actual[owner]+=granularity;
++                let view=result.bases[owner+1]+page*granularity;
++                unsafe {driver.check(map(view,granularity as usize,0,handle,0),"row-shard local map")?;}
++                result.mappings.push(view);
++                if owner==primary {
++                    let master=result.master+page*granularity;
++                    unsafe {driver.check(map(master,granularity as usize,0,handle,0),"row-shard master map")?;}
++                    result.mappings.push(master);
++                } else {result.boundaries.push(Boundary {source:primary,destination:owner,page});}
++            }
++        }
++        if actual!=result.plan.physical_bytes {return Err(invalid("physical page charge differs from the row-shard plan"));}
++        let set_access=memory_management_symbol(driver.set_access)?;
++        let access=contexts.iter().map(|c|AccessDescription {location:MemoryLocation::device(c.ordinal()),flags:3}).collect::<Vec<_>>();
++        unsafe {driver.check(set_access(result.master,result.plan.reserved_bytes as usize,access.as_ptr(),access.len()),"row-shard master access")?;}
++        for (owner,&(a,b)) in result.plan.page_ranges.iter().enumerate() {
++            if a==b {continue;}
++            let access=AccessDescription {location:MemoryLocation::device(contexts[owner].ordinal()),flags:3};
++            unsafe {driver.check(set_access(result.bases[owner+1]+a*granularity,((b-a)*granularity) as usize,&access,1),"row-shard local access")?;}
++        }
++        Ok(result)
++    }
++    /// Called only after the canonical import's write fence completes. The
++    /// immutable flag is published after every boundary copy completes.
++    pub fn publish(&self) -> Result<(),DriverError> {
++        let _lock=self.publish.lock().expect("row-shard publication lock poisoned");
++        if self.frozen.load(Ordering::Acquire) {return Ok(());}
++        for boundary in &self.boundaries {
++            let source=&self.contexts[boundary.source];let destination=&self.contexts[boundary.destination];
++            let offset=boundary.page*self.plan.granularity;
++            copy_peer(source,destination,self.bases[boundary.source+1]+offset,self.bases[boundary.destination+1]+offset,self.plan.granularity as usize)?;
++        }
++        self.frozen.store(true,Ordering::Release);Ok(())
++    }
++    pub fn view(&self,ordinal:i32) -> Result<u64,DriverError> {
++        if !self.frozen.load(Ordering::Acquire) {return Err(invalid("projection weight views are not published"));}
++        let owner=self.contexts.iter().position(|c|c.ordinal()==ordinal).ok_or_else(||invalid("projection device is not a row-shard owner"))?;
++        Ok(self.bases[owner+1])
++    }
++    pub fn physical_bytes_on(&self,ordinal:i32)->u64 {
++        self.contexts.iter().position(|c|c.ordinal()==ordinal).map_or(0,|i|self.plan.physical_bytes[i])
++    }
++    pub fn context(&self) -> &Arc<Context> {&self.home}
++}
++impl Drop for RowShards {
++    fn drop(&mut self) {
++        let driver=&self.home.driver;
++        let (Some(unmap),Some(release),Some(free))=(driver.unmap,driver.physical_release,driver.address_free) else {return;};
++        if let Ok(_current)=self.home.enter() {unsafe {
++            for &address in self.mappings.iter().rev() {unmap(address,self.plan.granularity as usize);}
++            for &handle in self.handles.iter().rev() {release(handle);}
++            for &base in self.bases.iter().rev() {free(base,self.plan.reserved_bytes as usize);}
++        }}
++    }
++}
+--- a/inference/seismic/backends/cuda/src/executor.rs
++++ b/inference/seismic/backends/cuda/src/executor.rs
+@@ -3,7 +3,7 @@
+ use crate::buffer::Buffer;
+ use crate::command::{CompiledKernel, LaunchFrame};
+ use crate::driver::{
+-    Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Reservation, Stream,
++    Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Reservation, Stream, RowShards, RowShardPlan,
+ };
+ use crate::{Cuda, CudaLaunchMode};
+ use seismic_compiler::errors::ExecutionError;
+@@ -93,6 +93,24 @@
+             destination_buffer.pointer() + destination_offset, bytes).map_err(submission_error)
+     }
+ 
++    pub fn enable_peer_reader(&self,source:&Device)->Result<(),ExecutionError> {
++        if self.ordinal()==source.ordinal() {return Ok(());}
++        crate::driver::enable_peer_reader(&source.context,&self.context).map_err(submission_error)
++    }
++    pub fn row_shard_plan(&self,rows:u64,row_stride:u64,bytes:u64,owners:&[Device]) -> Result<RowShardPlan,ExecutionError> {
++        let contexts=owners.iter().map(|d|d.context.clone()).collect::<Vec<_>>();
++        let granularity=RowShards::granularity(&contexts).map_err(allocation_error)?;
++        RowShardPlan::new(rows,row_stride,bytes,owners.len(),granularity).map_err(allocation_error)
++    }
++    /// The caller grants every plan.physical_bytes charge before this call.
++    /// This returns an unpublished master: import must finish before the
++    /// boundary pages and immutable partial views are published.
++    pub fn allocate_row_shards(&self,plan:RowShardPlan,owners:&[Device]) -> Result<Buffer,ExecutionError> {
++        let contexts=owners.iter().map(|d|d.context.clone()).collect::<Vec<_>>();
++        let shards=RowShards::new(&self.context,&contexts,plan).map_err(allocation_error)?;
++        self.zero(shards.master,shards.plan.canonical_bytes as usize)?;
++        Ok(Buffer::row_sharded(shards))
++    }
+     /// Pinned host memory mapped into the device address space, for inputs
+     /// the host fills before each submission: the host writes it in place,
+     /// without a driver copy that would wait for queued device work.
+--- a/inference/seismic/backends/cuda/src/lib.rs
++++ b/inference/seismic/backends/cuda/src/lib.rs
+@@ -647,3 +647,5 @@
+         });
+     }
+ }
++
++pub use driver::RowShardPlan;
+--- a/inference/seismic/runtime/src/api.rs
++++ b/inference/seismic/runtime/src/api.rs
+@@ -355,6 +355,8 @@
+         pub(crate) artifacts: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
+         /// Native submission order and CUDA graph replays.
+         pub(crate) native: crate::native::NativeQueue,
++        pub(crate) projection_peers: std::sync::Mutex<Vec<std::sync::Weak<DeviceInner>>>,
++        pub(crate) projection_constants: std::sync::Mutex<std::collections::HashMap<(u64,u64,u64),std::sync::Weak<Allocation>>>,
+     }
+     impl DeviceInner {
+         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
+@@ -362,6 +364,15 @@
+                 .lock()
+                 .expect("trace slot lock is never poisoned")
+                 .clone()
++        }
++        pub fn projection_weight_costs(self:&Arc<Self>,representation:seismic_lang::ids::RepresentationId,extents:&[u64],owners:&[Arc<Self>])->Result<Option<Vec<u64>>,super::TensorError> {
++            if extents.len()!=2 || owners.len()<2 {return Ok(None);}
++            let full=crate::layout::canonical(representation,extents)?;
++            let tile=crate::layout::canonical(representation,&[16,extents[1]])?;
++            if tile.byte_len%16!=0 {return Ok(None);}
++            let plan=self.kind.row_shard_plan(extents[0],tile.byte_len/16,full.byte_len,owners)?;
++            if full.byte_len<owners.len() as u64*plan.granularity {return Ok(None);}
++            Ok(Some(plan.physical_bytes))
+         }
+         pub fn info(&self) -> &DeviceInfo {
+             &self.info
+@@ -742,6 +753,49 @@
+             self.allocation.share_access_with(&table.allocation);
+         }
+ 
++        /// A canonical two-axis matrix with a full import master and local
++        /// immutable row-shard views. Page costs are granted independently
++        /// on every owner. Publish only after its native import completes.
++        pub fn row_sharded(
++            device:&Arc<DeviceInner>,representation:RepresentationId,extents:&[u64],owners:&[Arc<DeviceInner>],
++        )->Result<Self,TensorError> {
++            if extents.len()!=2 || extents[0]==0 || extents[1]==0 || !device.supports_representation(representation) {
++                return Err(TensorError::SlabLayout("row-sharded weight is not a supported nonempty matrix".into()));
++            }
++            let layout=layout::canonical(representation,extents)?;
++            for owner in owners {
++                *owner.projection_peers.lock().expect("projection peer registration lock poisoned")=owners.iter().map(Arc::downgrade).collect();
++            }
++            // The native row storage's 16-row tile contains its complete
++            // code/coefficient row records, including alignment padding.
++            let tile=layout::canonical(representation,&[16,extents[1]])?;
++            if tile.byte_len%16!=0 {return Err(TensorError::SlabLayout("native matrix tile has no integral row stride".into()));}
++            let plan=device.kind.row_shard_plan(extents[0],tile.byte_len/16,layout.byte_len,owners)?;
++            let allocation=device.kind.allocate_row_sharded(plan,layout.alignment,owners)?;
++            Ok(Self::new_view(device.clone(),allocation,0,layout.byte_len,representation,extents.to_vec(),layout.strides))
++        }
++        pub fn physical_storage_bytes_on(&self,device:&Arc<DeviceInner>)->u64 {
++            if let (crate::backends::OpenedKind::Cuda(_),crate::backends::OpenedKind::Cuda(peer))=(&self.device.kind,&device.kind) {
++                let buffer=crate::driver::typed_buffer::<seismic_cuda::Cuda,seismic_cuda::Executor>(&self.allocation);
++                if let Some(bytes)=buffer.sharded_physical_bytes_on(peer.service().ordinal()) {return bytes;}
++            }
++            if self.device.info.id==device.info.id {self.allocation.bytes()} else {0}
++        }
++        pub fn physical_storage_bytes(&self)->u64 {
++            if let crate::backends::OpenedKind::Cuda(_)=&self.device.kind {
++                let buffer=crate::driver::typed_buffer::<seismic_cuda::Cuda,seismic_cuda::Executor>(&self.allocation);
++                if let Some(plan)=buffer.row_shard_plan() {return plan.physical_bytes.iter().sum();}
++            }
++            self.allocation.bytes()
++        }
++        /// Seal completed immutable imports; row-sharded weights copy their
++        /// boundary pages before their partial views become accessible.
++        pub fn publish_immutable(&self)->Result<(),ExecutionError> {
++            if self.byte_offset!=0 || self.byte_len!=self.allocation.bytes() {
++                return Err(ExecutionError::ConstructionContradiction("immutable publication requires the entire weight allocation".into()));
++            }
++            self.device.kind.publish_immutable(&self.allocation)
++        }
+         /// A zero-filled tensor over `extents` whose leading rows
+         /// `[0, committed)` are physically backed. The remaining rows are an
+         /// address reservation: binding the tensor is legal only for device
+--- a/inference/seismic/runtime/src/backends.rs
++++ b/inference/seismic/runtime/src/backends.rs
+@@ -21,7 +21,7 @@
+ use crate::formation::ProgramFormer;
+ use crate::memory::MemoryDomain;
+ use seismic_compiler::errors::{ExecutionError, TargetError};
+-use seismic_compiler::executable::NativeExecutor;
++use seismic_compiler::executable::{NativeExecutor,DeviceService};
+ use seismic_compiler::feedback::PreparationOptions;
+ use seismic_lang::checked::CheckedModule;
+ use seismic_lang::entry::ElementBindings;
+@@ -508,6 +508,8 @@
+         trace: std::sync::Mutex::new(None),
+         artifacts: options.artifacts,
+         native: crate::native::NativeQueue::default(),
++        projection_peers: std::sync::Mutex::new(Vec::new()),
++        projection_constants: std::sync::Mutex::new(std::collections::HashMap::new()),
+     }))
+ }
+ 
+@@ -757,12 +759,32 @@
+             Self::Cpu(device) => device.allocate_storage(bytes, alignment),
+             #[cfg(target_os = "macos")]
+             Self::Metal(device) => device.allocate_storage(bytes, alignment),
+-            Self::Cuda(device) => device.allocate_storage(bytes, alignment),
++            Self::Cuda(device) => device.allocate_storage_with_flag(bytes,alignment,|service| {
++                let buffer=service.allocate(bytes,alignment)?;let flag=buffer.immutable_flag();Ok((buffer,flag))
++            }),
+             #[cfg(not(target_os = "macos"))]
+             Self::Vulkan(device) => device.allocate(bytes, alignment),
+         }
+     }
+ 
++    pub(crate) fn row_shard_plan(&self,rows:u64,row_stride:u64,bytes:u64,owners:&[Arc<DeviceInner>]) -> Result<seismic_cuda::RowShardPlan,ExecutionError> {
++        let Self::Cuda(home)=self else {return Err(ExecutionError::AllocationFailed("projection row shards require CUDA".into()));};
++        let peers=owners.iter().map(|owner|match &owner.kind {Self::Cuda(device)=>Ok(device.service().clone()),_=>Err(ExecutionError::AllocationFailed("row-shard owner has another backend".into()))}).collect::<Result<Vec<_>,_>>()?;
++        home.service().row_shard_plan(rows,row_stride,bytes,&peers)
++    }
++    pub(crate) fn allocate_row_sharded(&self,plan:seismic_cuda::RowShardPlan,alignment:u64,owners:&[Arc<DeviceInner>]) -> Result<Arc<driver::Allocation>,ExecutionError> {
++        let Self::Cuda(home)=self else {return Err(ExecutionError::AllocationFailed("projection row shards require CUDA".into()));};
++        let opened=owners.iter().map(|owner|match &owner.kind {Self::Cuda(device)=>Ok(device.clone()),_=>Err(ExecutionError::AllocationFailed("row-shard owner has another backend".into()))}).collect::<Result<Vec<_>,_>>()?;
++        let peers=opened.iter().map(|device|device.service().clone()).collect::<Vec<_>>();
++        let costs=plan.physical_bytes.clone();let bytes=plan.canonical_bytes;
++        home.allocate_grouped_storage_with(bytes,alignment,&opened,&costs,|service| {
++            let buffer=service.allocate_row_shards(plan,&peers)?;let flag=buffer.immutable_flag();Ok((buffer,flag))
++        })
++    }
++    pub(crate) fn publish_immutable(&self,allocation:&Arc<driver::Allocation>) -> Result<(),ExecutionError> {
++        if let Self::Cuda(_)=self {driver::typed_buffer::<seismic_cuda::Cuda,seismic_cuda::Executor>(allocation).publish_immutable()?;}
++        Ok(())
++    }
+     /// Storage for inputs the host writes before each submission. Host
+     /// writes to it are plain memory writes that never wait for queued
+     /// device work: CPU and Metal storage is host-visible already, CUDA uses
+--- a/inference/seismic/runtime/src/driver.rs
++++ b/inference/seismic/runtime/src/driver.rs
+@@ -197,6 +197,38 @@
+         self.allocate_reserved_with(bytes, alignment, &mut reservation, false, make)
+     }
+ 
++    pub(crate) fn allocate_storage_with_flag(
++        self:&Arc<Self>,bytes:u64,alignment:u64,
++        make:impl FnOnce(&Service<T,E>)->Result<(Buffer<T,E>,Arc<std::sync::atomic::AtomicBool>),ExecutionError>,
++    )->Result<Arc<Allocation>,ExecutionError> {
++        self.allocate_grouped_storage_with(bytes,alignment,&[self.clone()],&[bytes],make)
++    }
++    /// Grant exact physical costs in every owner scope before any backing is
++    /// created. The virtual canonical extent is independent of those costs.
++    pub(crate) fn allocate_grouped_storage_with(
++        self:&Arc<Self>,bytes:u64,alignment:u64,owners:&[Arc<Self>],costs:&[u64],
++        make:impl FnOnce(&Service<T,E>)->Result<(Buffer<T,E>,Arc<std::sync::atomic::AtomicBool>),ExecutionError>,
++    )->Result<Arc<Allocation>,ExecutionError> {
++        let limits=self.device_description().limits();
++        let maximum=if limits.max_index_bits>=64 {limits.max_allocation_bytes} else {limits.max_allocation_bytes.min((1u64<<limits.max_index_bits)-1)};
++        if bytes>maximum {return Err(ExecutionError::AllocationCapacity {required:bytes.into(),available:maximum});}
++        if !alignment.is_power_of_two() || alignment>limits.max_allocation_alignment {
++            return Err(ExecutionError::ConstructionContradiction("distributed allocation alignment violates target ABI".into()));
++        }
++        if owners.len()!=costs.len() || !owners.iter().any(|owner|Arc::ptr_eq(self,owner)) {
++            return Err(ExecutionError::ConstructionContradiction("physical allocation owners differ from its canonical home".into()));
++        }
++        let mut identities=std::collections::HashSet::new();
++        if owners.iter().any(|owner|!identities.insert(owner.identity())) {
++            return Err(ExecutionError::ConstructionContradiction("physical allocation owner is repeated".into()));
++        }
++        let mut grants=owners.iter().zip(costs).map(|(owner,&cost)|reserve(&owner.memory,cost)).collect::<Result<Vec<_>,_>>()?;
++        let (buffer,freeze)=make(&self.service)?;
++        let charges=grants.iter_mut().zip(costs).map(|(grant,&cost)|grant.take(cost)).collect::<Vec<_>>();
++        let mut virtual_grant=reserve(&self.memory,0)?;
++        let storage=Box::new(TypedStorage::<T,E> {service:self.service.clone(),buffer,read_only:false,freeze:Some(freeze),physical_charges:charges});
++        Ok(Allocation::new(fresh_allocation_identity(),bytes,virtual_grant.take(0),storage))
++    }
+     /// Recommit an exclusively owned reserved allocation. The backend keeps
+     /// its physical reservation, so only growth needs a new ledger grant;
+     /// shrink releases the difference after the backend has unmapped it.
+@@ -247,6 +279,7 @@
+             service: self.service.clone(),
+             buffer,
+             read_only: false,
++            freeze: None, physical_charges: Vec::new(),
+         });
+         // `make` has finished the backend resize. Transfer the sole old
+         // charge only after that point; a recoverable failure leaves both
+@@ -320,6 +353,7 @@
+                 service: self.service.clone(),
+                 buffer,
+                 read_only,
++                freeze: None, physical_charges: Vec::new(),
+             }))
+         })
+     }
+@@ -405,6 +439,9 @@
+     service: Arc<Service<T, E>>,
+     buffer: Buffer<T, E>,
+     read_only: bool,
++    freeze: Option<Arc<std::sync::atomic::AtomicBool>>,
++    // Declared after buffer: backing is released before these page grants.
++    physical_charges: Vec<MemoryCharge>,
+ }
+ 
+ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
+@@ -412,7 +449,7 @@
+         self.service.read(&self.buffer, offset, into)
+     }
+     fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+-        if self.read_only {
++        if self.read_only() {
+             return Err(ExecutionError::SubmissionFailed(
+                 "write to read-only mapped storage".into(),
+             ));
+@@ -423,7 +460,7 @@
+         self
+     }
+     fn read_only(&self) -> bool {
+-        self.read_only
++        self.read_only || self.freeze.as_ref().is_some_and(|flag|flag.load(Ordering::Acquire))
+     }
+ }
+ 
+--- a/inference/seismic/runtime/src/native/cuda.rs
++++ b/inference/seismic/runtime/src/native/cuda.rs
+@@ -13,8 +13,9 @@
+ //! Standalone calls, and every launch of a launch-detail trace (timed one by
+ //! one), are launched individually.
+ 
++mod projection;
+ use super::graph_replays::Replays;
+-use super::{DispatchList, NativeRoute, RouteSubmission};
++use super::{Dispatch,DispatchList, NativeRoute, RouteSubmission};
+ use crate::api::CallError;
+ use crate::driver::{typed_buffer, Allocation};
+ use seismic_compiler::errors::ExecutionError;
+@@ -61,9 +62,12 @@
+                 || {
+                     let mut builder =
+                         DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
+-                    each_launch(list, |launch| match launch {
+-                        Some(launch) => builder.launch(launch),
+-                        None => Ok(()),
++                    each_launch(list, |dispatch,ordinal,buffers,launch| {
++                        if let Some(launch)=launch {
++                            if projection::capture(&mut builder,dispatch,ordinal,buffers,launch)? {return Ok(());}
++                            builder.launch(launch).map_err(CallError::Execution)?;
++                        }
++                        Ok(())
+                     })?;
+                     builder.instantiate().map_err(CallError::Execution)
+                 },
+@@ -77,8 +81,8 @@
+         }
+         None => {
+             for _ in 0..repetitions {
+-                each_launch(list, |launch| match launch {
+-                    Some(launch) => batch.launch(launch),
++                each_launch(list, |_,_,_,launch| match launch {
++                    Some(launch) => batch.launch(launch).map_err(CallError::Execution),
+                     None => {
+                         batch.skip();
+                         Ok(())
+@@ -107,7 +111,7 @@
+ /// inactive launch.
+ fn each_launch(
+     list: &impl DispatchList,
+-    mut visit: impl FnMut(Option<&DirectLaunch<'_>>) -> Result<(), ExecutionError>,
++    mut visit: impl FnMut(&Dispatch<'_>,usize,&[(&Allocation,u64)],Option<&DirectLaunch<'_>>) -> Result<(), CallError>,
+ ) -> Result<(), CallError> {
+     let mut buffers = Vec::new();
+     let mut typed = Vec::new();
+@@ -130,13 +134,14 @@
+                 module,
+                 function: module_function,
+                 buffers: &typed,
++                pointer_overrides: None,
+                 words: dispatch.word_bytes,
+                 scalar_results: (scalars, 0),
+                 grid: launch.groups,
+                 block: launch.threads,
+                 shared_bytes: launch.shared_bytes,
+             });
+-            visit(launch.as_ref()).map_err(CallError::Execution)?;
++            visit(&dispatch,function,&buffers,launch.as_ref())?;
+         }
+     }
+     Ok(())
+--- /dev/null
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -0,0 +1,193 @@
++//! Row-parallel projection metadata derived from the authored entry ABI.
++//! Operator layouts are reusable across artifacts; no model/family branch.
++use super::super::{Dispatch,CallError};
++use seismic_lang::entry::{ParameterKind,ResultKind};
++use seismic_compiler::errors::ExecutionError;
++
++#[derive(Clone)]
++pub(super) struct View {pub buffer:usize,pub bytes:u64,pub extents:Vec<u64>,pub strides:Vec<u64>,pub element_bytes:u64}
++#[derive(Clone)]
++pub(super) struct Output {pub buffer:usize,pub first:u64,pub columns:u64,pub pitch:u64,pub rows:u64,pub element_bytes:u64}
++pub(super) struct Spec {pub inputs:Vec<(usize,u64)>,pub constants:Vec<View>,pub outputs:Vec<Output>}
++fn invalid(message:&str)->CallError {CallError::Execution(ExecutionError::ConstructionContradiction(message.into()))}
++fn product(xs:&[u64])->Result<u64,CallError> {xs.iter().try_fold(1u64,|a,&b|a.checked_mul(b).ok_or_else(||invalid("projection extent product overflows")))}
++fn view(dispatch:&Dispatch<'_>,buffer:usize,extents:&[u64],strides:&[u64])->Result<View,CallError> {
++    let name=dispatch.representations.get(buffer).ok_or_else(||invalid("projection ABI representation is absent"))?;
++    let representation=seismic_lang::registry::representation(name).ok_or_else(||invalid("projection representation is unregistered"))?;
++    let layout=crate::layout::canonical(representation,extents).map_err(|e|CallError::Execution(ExecutionError::ConstructionContradiction(e.to_string())))?;
++    let element_bytes=if matches!(*name,"bf16"|"f16") {2} else if matches!(*name,"f32"|"i32"|"u32") {4} else {0};
++    Ok(View {buffer,bytes:layout.byte_len,extents:extents.to_vec(),strides:strides.to_vec(),element_bytes})
++}
++impl Spec {
++    pub(super) fn from(dispatch:&Dispatch<'_>,ordinal:usize)->Result<Option<Self>,CallError> {
++        let launch=&dispatch.kernel.implementation.launches[ordinal].kernel;
++        if !launch.contains("_gemv") && !launch.contains("_gemm") {return Ok(None);}
++        let kind=if launch.starts_with("dense_expand_") {0} else if launch.starts_with("dense_output_") {1}
++            else if launch.starts_with("attention_project_") {2} else if launch.starts_with("attention_output_") {3}
++            else if launch.starts_with("gated_delta_project_") {4} else if launch.starts_with("readout_head_rows_") {5} else {return Ok(None);};
++        let schema=dispatch.kernel.logical.schema();let mut word=schema.dimensions().len();let mut buffer=0;
++        let mut parameters=Vec::new();let mut results=Vec::new();
++        for parameter in schema.parameters() {
++            match &parameter.kind {
++                ParameterKind::Tensor {axes,..} => {
++                    let rank=axes.len();let extents=&dispatch.words[word..word+rank];let strides=&dispatch.words[word+rank..word+2*rank];
++                    parameters.push((parameter.name.clone(),view(dispatch,buffer,extents,strides)?));word+=2*rank;buffer+=1;
++                }
++                ParameterKind::Range {..}=>word+=2,
++                _=>word+=1,
++            }
++        }
++        for result in schema.results() {
++            if let ResultKind::Tensor {axes,..}=&result.kind {
++                let rank=axes.len();results.push(view(dispatch,buffer,&dispatch.words[word..word+rank],&dispatch.words[word+rank..word+2*rank])?);word+=2*rank;buffer+=1;
++            }
++        }
++        let scratch=dispatch.kernel.implementation.scratch.iter().enumerate().map(|(i,s)|(s.name.as_str(),buffer+i)).collect::<std::collections::HashMap<_,_>>();
++        let weight_names:&[&str]=match kind {0=>&["gate_weight","up_weight"],1=>&["down_weight"],2=>&["query_weight","gate_weight","key_weight","value_weight"],3=>&["output_weight"],4=>&["qkv_weight","gate_weight","alpha_weight","beta_weight"],_=>&["weight"]};
++        let weights=weight_names.iter().map(|name|parameters.iter().find(|(n,_)|n==name).map(|(_,v)|v.clone()).ok_or_else(||invalid("projection source weight is absent from its ABI"))).collect::<Result<Vec<_>,_>>()?;
++        if weights.iter().any(|w|w.extents.len()!=2) {return Err(invalid("projection weight is not a canonical matrix"));}
++        let rows=results.first().and_then(|v|v.extents.first()).copied().ok_or_else(||invalid("projection output has no batch extent"))?;
++        // An INT8 preparation has another input ABI. Keep its original
++        // module until that precision mode has its own sealed copy contract.
++        if dispatch.kernel.specialization.param("INT8")==Some(1) && rows>16 && rows<=64 {return Ok(None);}
++        let width=weights[0].extents[1];let mut inputs=Vec::new();
++        if kind==1 || kind==3 {
++            let name=if kind==1 {"product"} else {"gated"};let input=parameters.iter().find(|(n,_)|n==name).ok_or_else(||invalid("plain projection input is absent"))?;
++            inputs.push((input.1.buffer,input.1.bytes));
++        }
++        if kind!=1 && kind!=3 {
++            let staged=*scratch.get("staged").ok_or_else(||invalid("normalized projection has no staged input"))?;
++            inputs.push((staged,rows.checked_mul(width).and_then(|n|n.checked_mul(2)).ok_or_else(||invalid("projection staging size overflows"))?));
++        }
++        // Residuals, row selectors and scalar scales remain distinct input
++        // views; immutable weights are cached locally by allocation identity.
++        let constants=parameters.into_iter().map(|(_,v)|v).collect::<Vec<_>>();let mut outputs=Vec::new();
++        if kind==2 {
++            if results.len()!=4 {return Err(invalid("segmented attention output ABI differs"));}
++            for (result,weight) in results.iter().zip(&weights) {outputs.push(Output {buffer:result.buffer,first:0,columns:weight.extents[0],pitch:result.strides[0]*result.element_bytes,rows,element_bytes:result.element_bytes});}
++        } else {
++            let result=&results[0];let pitch=result.strides[0]*result.element_bytes;
++            if kind==4 {
++                let mut first=0;for weight in &weights {outputs.push(Output {buffer:result.buffer,first,columns:weight.extents[0],pitch,rows,element_bytes:result.element_bytes});first+=weight.extents[0];}
++            } else {outputs.push(Output {buffer:result.buffer,first:0,columns:weights[0].extents[0],pitch,rows,element_bytes:result.element_bytes});}
++        }
++        if let Some(geometry)=dispatch.launches[ordinal] {
++            if geometry.groups[2]>1 && (kind==1 || kind==3) {
++                let partials=*scratch.get("partials").ok_or_else(||invalid("split projection has no partial output"))?;
++                let columns=outputs[0].columns;outputs=vec![Output {buffer:partials,first:0,columns,pitch:columns*4,rows:rows.checked_mul(geometry.groups[2]).ok_or_else(||invalid("split output row count overflows"))?,element_bytes:4}];
++            }
++        }
++        // Representation sizes and extents come from the sealed invocation.
++        if outputs.iter().any(|v|v.element_bytes==0) {return Err(invalid("projection output is not a dense scalar element"));}
++        let _=product(&[rows,width])?;
++        Ok(Some(Self {inputs,constants,outputs}))
++    }
++}
++
++use crate::api::device::DeviceInner;
++use crate::backends::OpenedKind;
++use crate::driver::{Allocation,typed_buffer};
++use seismic_cuda::{Cuda,Executor};
++use seismic_cuda::direct::{DirectGraphBuilder,DirectLaunch,GraphNode};
++use std::sync::Arc;
++
++fn cuda(device:&DeviceInner)->Result<&seismic_cuda::Device,CallError> {
++    match &device.kind {OpenedKind::Cuda(opened)=>Ok(opened.service()),_=>Err(invalid("projection peer is not CUDA"))}
++}
++fn allocate(device:&Arc<DeviceInner>,bytes:u64,builder:&mut DirectGraphBuilder)->Result<Arc<Allocation>,CallError> {
++    let allocation=device.kind.allocate(bytes.max(1),16).map_err(CallError::Execution)?;
++    builder.retain(allocation.clone());Ok(allocation)
++}
++fn constant(source:&Arc<DeviceInner>,peer:&Arc<DeviceInner>,allocation:&Allocation,offset:u64,bytes:u64,builder:&mut DirectGraphBuilder)->Result<Arc<Allocation>,CallError> {
++    let key=(allocation.identity(),offset,bytes);
++    let mut cache=peer.projection_constants.lock().expect("projection constant cache lock poisoned");
++    if let Some(copy)=cache.get(&key).and_then(std::sync::Weak::upgrade) {builder.retain(copy.clone());return Ok(copy);}
++    cache.retain(|_,value|value.strong_count()!=0);
++    let copy=allocate(peer,bytes,builder)?;
++    let from=typed_buffer::<Cuda,Executor>(allocation);let to=typed_buffer::<Cuda,Executor>(&copy);
++    cuda(peer)?.copy_from_peer(cuda(source)?,from,offset,to,0,bytes).map_err(CallError::Execution)?;
++    to.publish_immutable().map_err(CallError::Execution)?;
++    cache.insert(key,Arc::downgrade(&copy));Ok(copy)
++}
++fn row_range(columns:u64,owner:usize,owners:usize)->(u64,u64) {
++    let groups=columns.div_ceil(128);
++    (((u128::from(groups)*owner as u128/owners as u128) as u64*128).min(columns),
++     ((u128::from(groups)*(owner+1) as u128/owners as u128) as u64*128).min(columns))
++}
++/// Capture one projection as an explicit fork/join. Original root allocation
++/// permits cover its producer/consumer fence; every temporary is exclusively
++/// owned by this replay and kept alive by the instantiated graph.
++pub(super) fn capture(
++    builder:&mut DirectGraphBuilder,dispatch:&Dispatch<'_>,ordinal:usize,
++    buffers:&[(&Allocation,u64)],launch:&DirectLaunch<'_>,
++)->Result<bool,CallError> {
++    let source=&dispatch.kernel.public_device;
++    let peers=source.projection_peers.lock().expect("projection peer registry lock poisoned").iter().map(std::sync::Weak::upgrade).collect::<Option<Vec<_>>>();
++    let Some(peers)=peers.filter(|peers|peers.len()>1) else {return Ok(false);};
++    let Some(spec)=Spec::from(dispatch,ordinal)? else {return Ok(false);};
++    let source_cuda=cuda(source)?;let dependencies=builder.dependencies();let mut terminals=Vec::new();
++    for (owner,peer) in peers.iter().enumerate() {
++        let device=cuda(peer)?;device.enable_peer_reader(source_cuda).map_err(CallError::Execution)?;
++        let module=launch.module.projection_module(device,owner as u64,peers.len() as u64).map_err(CallError::Execution)?;
++        builder.retain(module.clone());
++        let mut pointers=buffers.iter().map(|(allocation,offset)|typed_buffer::<Cuda,Executor>(allocation).pointer()+offset).collect::<Vec<_>>();
++        let mut copied=Vec::<Arc<Allocation>>::new();let mut input_nodes=Vec::<GraphNode>::new();
++        let remote=peer.info.id!=source.info.id;
++        for view in &spec.constants {
++            let (allocation,offset)=buffers[view.buffer];let buffer=typed_buffer::<Cuda,Executor>(allocation);
++            if buffer.row_shard_plan().is_some() {
++                pointers[view.buffer]=buffer.projection_pointer(device.ordinal()).map_err(CallError::Execution)?+offset;
++            } else if remote && allocation.storage().read_only() && view.bytes!=0 {
++                let copy=constant(source,peer,allocation,offset,view.bytes,builder)?;
++                pointers[view.buffer]=typed_buffer::<Cuda,Executor>(&copy).pointer();copied.push(copy);
++            }
++        }
++        if remote {
++            let mut inputs=spec.inputs.clone();
++            // Row-selector/other invocation arrays can be mapped host uploads.
++            // Copy their exact view; residual F32 reads remain explicit peers.
++            inputs.extend(spec.constants.iter().filter(|v|v.extents.len()==1 && !buffers[v.buffer].0.storage().read_only() && v.bytes!=0).map(|v|(v.buffer,v.bytes)));
++            inputs.sort_unstable();inputs.dedup_by_key(|entry|entry.0);
++            for (index,bytes) in inputs {
++                if bytes==0 {continue;}
++                let (allocation,offset)=buffers[index];let buffer=typed_buffer::<Cuda,Executor>(allocation);
++                if offset.checked_add(bytes).is_none_or(|end|end>buffer.len()) {return Err(invalid("projection input copy exceeds its sealed backing"));}
++                let copy=allocate(peer,bytes,builder)?;let destination=typed_buffer::<Cuda,Executor>(&copy).pointer();
++                let host=buffer.mapped_host_pointer().map(|host|host+offset);
++                let node=builder.copy_after(device,buffer.pointer()+offset,host,destination,bytes,1,bytes,bytes,&dependencies).map_err(CallError::Execution)?;
++                pointers[index]=destination;input_nodes.push(node);copied.push(copy);
++            }
++        }
++        let mut output_buffers=std::collections::HashMap::<usize,Arc<Allocation>>::new();
++        if remote {
++            for output in &spec.outputs {
++                let bytes=output.rows.checked_mul(output.pitch).ok_or_else(||invalid("projection output scratch overflows"))?;
++                if !output_buffers.contains_key(&output.buffer) {
++                    let copy=allocate(peer,bytes,builder)?;pointers[output.buffer]=typed_buffer::<Cuda,Executor>(&copy).pointer();output_buffers.insert(output.buffer,copy);
++                }
++            }
++        }
++        let mut before=dependencies.clone();before.extend(input_nodes);
++        let parallel=DirectLaunch {module:&module,function:launch.function,buffers:launch.buffers,pointer_overrides:Some(&pointers),words:launch.words,scalar_results:launch.scalar_results,grid:launch.grid,block:launch.block,shared_bytes:launch.shared_bytes};
++        let Some(kernel)=builder.kernel_after(device,&parallel,&before).map_err(CallError::Execution)? else {continue;};
++        if !remote {terminals.push(kernel);continue;}
++        let mut gathers=Vec::new();
++        for output in &spec.outputs {
++            let (begin,end)=row_range(output.columns,owner,peers.len());if begin==end {continue;}
++            let offset=(output.first+begin).checked_mul(output.element_bytes).ok_or_else(||invalid("projection gather offset overflows"))?;
++            let width=(end-begin)*output.element_bytes;
++            let allocation=output_buffers.get(&output.buffer).expect("projection output was allocated");
++            let from=typed_buffer::<Cuda,Executor>(allocation).pointer()+offset;
++            let (target,target_offset)=buffers[output.buffer];let destination=typed_buffer::<Cuda,Executor>(target).pointer()+target_offset+offset;
++            let node=builder.copy_after(device,from,None,destination,width,output.rows,output.pitch,output.pitch,&[kernel]).map_err(CallError::Execution)?;
++            gathers.push(node);
++        }
++        if gathers.is_empty() {terminals.push(kernel);} else {terminals.extend(gathers);}
++        // The graph retains copied input and output allocations independently
++        // of the source session's invocation lifetime.
++        for allocation in copied {builder.retain(allocation);}
++        for allocation in output_buffers.into_values() {builder.retain(allocation);}
++    }
++    if !terminals.is_empty() {builder.join(terminals);}
++    Ok(true)
++}

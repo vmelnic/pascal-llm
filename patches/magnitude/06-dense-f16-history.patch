@@ -1,0 +1,1275 @@
+--- a/design/inference/engine/state-transactions.md
++++ b/design/inference/engine/state-transactions.md
+@@ -67,8 +67,16 @@
+ `n` plus the largest advance (at most the context limit) for Window(n). Compaction moves one
+ domain's rows; kernels and batching follow the largest span bound of the model.
+ 
++The dense history policy carries a storage dtype independent of projected activations.
++`dense` follows the activation dtype; `dense-f16` fixes key and value planes to IEEE
++binary16 for the target and its attention drafter. Checked attention entries, native
++append/read operations and tuning state bind that same dtype. It is part of the
++prepared entry and tuning identities; equal BF16/F16 byte counts never permit a
++binding to substitute one for the other. Fresh projected inputs retain their
++activation rounding before the history append acquires its own storage rounding.
++
+ Each history slab contains every component of its domain at a fixed aligned offset. Dense
+-components hold activation values; affine components hold codes and scale/zero coefficients. A row
++components hold values of their declared storage dtype; affine components hold codes and scale/zero coefficients. A row
+ has the same slab index and offset in every component of its domain, so placement, compaction and
+ conversion move all parts of that row together. A slab targets 64 MiB: its row count is rounded
+ down to a multiple of the 256-row tile, with at least one tile. Bank slabs hold as many complete
+--- a/inference/engine/cli/src/main.rs
++++ b/inference/engine/cli/src/main.rs
+@@ -52,7 +52,7 @@
+ const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
+ [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
+ [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
+-[--kv-codec dense|affine-k8v4] [--admit-error-class CLASS]... [--lookahead on|off] [--telemetry URL] \
++[--kv-codec dense|dense-f16|affine-k8v4] [--admit-error-class CLASS]... [--lookahead on|off] [--telemetry URL] \
+ [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
+ 
+ /// `on` or `off`.
+--- a/inference/engine/executor/src/native/attestation.rs
++++ b/inference/engine/executor/src/native/attestation.rs
+@@ -545,7 +545,7 @@
+                             }
+                         }
+                         + match binding.history {
+-                            KvCodec::Dense => bytes!(attention_decode) + bytes!(attention_prefill),
++                            KvCodec::Dense | KvCodec::DenseF16 => bytes!(attention_decode) + bytes!(attention_prefill),
+                             KvCodec::AffineK8V4 => {
+                                 bytes!(attention_decode_k8v4) + bytes!(attention_prefill_k8v4)
+                             }
+--- a/inference/engine/executor/src/native/preparation.rs
++++ b/inference/engine/executor/src/native/preparation.rs
+@@ -696,6 +696,7 @@
+         )?;
+         let mix = || AttentionMix {
+             activation,
++            history: if binding.history == KvCodec::DenseF16 { Element::f16() } else { activation },
+             shape,
+             scopes: scopes.clone(),
+             epsilon: self.epsilon,
+@@ -703,7 +704,7 @@
+             listed: false,
+         };
+         let history = match binding.history {
+-            KvCodec::Dense => {
++            KvCodec::Dense | KvCodec::DenseF16 => {
+                 // As for K8/V4, multi-row launches (draft blocks,
+                 // verification) get their own tuning identity, so their
+                 // grouped form is not displaced by the single-row one.
+--- a/inference/engine/executor/src/native/tuning/attention.rs
++++ b/inference/engine/executor/src/native/tuning/attention.rs
+@@ -374,6 +374,7 @@
+ #[derive(Clone)]
+ pub(crate) struct AttentionMix {
+     pub activation: Element,
++    pub history: Element,
+     pub shape: AttentionShape,
+     pub scopes: Vec<WeightScope>,
+     pub epsilon: f32,
+@@ -461,8 +462,8 @@
+         let mut plane = |name: &str, seed: u64| {
+             let extents = [rows, shape.kv_heads, shape.width];
+             let plane = inputs.shared(
+-                format!("{name}-{}-{extents:?}", mix.activation.name()),
+-                |inputs| inputs.activation(mix.activation, &extents, seed),
++                format!("{name}-{}-{extents:?}", mix.history.name()),
++                |inputs| inputs.activation(mix.history, &extents, seed),
+             )?;
+             inputs.slab_state(plane, view, appended.clone())
+         };
+@@ -588,13 +589,14 @@
+     fn bindings(&self) -> String {
+         match &self.decode_rows {
+             Some(rows) => format!(
+-                "A={},M={}..{}",
++                "A={},H={},M={}..{}",
+                 self.activation.name(),
++                self.history.name(),
+                 rows.start,
+                 rows.end
+             ),
+-            None if self.listed => format!("A={},L=1", self.activation.name()),
+-            None => format!("A={}", self.activation.name()),
++            None if self.listed => format!("A={},H={},L=1", self.activation.name(), self.history.name()),
++            None => format!("A={},H={}", self.activation.name(), self.history.name()),
+         }
+     }
+ 
+@@ -756,6 +758,7 @@
+ macro_rules! mix_entry {
+     ($tuning:ident, $module:ident, $history:ty, $serves:expr,
+      |$case:ident| { $($plane:ident: $state:expr),* $(,)? }
++     , elements |$mix:ident| $elements:expr
+      $(, search_starts $starts:path)?) => {
+         impl $tuning {
+             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
+@@ -843,7 +846,7 @@
+                 case.history.states()
+             }
+ 
+-            generated_entry!($module, this => $module::Elements { A: this.0.activation });
++            generated_entry!($module, $mix => $elements);
+         }
+     };
+ }
+@@ -857,6 +860,7 @@
+         history_key: case.history.key.tensor_mut(),
+         history_value: case.history.value.tensor_mut(),
+     },
++    elements |mix| attention_decode::Elements { A: mix.0.activation, H: mix.0.history },
+     search_starts decode_starts
+ );
+ mix_entry!(
+@@ -867,7 +871,8 @@
+     |case| {
+         history_key: case.history.key.tensor_mut(),
+         history_value: case.history.value.tensor_mut(),
+-    }
++    },
++    elements |mix| attention_prefill::Elements { A: mix.0.activation, H: mix.0.history }
+ );
+ mix_entry!(
+     AttentionDecodeK8V4Tuning,
+@@ -880,6 +885,7 @@
+         history_value_codes: case.history.value_codes.tensor_mut(),
+         history_value_coefficients: case.history.value_coefficients.tensor_mut(),
+     },
++    elements |mix| attention_decode_k8v4::Elements { A: mix.0.activation },
+     search_starts decode_starts
+ );
+ mix_entry!(
+@@ -893,7 +899,8 @@
+         history_key_coefficients: case.history.key_coefficients.tensor_mut(),
+         history_value_codes: case.history.value_codes.tensor_mut(),
+         history_value_coefficients: case.history.value_coefficients.tensor_mut(),
+-    }
++    },
++    elements |mix| attention_prefill_k8v4::Elements { A: mix.0.activation }
+ );
+ 
+ #[cfg(test)]
+@@ -905,6 +912,7 @@
+         let mix = AttentionMix {
+             listed: false,
+             activation: Element::bf16(),
++            history: Element::bf16(),
+             shape: AttentionShape {
+                 hidden: 2560,
+                 kv_heads: 4,
+@@ -937,7 +945,7 @@
+                 .collect::<std::collections::BTreeSet<_>>(),
+             [1].into()
+         );
+-        assert_eq!(single.bindings(), "A=bf16,M=1..2");
++        assert_eq!(single.bindings(), "A=bf16,H=bf16,M=1..2");
+         let mut mix = single.0;
+         mix.decode_rows = Some(2..DECODE_ROWS + 1);
+         let verify = AttentionDecodeK8V4Tuning(mix);
+@@ -949,7 +957,7 @@
+                 .collect::<std::collections::BTreeSet<_>>(),
+             [2, 4, 8].into()
+         );
+-        assert_eq!(verify.bindings(), "A=bf16,M=2..9");
++        assert_eq!(verify.bindings(), "A=bf16,H=bf16,M=2..9");
+ 
+         let mut classes = Vec::new();
+         for range in [2..4, 4..5, 5..DECODE_ROWS + 1] {
+--- a/inference/engine/executor/src/operators/attention/graph.rs
++++ b/inference/engine/executor/src/operators/attention/graph.rs
+@@ -113,6 +113,7 @@
+ pub(crate) struct CheckedAttentionEntries {
+     project: [(&'static str, Element); 6],
+     mix: [(&'static str, Element); 1],
++    dense_mix: [(&'static str, Element); 2],
+     output: [(&'static str, Element); 2],
+     post_norm: Option<CheckedPostNormEntries>,
+     history: KvCodec,
+@@ -135,6 +136,14 @@
+                 ("A", binding.activation),
+             ],
+             mix: [("A", binding.activation)],
++            dense_mix: [
++                ("A", binding.activation),
++                ("H", if binding.history == KvCodec::DenseF16 {
++                    Element::f16()
++                } else {
++                    binding.activation
++                }),
++            ],
+             output: [("OW", binding.output), ("A", binding.activation)],
+             post_norm: match binding.tail {
+                 SublayerTail::Residual => None,
+@@ -150,10 +159,10 @@
+ 
+     pub(crate) fn entries(&self) -> Result<AttentionGraphEntries<'_, NativeGraphMetadata>, String> {
+         let history = match self.history {
+-            KvCodec::Dense => AttentionHistoryEntries::Dense {
+-                decode: &self.mix[..],
++            KvCodec::Dense | KvCodec::DenseF16 => AttentionHistoryEntries::Dense {
++                decode: &self.dense_mix[..],
+                 verify: None,
+-                prefill: &self.mix[..],
++                prefill: &self.dense_mix[..],
+             },
+             KvCodec::AffineK8V4 => AttentionHistoryEntries::AffineK8V4 {
+                 decode: &self.mix[..],
+--- a/inference/engine/executor/src/planning/programs.rs
++++ b/inference/engine/executor/src/planning/programs.rs
+@@ -543,7 +543,7 @@
+     let draft_program = separate
+         .zip(head)
+         .map(|(draft, weights)| {
+-            draft_program_plan(draft, decoder.hidden, target, weights, active_element)
++            draft_program_plan(draft, decoder.hidden, target, weights, active_element, history)
+         })
+         .transpose()?;
+     let head_program = head
+@@ -565,7 +565,7 @@
+                     decoder.hidden,
+                     |kind| lookup(weights, mixer, kind),
+                     active_element,
+-                    KvCodec::Dense,
++                    history.drafter(),
+                 )?;
+                 slots.push(HeadBinding {
+                     embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
+@@ -641,6 +641,7 @@
+     target: &[WeightPlan],
+     weights: &[WeightPlan],
+     activation: Element,
++    history: KvCodec,
+ ) -> Result<DraftProgramPlan, PlanError> {
+     let lookup = |weights: &[WeightPlan], scope, kind| {
+         planned_element(weights, scope, kind)
+@@ -658,7 +659,7 @@
+             hidden,
+             |kind| lookup(weights, mixer, kind),
+             activation,
+-            KvCodec::Dense,
++            history.drafter(),
+         )?;
+         let dense = dense_slot(
+             &paired
+--- a/inference/engine/kernels/kernels/attention.seismic
++++ b/inference/engine/kernels/kernels/attention.seismic
+@@ -462,8 +462,8 @@
+     rotary_amplitudes: &tensor[P] f32,
+     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+-    history_key: &mut tensor[T, KV, 2 * P + S] A,
+-    history_value: &mut tensor[T, KV, 2 * P + S] A,
++    history_key: &mut tensor[T, KV, 2 * P + S] H,
++    history_value: &mut tensor[T, KV, 2 * P + S] H,
+     epsilon: f32, scale: f32, gate_function: i32) -> tensor[M, KV * G, 2 * P + S] A
+     where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+     let mut fresh_key = tensor[F, M, KV, 2 * P + S] A
+@@ -542,8 +542,8 @@
+     rotary_amplitudes: &tensor[P] f32,
+     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+-    history_key: &mut tensor[T, KV, 2 * P + S] A,
+-    history_value: &mut tensor[T, KV, 2 * P + S] A,
++    history_key: &mut tensor[T, KV, 2 * P + S] H,
++    history_value: &mut tensor[T, KV, 2 * P + S] H,
+     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
+     -> tensor[M, KV * G, 2 * P + S] A
+     where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+@@ -677,8 +677,8 @@
+     rotary_amplitudes: &tensor[P] f32,
+     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
+     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+-    history_key: &mut tensor[T, KV, 2 * P + S] A,
+-    history_value: &mut tensor[T, KV, 2 * P + S] A,
++    history_key: &mut tensor[T, KV, 2 * P + S] H,
++    history_value: &mut tensor[T, KV, 2 * P + S] H,
+     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
+     -> tensor[M, KV * G, 2 * P + S] A
+     where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+@@ -727,8 +727,8 @@
+ native attention_prefill for cuda from "cuda/attention_prefill.cu":
+     static (KV, G, P, S, I, U, F, N, NV)
+     params (arithmetic WARPS in [4, 2, 8, 1], arithmetic SPLIT_GROUPS in [1, 256, 512], arithmetic STAGES in [2, 3],
+-        arithmetic COLUMNS in [1, 2], QREG in [0, 1])
+-    where (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 <= 98304
++        arithmetic COLUMNS in [1, 2], QREG in [1, 0], arithmetic KEY_TILE in [16, 32])
++    where (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * min(KEY_TILE, 32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * min(KEY_TILE, 32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 <= 98304
+     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
+     scratch keys bytes (M * KV * (2 * P + S) * 2)
+     scratch values bytes (M * KV * (2 * P + S) * 2)
+@@ -741,7 +741,7 @@
+     launch attention_prefill_attend:
+         threadgroups (ceil_div(M, WARPS * 16 / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)))
+         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
+-        shared_bytes (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 + (R + 1) * 16)
++        shared_bytes (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * min(KEY_TILE, 32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * min(KEY_TILE, 32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 + (R + 1) * 16)
+     launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV) > 1:
+         threadgroups (ceil_div(M, WARPS * 16 / G), KV * G, 1)
+         threads_per_threadgroup (2 * P + S, 1, 1)
+--- a/inference/engine/kernels/kernels/cpu/attention_decode.rs
++++ b/inference/engine/kernels/kernels/cpu/attention_decode.rs
+@@ -68,8 +68,8 @@
+             let (key_row, value_row) = unsafe {
+                 (history_key.row_mut([destination as usize, head, 0]), history_value.row_mut([destination as usize, head, 0]))
+             };
+-            activation::store::<E::A>(&keys[head * w..][..w], key_row);
+-            activation::store::<E::A>(&values[head * w..][..w], value_row);
++            activation::store::<E::H>(&keys[head * w..][..w], key_row);
++            activation::store::<E::H>(&values[head * w..][..w], value_row);
+         }
+     }
+ }
+@@ -117,8 +117,8 @@
+         spans,
+         fresh,
+         range,
+-        |token, out| activation::widen::<E::A>(history_key.row([token, kv_head, 0]), out),
+-        |token, out| activation::widen::<E::A>(history_value.row([token, kv_head, 0]), out),
++        |token, out| activation::widen::<E::H>(history_key.row([token, kv_head, 0]), out),
++        |token, out| activation::widen::<E::H>(history_value.row([token, kv_head, 0]), out),
+         |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),
+         |token, out| out.copy_from_slice(&values[(token * kv + kv_head) * w..][..w]),
+     );
+--- a/inference/engine/kernels/kernels/cpu/attention_prefill.rs
++++ b/inference/engine/kernels/kernels/cpu/attention_prefill.rs
+@@ -65,8 +65,8 @@
+             let (key_row, value_row) = unsafe {
+                 (history_key.row_mut([destination as usize, head, 0]), history_value.row_mut([destination as usize, head, 0]))
+             };
+-            activation::store::<E::A>(&keys[head * w..][..w], key_row);
+-            activation::store::<E::A>(&values[head * w..][..w], value_row);
++            activation::store::<E::H>(&keys[head * w..][..w], key_row);
++            activation::store::<E::H>(&values[head * w..][..w], value_row);
+         }
+     }
+ }
+@@ -112,8 +112,8 @@
+         spans,
+         fresh,
+         range,
+-        |token, out| activation::widen::<E::A>(history_key.row([token, kv_head, 0]), out),
+-        |token, out| activation::widen::<E::A>(history_value.row([token, kv_head, 0]), out),
++        |token, out| activation::widen::<E::H>(history_key.row([token, kv_head, 0]), out),
++        |token, out| activation::widen::<E::H>(history_value.row([token, kv_head, 0]), out),
+         |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),
+         |token, out| out.copy_from_slice(&values[(token * kv + kv_head) * w..][..w]),
+     );
+--- a/inference/engine/kernels/kernels/cuda/attention_decode.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_decode.cu
+@@ -1,3 +1,5 @@
++#define ATTENTION_HISTORY_ELEMENT ELEMENT_OF(SEISMIC_ELEMENT_H)
++#define ATTENTION_HISTORY_BF16 ELEMENT_HAS(SEISMIC_ELEMENT_H, _REPRESENTATION_BF16)
+ // attention_decode (M <= 8): split-KV decode attention.
+ //
+ // L1 `attention_decode_partial`, one block per (kv head, partition, row
+@@ -145,8 +147,8 @@
+                     const int part_hi = history.slab_end(part_lo, hi);
+                     const auto *keys = history.key_vector(part_lo, kv);
+                     const auto *values = history.value_vector(part_lo, kv);
+-                    const u64 key_step = history.key_row * Act::bytes;
+-                    const u64 value_step = history.value_row * Act::bytes;
++                    const u64 key_step = history.key_row * attention::HistoryElement::bytes;
++                    const u64 value_step = history.value_row * attention::HistoryElement::bytes;
+                     for (int token = part_lo; token < part_hi; token += TOKENS) {
+                         const int count = min(TOKENS, part_hi - token);
+                         float k[TOKENS][DPL];
+@@ -155,8 +157,8 @@
+                         for (int t = 0; t < TOKENS; ++t) {
+                             if (t < count) {
+                                 const u64 at = static_cast<u64>(token + t - part_lo);
+-                                element::span<Act, DPL, true>(keys + at * key_step, lane * DPL, k[t]);
+-                                element::span<Act, DPL, true>(values + at * value_step, lane * DPL,
++                                element::span<attention::HistoryElement, DPL, true>(keys + at * key_step, lane * DPL, k[t]);
++                                element::span<attention::HistoryElement, DPL, true>(values + at * value_step, lane * DPL,
+                                                               v[t]);
+                             } else {
+ #pragma unroll
+--- a/inference/engine/kernels/kernels/cuda/attention_prefill.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_prefill.cu
+@@ -1,3 +1,6 @@
++#define ATTENTION_KEY_TILE SEISMIC_TUNE_KEY_TILE
++#define ATTENTION_HISTORY_ELEMENT ELEMENT_OF(SEISMIC_ELEMENT_H)
++#define ATTENTION_HISTORY_BF16 ELEMENT_HAS(SEISMIC_ELEMENT_H, _REPRESENTATION_BF16)
+ // attention_prefill (M >= 16): flash attention on tensor cores over dense
+ // history (bodies in lib/attention/prefill.cuh).
+ 
+--- a/inference/engine/kernels/kernels/cuda/lib/attention/history.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/attention/history.cuh
+@@ -6,7 +6,12 @@
+ // policy from its own ABI (`HISTORY()`): a header may name only macros every
+ // including entry generates.
+ 
+-// Dense history: key and value planes [T, KV, W] of the activation element.
++// Dense history has its own element, independent of projected activations.
++#ifdef ATTENTION_HISTORY_ELEMENT
++typedef ATTENTION_HISTORY_ELEMENT HistoryElement;
++#else
++typedef Act HistoryElement;
++#endif
+ struct DenseHistory {
+     static constexpr bool CODED = false;
+     const u32 *key;
+@@ -22,12 +27,12 @@
+ 
+     // Byte addresses of a (history row, kv head) vector.
+     __device__ __forceinline__ u8 *key_vector(int token, int kv_head) const {
+-        return slab::row(key, token, slab_rows, key_row * Act::bytes)
+-            + static_cast<u64>(kv_head) * key_head * Act::bytes;
++        return slab::row(key, token, slab_rows, key_row * HistoryElement::bytes)
++            + static_cast<u64>(kv_head) * key_head * HistoryElement::bytes;
+     }
+     __device__ __forceinline__ u8 *value_vector(int token, int kv_head) const {
+-        return slab::row(value, token, slab_rows, value_row * Act::bytes)
+-            + static_cast<u64>(kv_head) * value_head * Act::bytes;
++        return slab::row(value, token, slab_rows, value_row * HistoryElement::bytes)
++            + static_cast<u64>(kv_head) * value_head * HistoryElement::bytes;
+     }
+ 
+     __device__ __forceinline__ void append(int destination, int kv_head, const float (&k)[DPL],
+@@ -36,8 +41,8 @@
+         u8 *v_row = value_vector(destination, kv_head);
+ #pragma unroll
+         for (int d = 0; d < DPL; ++d) {
+-            element::put<Act>(k_row, lane * DPL + d, k[d]);
+-            element::put<Act>(v_row, lane * DPL + d, v[d]);
++            element::put<HistoryElement>(k_row, lane * DPL + d, k[d]);
++            element::put<HistoryElement>(v_row, lane * DPL + d, v[d]);
+         }
+     }
+ };
+--- a/inference/engine/kernels/kernels/cuda/lib/attention/prefill.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/attention/prefill.cuh
+@@ -72,7 +72,12 @@
+ // registers and the stages within shared memory. Its key tiles also stage in
+ // 256-column pieces, one per operand stage, the scores accumulating over the
+ // pieces (the query tile is the only whole-head operand in shared memory).
++#ifdef ATTENTION_KEY_TILE
++constexpr int KEYS = W > 256 ? 16 : ATTENTION_KEY_TILE;
++#else
+ constexpr int KEYS = W > 256 ? 16 : 32;
++#endif
++static_assert(KEYS == 16 || KEYS == 32, "key tiles are complete matrix fragments");
+ constexpr int WINDOW = W > 256 * COLUMNS ? 256 * COLUMNS : W;
+ constexpr int WINDOWS = W / WINDOW;
+ constexpr int PIECE = W > 256 ? 256 : W;
+@@ -114,7 +119,7 @@
+ // their precision (a bf16 rounding costs up to a code step); activation
+ // values enter exactly within the codec's range.
+ template <class History> struct Operands;
+-#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16)
++#if ATTENTION_HISTORY_BF16
+ template <> struct Operands<DenseHistory> : Bf16Operands {};
+ #else
+ template <> struct Operands<DenseHistory> : F16Operands {};
+@@ -199,14 +204,14 @@
+ __device__ __forceinline__ void stage_history(const DenseHistory &history, u8 *k_tile,
+                                               u8 *v_tile, int first, int limit, int kv, int piece,
+                                               int column0) {
+-    stage_slab<F32_ACTIVATION, PIECE_CHUNKS>(k_tile, KEYS, [&](int r) -> const u8 * {
++    stage_slab<(HistoryElement::bytes == 4), PIECE_CHUNKS>(k_tile, KEYS, [&](int r) -> const u8 * {
+         const int token = first + r;
+-        return token < limit ? history.key_vector(token, kv) + piece * PIECE * Act::bytes : nullptr;
++        return token < limit ? history.key_vector(token, kv) + piece * PIECE * HistoryElement::bytes : nullptr;
+     }, threadIdx.x, MMA_THREADS);
+     if (piece + 1 < PIECES) return;
+-    stage_slab<F32_ACTIVATION, WINDOW_CHUNKS>(v_tile, KEYS, [&](int r) -> const u8 * {
++    stage_slab<(HistoryElement::bytes == 4), WINDOW_CHUNKS>(v_tile, KEYS, [&](int r) -> const u8 * {
+         const int token = first + r;
+-        return token < limit ? history.value_vector(token, kv) + column0 * Act::bytes : nullptr;
++        return token < limit ? history.value_vector(token, kv) + column0 * HistoryElement::bytes : nullptr;
+     }, threadIdx.x, MMA_THREADS);
+ }
+ 
+--- a/inference/engine/kernels/kernels/metal/attention_decode.metal
++++ b/inference/engine/kernels/kernels/metal/attention_decode.metal
+@@ -1,3 +1,4 @@
++#define ATTENTION_HISTORY_SCALAR ELEMENT_OF(SEISMIC_ELEMENT_H)::native
+ #define ATTENTION_I SEISMIC_DIM_I
+ #define ATTENTION_U SEISMIC_DIM_U
+ #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+@@ -84,7 +85,7 @@
+                     rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, x);
+             else
+                 attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, x);
+-            attention::append(slab::row<attention::Scalar>(item % 2 == 0 ? history_key : history_value,
++            attention::append(slab::row<attention::HistoryScalar>(item % 2 == 0 ? history_key : history_value,
+                 ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS), KV * W), 0, kv_head, lane, x);
+         }
+     }
+@@ -165,9 +166,9 @@
+                 const uint part_end =
+                     uint(metal::min(ulong(end), (slab_index + 1) * slab_rows - ulong(lo) + ulong(offset)));
+                 const ulong at = ((token - slab_index * slab_rows) * KV + kv_head) * W + lane * E;
+-                device const attention::Scalar *key_rows = slab::region<attention::Scalar>(history_key, slab_index) + at;
+-                device const attention::Scalar *value_rows =
+-                    slab::region<attention::Scalar>(history_value, slab_index) + at;
++                device const attention::HistoryScalar *key_rows = slab::region<attention::HistoryScalar>(history_key, slab_index) + at;
++                device const attention::HistoryScalar *value_rows =
++                    slab::region<attention::HistoryScalar>(history_value, slab_index) + at;
+                 uint t = 0;
+                 for (; position + DECODE_BATCH <= part_end; position += DECODE_BATCH, t += DECODE_BATCH) {
+                     float k[DECODE_BATCH][E];
+--- a/inference/engine/kernels/kernels/metal/attention_prefill.metal
++++ b/inference/engine/kernels/kernels/metal/attention_prefill.metal
+@@ -1,3 +1,4 @@
++#define ATTENTION_HISTORY_SCALAR ELEMENT_OF(SEISMIC_ELEMENT_H)::native
+ #define ATTENTION_I SEISMIC_DIM_I
+ #define ATTENTION_U SEISMIC_DIM_U
+ #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+@@ -27,9 +28,9 @@
+     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
+     device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
+     device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+-    device attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
+-    device attention::Scalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
+-    device attention::Scalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
++    device attention::HistoryScalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
++    device attention::HistoryScalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
++    device attention::HistoryScalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
+     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+     uint group [[threadgroup_position_in_grid]],
+     uint simd [[simdgroup_index_in_threadgroup]],
+@@ -50,9 +51,9 @@
+     device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
+     device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+     device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+-    device const attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
+-    device const attention::Scalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
+-    device const attention::Scalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
++    device const attention::HistoryScalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
++    device const attention::HistoryScalar *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
++    device const attention::HistoryScalar *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
+     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
+     device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
+     device uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
+--- a/inference/engine/kernels/kernels/metal/lib/attention/attention.h
++++ b/inference/engine/kernels/kernels/metal/lib/attention/attention.h
+@@ -43,6 +43,11 @@
+ 
+ // The activation element's MSL scalar.
+ typedef element::Act::native Scalar;
++#ifdef ATTENTION_HISTORY_SCALAR
++typedef ATTENTION_HISTORY_SCALAR HistoryScalar;
++#else
++typedef Scalar HistoryScalar;
++#endif
+ 
+ // sin and cos of an F32 rotary angle (|angle| up to the context length). The
+ // angle is reduced exactly enough to [-pi, pi] by a three-part 2*pi
+@@ -61,12 +66,12 @@
+ // Appends lane `lane`'s columns of one kv head row at history row
+ // `destination` (the caller skips rows without a destination).
+ template <typename T>
+-inline void append(device Scalar *history, int destination, uint kv_head, uint lane,
++inline void append(device HistoryScalar *history, int destination, uint kv_head, uint lane,
+     thread const T (&x)[ATTENTION_E]) {
+     const ulong target = (ulong(destination) * SEISMIC_DIM_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
+     ATTENTION_UNROLL
+     for (uint i = 0; i < ATTENTION_E; ++i)
+-        history[target + i] = Scalar(x[i]);
++        history[target + i] = HistoryScalar(Scalar(x[i]));
+ }
+ 
+ // Keys per decode partition for a row seeing `total` keys: at least `span`,
+@@ -663,39 +668,39 @@
+ // activation-dtype operands.
+ struct dense_history {
+     enum : bool { AFFINE = false };
+-    typedef Scalar Operand;
++    typedef HistoryScalar Operand;
+     device const ulong *key;
+     device const ulong *value;
+     ulong rows_per_slab;
+ 
+     inline void append(int destination, uint kv_head, uint lane, thread const float (&k)[ATTENTION_E],
+         thread const Scalar (&v)[ATTENTION_E]) const {
+-        attention::append(slab::row<Scalar>(key, ulong(destination), rows_per_slab,
++        attention::append(slab::row<HistoryScalar>(key, ulong(destination), rows_per_slab,
+             SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, k);
+-        attention::append(slab::row<Scalar>(value, ulong(destination), rows_per_slab,
++        attention::append(slab::row<HistoryScalar>(value, ulong(destination), rows_per_slab,
+             SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, v);
+     }
+ 
+     template <uint THREADS, uint KEYS = PREFILL_KEYS>
+-    inline void stage_key(threadgroup Scalar *staged, int first, int end, uint kv_head,
++    inline void stage_key(threadgroup HistoryScalar *staged, int first, int end, uint kv_head,
+         uint thread_index) const {
+-        prefill_stage_slab<THREADS, Scalar, KEYS>(staged, key, rows_per_slab, first, end, kv_head, thread_index);
++        prefill_stage_slab<THREADS, HistoryScalar, KEYS>(staged, key, rows_per_slab, first, end, kv_head, thread_index);
+     }
+ 
+     template <uint THREADS, uint KEYS = PREFILL_KEYS>
+-    inline void stage_value(threadgroup Scalar *staged, int first, int end, uint kv_head,
++    inline void stage_value(threadgroup HistoryScalar *staged, int first, int end, uint kv_head,
+         uint thread_index) const {
+-        prefill_stage_slab<THREADS, Scalar, KEYS>(staged, value, rows_per_slab, first, end, kv_head,
++        prefill_stage_slab<THREADS, HistoryScalar, KEYS>(staged, value, rows_per_slab, first, end, kv_head,
+             thread_index);
+     }
+ 
+     // The direct form's operand rows for a span that holds row `at`: its slab
+     // (a span lies in one slab).
+-    inline direct_rows<Scalar> direct(int at, uint kv_head) const {
++    inline direct_rows<HistoryScalar> direct(int at, uint kv_head) const {
+         const uint rows = uint(rows_per_slab);
+         const uint index = uint(at) / rows;
+-        return direct_rows<Scalar>{slab::region<Scalar>(key, index) + kv_head * ATTENTION_W,
+-            slab::region<Scalar>(value, index) + kv_head * ATTENTION_W, int(index * rows), int(rows)};
++        return direct_rows<HistoryScalar>{slab::region<HistoryScalar>(key, index) + kv_head * ATTENTION_W,
++            slab::region<HistoryScalar>(value, index) + kv_head * ATTENTION_W, int(index * rows), int(rows)};
+     }
+ 
+     // History read in place is attended in one launch.
+@@ -703,7 +708,7 @@
+ 
+     // The matrix decode's key operand: the history dtype. Its values enter the
+     // P.V product as F16, exact for activation values within F16's range.
+-    typedef Scalar KeyOperand;
++    typedef HistoryScalar KeyOperand;
+ 
+     // One simdgroup's rows [first, first + KEYS) of columns [col0, col0 + WC)
+     // of one kv head in registers, eight elements per 16-byte piece split
+@@ -718,7 +723,7 @@
+         uint4 key[COUNT];
+         uint4 value[COUNT];
+ 
+-        inline void store_key_direct(threadgroup Scalar *staged, uint lane) const {
++        inline void store_key_direct(threadgroup HistoryScalar *staged, uint lane) const {
+             store_key(staged, lane);
+         }
+ 
+@@ -726,7 +731,7 @@
+             store_value(staged, lane);
+         }
+ 
+-        inline void store_key(threadgroup Scalar *staged, uint lane) const {
++        inline void store_key(threadgroup HistoryScalar *staged, uint lane) const {
+             ATTENTION_UNROLL
+             for (uint n = 0; n < COUNT; ++n) {
+                 const uint item = lane + n * 32;
+@@ -745,7 +750,7 @@
+                 uint converted[4];
+                 ATTENTION_UNROLL
+                 for (uint i = 0; i < 4; ++i)
+-                    converted[i] = as_type<uint>(half2(float2(as_type<vec<Scalar, 2>>(value[n][i]))));
++                    converted[i] = as_type<uint>(half2(float2(as_type<vec<HistoryScalar, 2>>(value[n][i]))));
+                 *reinterpret_cast<threadgroup uint4 *>(staged + (item / PIECES) * (WC + 8) + (item % PIECES) * 8) =
+                     uint4(converted[0], converted[1], converted[2], converted[3]);
+             }
+@@ -756,8 +761,8 @@
+     inline void load_tile(thread decode_tile<KEYS, WC> &tile, int first, int end, uint kv_head, uint col0,
+         uint lane) const {
+         constexpr uint PIECES = decode_tile<KEYS, WC>::PIECES;
+-        const decode_slab_tile<Scalar> keys(key, rows_per_slab, first);
+-        const decode_slab_tile<Scalar> values(value, rows_per_slab, first);
++        const decode_slab_tile<HistoryScalar> keys(key, rows_per_slab, first);
++        const decode_slab_tile<HistoryScalar> values(value, rows_per_slab, first);
+         ATTENTION_UNROLL
+         for (uint n = 0; n < decode_tile<KEYS, WC>::COUNT; ++n) {
+             const uint item = lane + n * 32;
+--- a/inference/engine/kernels/kernels/vulkan/attention_decode.comp
++++ b/inference/engine/kernels/kernels/vulkan/attention_decode.comp
+@@ -1,3 +1,10 @@
++#if defined(SEISMIC_ELEMENT_H_REPRESENTATION_F16)
++#define ELEMENT_HISTORY ELEMENT_F16
++#elif defined(SEISMIC_ELEMENT_H_REPRESENTATION_BF16)
++#define ELEMENT_HISTORY ELEMENT_BF16
++#else
++#define ELEMENT_HISTORY ELEMENT_F32
++#endif
+ // attention_decode: split-KV decode attention over dense history. The Vulkan
+ // form of `metal/attention_decode.metal` over `lib/attention/attention.glsl`.
+ #define ATTENTION_HEADS uint(SEISMIC_DIM_G / SEISMIC_TUNE_SLICES)
+@@ -94,10 +101,10 @@
+                     amplitudes, epsilon, lane, x);
+             else
+                 attention_value(value + source * act_bytes, ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
+-            const uint64_t head_bytes = uint64_t(W) * act_bytes;
++            const uint64_t head_bytes = uint64_t(W) * ELEMENT_BYTES(ELEMENT_HISTORY);
+             const uint64_t address = slab_row(sg == 0u ? history_key : history_value, uint64_t(destination),
+                 SEISMIC_PARAM_SLAB_ROWS, uint64_t(KV) * head_bytes) + uint64_t(kv_head) * head_bytes;
+-            attention_append(address, 0, 0u, lane, x);
++            history_dense_append(address, lane, x);
+         }
+     }
+ 
+@@ -161,7 +168,7 @@
+         const uint begin = max(first, offset);
+         const uint end = min(last, offset + length);
+         uint position = begin;
+-        const uint64_t head_bytes = uint64_t(W) * act_bytes;
++        const uint64_t head_bytes = uint64_t(W) * ELEMENT_BYTES(ELEMENT_HISTORY);
+         const uint64_t row_bytes = uint64_t(KV) * head_bytes;
+         if (historical) {
+             // Each slab's part of the span: its key and value rows address
+@@ -181,8 +188,8 @@
+                     float v[4][ATTENTION_E];
+                     [[unroll]] for (uint j = 0u; j < DECODE_BATCH; ++j) {
+                         const uint64_t at = uint64_t(position + j - part_start) * row_bytes;
+-                        attention_load_row(key_rows + at, lane * E, k[j]);
+-                        attention_load_row(value_rows + at, lane * E, v[j]);
++                        history_dense_load(key_rows + at, lane * E, k[j]);
++                        history_dense_load(value_rows + at, lane * E, v[j]);
+                     }
+                     attention_absorb(DECODE_BATCH, q, k, v, maximum, denominator, result);
+                 }
+@@ -190,8 +197,8 @@
+                     float k[4][ATTENTION_E];
+                     float v[4][ATTENTION_E];
+                     const uint64_t at = uint64_t(position - part_start) * row_bytes;
+-                    attention_load_row(key_rows + at, lane * E, k[0]);
+-                    attention_load_row(value_rows + at, lane * E, v[0]);
++                    history_dense_load(key_rows + at, lane * E, k[0]);
++                    history_dense_load(value_rows + at, lane * E, v[0]);
+                     attention_absorb(1u, q, k, v, maximum, denominator, result);
+                 }
+             }
+--- a/inference/engine/kernels/kernels/vulkan/attention_prefill.comp
++++ b/inference/engine/kernels/kernels/vulkan/attention_prefill.comp
+@@ -1,3 +1,10 @@
++#if defined(SEISMIC_ELEMENT_H_REPRESENTATION_F16)
++#define ELEMENT_HISTORY ELEMENT_F16
++#elif defined(SEISMIC_ELEMENT_H_REPRESENTATION_BF16)
++#define ELEMENT_HISTORY ELEMENT_BF16
++#else
++#define ELEMENT_HISTORY ELEMENT_F32
++#endif
+ // attention_prefill: streaming attention for prefill rows over dense history.
+ // The body (three launches) is `lib/attention/prefill.glsl`.
+ #define ATTENTION_I uint(SEISMIC_DIM_I)
+--- a/inference/engine/kernels/kernels/vulkan/lib/attention/history.glsl
++++ b/inference/engine/kernels/kernels/vulkan/lib/attention/history.glsl
+@@ -19,6 +19,20 @@
+ #include "attention.glsl"
+ #include "flash.glsl"
+ 
++#ifndef ELEMENT_HISTORY
++#define ELEMENT_HISTORY ELEMENT_ACT
++#endif
++
++void history_dense_load(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
++    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
++        x[i] = element_at(ELEMENT_HISTORY, base, index + uint64_t(i));
++}
++
++void history_dense_append(uint64_t address, uint lane, float x[ATTENTION_E]) {
++    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
++        element_put(ELEMENT_HISTORY, address, uint64_t(lane * ATTENTION_E + i), element_round(ELEMENT_ACT, x[i]));
++}
++
+ #define HISTORY_KEY_BITS 8u
+ #define HISTORY_VALUE_BITS 4u
+ // Columns per (scale, zero) pair: the codec's group (model-state
+@@ -153,10 +167,10 @@
+ void history_append(attention_history h, const bool is_key, int destination, uint kv_head, uint lane,
+     float x[ATTENTION_E]) {
+     if (!h.affine) {
+-        const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ELEMENT_ACT);
++        const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ELEMENT_HISTORY);
+         const uint64_t address = history_address(is_key ? h.key : h.value, uint64_t(destination),
+             h.slab_rows, uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head);
+-        attention_append(address, 0, 0u, lane, x);
++        history_dense_append(address, lane, x);
+         return;
+     }
+     const uint b = is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS;
+@@ -177,7 +191,7 @@
+ void history_stage(attention_history h, const bool is_key, int first, int end, uint kv_head, uint column,
+     const uint w, uint base) {
+     if (!h.affine) {
+-        flash_stage_slab(ELEMENT_ACT, is_key ? h.key : h.value, h.slab_rows, ATTENTION_KV * ATTENTION_W,
++        flash_stage_slab(ELEMENT_HISTORY, is_key ? h.key : h.value, h.slab_rows, ATTENTION_KV * ATTENTION_W,
+             kv_head * ATTENTION_W + column, w, first, end, base);
+         return;
+     }
+--- a/inference/engine/kernels/tests/attention.rs
++++ b/inference/engine/kernels/tests/attention.rs
+@@ -348,7 +348,7 @@
+ ) -> seismic::NativeKernel<attention_decode::Entry> {
+     attention_decode::native_for_device_with(
+         device,
+-        attention_decode::Elements { A: Element::bf16() },
++        attention_decode::Elements { A: Element::bf16() , H: Element::bf16() },
+         specialization,
+     )
+     .unwrap()
+@@ -360,7 +360,7 @@
+ ) -> seismic::NativeKernel<attention_prefill::Entry> {
+     attention_prefill::native_for_device_with(
+         device,
+-        attention_prefill::Elements { A: Element::bf16() },
++        attention_prefill::Elements { A: Element::bf16() , H: Element::bf16() },
+         specialization,
+     )
+     .unwrap()
+@@ -477,7 +477,7 @@
+     let logical = module
+         .entry(
+             module.entry_named(entry).unwrap(),
+-            &ElementBindings::new().bind("A", registry::dense(DType::BF16)),
++            &ElementBindings::new().bind("A", registry::dense(DType::BF16)).bind("H", registry::dense(DType::BF16)),
+         )
+         .unwrap();
+     let Geometry { kv, g, p, .. } = case.geometry;
+--- a/inference/engine/kernels/tests/attention_family.rs
++++ b/inference/engine/kernels/tests/attention_family.rs
+@@ -401,7 +401,7 @@
+     let logical = module
+         .entry(
+             module.entry_named(entry).unwrap(),
+-            &ElementBindings::new().bind("A", registry::dense(DType::BF16)),
++            &ElementBindings::new().bind("A", registry::dense(DType::BF16)).bind("H", registry::dense(DType::BF16)),
+         )
+         .unwrap();
+     let form = case.form;
+@@ -878,6 +878,7 @@
+                     ("STAGES", 2),
+                     ("COLUMNS", 1),
+                     ("QREG", 0),
++                    ("KEY_TILE", 16),
+                 ],
+                 vec![
+                     ("WARPS", 2),
+@@ -885,6 +886,7 @@
+                     ("STAGES", 2),
+                     ("COLUMNS", 2),
+                     ("QREG", 0),
++                    ("KEY_TILE", 16),
+                 ],
+             ];
+             // Register queries hold heads up to 256 columns.
+@@ -895,6 +897,7 @@
+                     ("STAGES", 2),
+                     ("COLUMNS", 1),
+                     ("QREG", 1),
++                    ("KEY_TILE", 16),
+                 ]);
+             }
+             configurations
+@@ -947,7 +950,7 @@
+         ($module:ident) => {{
+             let kernel = $module::native_for_device_with(
+                 device,
+-                $module::Elements { A: Element::bf16() },
++                $module::Elements { A: Element::bf16(), H: Element::bf16() },
+                 specialization,
+             )
+             .map_err(|error| error.to_string())?;
+@@ -1656,7 +1659,7 @@
+     let mut bound = Bound::new(device, case);
+     let kernel = attention_decode::native_for_device_with(
+         device,
+-        attention_decode::Elements { A: Element::bf16() },
++        attention_decode::Elements { A: Element::bf16() , H: Element::bf16() },
+         specialization,
+     )
+     .map_err(|error| error.to_string())?;
+--- a/inference/engine/kernels/tests/attention_golden.rs
++++ b/inference/engine/kernels/tests/attention_golden.rs
+@@ -462,7 +462,7 @@
+             ($module:ident) => {{
+                 let kernel = $module::native_for_device_with(
+                     device,
+-                    $module::Elements { A: elements },
++                    $module::Elements { A: elements, H: elements },
+                     specialization,
+                 )
+                 .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+--- a/inference/engine/kernels/tests/attention_k8v4.rs
++++ b/inference/engine/kernels/tests/attention_k8v4.rs
+@@ -2380,7 +2380,7 @@
+                 .and_then(|dense_config| {
+                     attention_decode::native_for_device_with(
+                         device,
+-                        attention_decode::Elements { A: Element::bf16() },
++                        attention_decode::Elements { A: Element::bf16() , H: Element::bf16() },
+                         &specialization_on(device, geometry, &dense_config),
+                     )
+                     .ok()
+@@ -2493,7 +2493,7 @@
+                 .median;
+             let dense_kernel = attention_prefill::native_for_device_with(
+                 device,
+-                attention_prefill::Elements { A: Element::bf16() },
++                attention_prefill::Elements { A: Element::bf16() , H: Element::bf16() },
+                 // The dense entry has no producer warps.
+                 &specialization_on(
+                     device,
+@@ -2502,6 +2502,7 @@
+                         .iter()
+                         .copied()
+                         .filter(|(name, _)| *name != "PRODUCERS")
++                        .chain((backend == BackendName::Cuda).then_some(("KEY_TILE", 16)))
+                         .collect::<Vec<_>>(),
+                 ),
+             )
+--- a/inference/engine/kernels/tests/attention_segments.rs
++++ b/inference/engine/kernels/tests/attention_segments.rs
+@@ -50,7 +50,7 @@
+     };
+     let kernel = attention_decode::native_for_device_with(
+         device,
+-        attention_decode::Elements { A: Element::bf16() },
++        attention_decode::Elements { A: Element::bf16() , H: Element::bf16() },
+         &specialization,
+     )
+     .unwrap();
+--- a/inference/engine/kernels/tests/cuda_attention.rs
++++ b/inference/engine/kernels/tests/cuda_attention.rs
+@@ -26,7 +26,7 @@
+ ) -> seismic::NativeKernel<attention_decode::Entry> {
+     attention_decode::native_for_device_with(
+         device,
+-        attention_decode::Elements { A: Element::bf16() },
++        attention_decode::Elements { A: Element::bf16() , H: Element::bf16() },
+         &qwen_form(statics(geometry), geometry)
+             .with_param("PARTS", parts)
+             .with_param("WARPS", warps)
+@@ -45,13 +45,14 @@
+ ) -> seismic::NativeKernel<attention_prefill::Entry> {
+     attention_prefill::native_for_device_with(
+         device,
+-        attention_prefill::Elements { A: Element::bf16() },
++        attention_prefill::Elements { A: Element::bf16() , H: Element::bf16() },
+         &qwen_form(statics(geometry), geometry)
+             .with_param("WARPS", warps)
+             .with_param("SPLIT_GROUPS", split_groups)
+             .with_param("STAGES", 2)
+             .with_param("COLUMNS", 1)
+-            .with_param("QREG", 0),
++            .with_param("QREG", 0)
++            .with_param("KEY_TILE", 16),
+     )
+     .unwrap()
+ }
+--- /dev/null
++++ b/inference/engine/kernels/tests/dense_f16_history.rs
+@@ -0,0 +1,186 @@
++//! BF16 projected inputs and independently typed F16 history on real devices.
++//! The scalar F32 softmax oracle is independent of the native implementations.
++use magnitude_kernels::{attention_decode, attention_prefill};
++use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
++use seismic_lang::{reference_math::{float_literal, ReferenceScalar}, types::DType};
++
++const KV: usize = 4;
++const G: usize = 6;
++const W: usize = 256;
++const OLD: usize = 7;
++const SLAB: usize = 4;
++
++fn rounded(dtype: DType, x: f32) -> f32 {
++    float_literal(dtype, f64::from(x)).to_f64() as f32
++}
++
++fn bytes(dtype: DType, values: &[f32]) -> Vec<u8> {
++    values.iter().flat_map(|x| (float_literal(dtype, f64::from(*x)).bits() as u16).to_le_bytes()).collect()
++}
++
++fn tensor(device: &Device, element: Element, shape: &[usize], data: Vec<u8>) -> Tensor {
++    Tensor::from_host(device, element, &shape.iter().map(|x| *x as u64).collect::<Vec<_>>(), &data).unwrap()
++}
++
++fn bf16(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
++    tensor(device, Element::bf16(), shape, bytes(DType::BF16, values))
++}
++
++fn ints(device: &Device, shape: &[usize], values: &[i32]) -> Tensor {
++    tensor(device, Element::i32(), shape, values.iter().flat_map(|x| x.to_le_bytes()).collect())
++}
++
++fn history(device: &Device, values: &[f32], rows: usize) -> SlabTensor {
++    let mut result = SlabTensor::new(device, SLAB as u64, rows as u64,
++        vec![SlabRegion { element: Element::f16(), row_shape: vec![KV as u64, W as u64] }]).unwrap();
++    for first in (0..rows).step_by(SLAB) {
++        result.add_slab().unwrap();
++        let count = SLAB.min(rows - first);
++        result.region_rows(0, first as u64, count as u64).unwrap()
++            .write_from_host(&bytes(DType::F16, &values[first * KV * W..(first + count) * KV * W])).unwrap();
++    }
++    result
++}
++
++fn history_bytes(history: &SlabTensor, rows: usize) -> Vec<u8> {
++    (0..rows).step_by(SLAB).flat_map(|first| {
++        history.region_rows(0, first as u64, SLAB.min(rows - first) as u64).unwrap().read_to_host().unwrap()
++    }).collect()
++}
++
++fn noise(count: usize, seed: usize, dtype: DType) -> Vec<f32> {
++    (0..count).map(|i| rounded(dtype, ((i * 37 + seed * 19) % 509) as f32 / 257.0 - 0.99)).collect()
++}
++
++fn oracle(query: &[f32], key: &[f32], value: &[f32], rows: usize, visible: &[i32],
++          fresh_key: &[f32], fresh_value: &[f32], fresh: &[i32]) -> Vec<f32> {
++    let mut output = vec![0.0; rows * KV * G * W];
++    for row in 0..rows {
++        for head in 0..KV * G {
++            let kv = head / G;
++            let q = &query[(row * KV * G + head) * W..][..W];
++            let mut pairs = Vec::new();
++            for span in 0..3 {
++                let at = row * 6 + span * 2;
++                for token in visible[at]..visible[at + 1] {
++                    let at = (token as usize * KV + kv) * W;
++                    pairs.push((&key[at..][..W], &value[at..][..W]));
++                }
++            }
++            for token in fresh[row * 2]..fresh[row * 2 + 1] {
++                let at = (token as usize * KV + kv) * W;
++                pairs.push((&fresh_key[at..][..W], &fresh_value[at..][..W]));
++            }
++            if pairs.is_empty() { continue; }
++            let scores = pairs.iter().map(|(k, _)| q.iter().zip(*k)
++                .fold(0.0f32, |sum, (a, b)| a.mul_add(*b, sum)) / 16.0).collect::<Vec<_>>();
++            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
++            let probabilities = scores.iter().map(|x| (x - maximum).exp()).collect::<Vec<_>>();
++            let denominator: f32 = probabilities.iter().sum();
++            for column in 0..W {
++                let sum = pairs.iter().zip(&probabilities).fold(0.0f32,
++                    |sum, ((_, v), p)| p.mul_add(v[column], sum));
++                output[(row * KV * G + head) * W + column] = rounded(DType::BF16, sum / denominator);
++            }
++        }
++    }
++    output
++}
++
++fn run(device: &Device, rows: usize) {
++    let total = OLD + rows;
++    let query_values = noise(rows * KV * G * W, 1, DType::BF16);
++    let mut key_values = noise(rows * KV * W, 2, DType::BF16);
++    let mut value_values = noise(rows * KV * W, 3, DType::BF16);
++    // These BF16 payloads require F16 rounding, including subnormal and signed zero.
++    let edges = [0.0, -0.0, 2.0f32.powi(-25), 2.0f32.powi(-24), -2.0f32.powi(-24), 1.0625];
++    key_values[..edges.len()].copy_from_slice(&edges);
++    value_values[..edges.len()].copy_from_slice(&edges);
++    let mut old_key = noise(total * KV * W, 4, DType::F16);
++    let mut old_value = noise(total * KV * W, 5, DType::F16);
++    assert!(old_key.iter().any(|x| rounded(DType::BF16, *x) != *x));
++    let key_slabs = history(device, &old_key, total);
++    let value_slabs = history(device, &old_value, total);
++    let mut history_key = key_slabs.logical_region(0).unwrap();
++    let mut history_value = value_slabs.logical_region(0).unwrap();
++    let query = bf16(device, &[rows, KV * G, W], &query_values);
++    let gate = bf16(device, &[rows, KV * G, 0], &[]);
++    let empty_norm = tensor(device, Element::f32(), &[0, W], vec![]);
++    let components = ints(device, &[0], &[]);
++    let empty_rotary = tensor(device, Element::f32(), &[0], vec![]);
++    let coordinates = ints(device, &[rows, 4], &vec![0; rows * 4]);
++
++    for appended in [true, false] {
++        let projected_key = if appended { key_values.as_slice() } else { &[] };
++        let projected_value = if appended { value_values.as_slice() } else { &[] };
++        let key = bf16(device, &[usize::from(appended), rows, KV * W], projected_key);
++        let value = bf16(device, &[usize::from(appended), rows, KV * W], projected_value);
++        let visible_values = (0..rows).flat_map(|row| {
++            if !appended { [OLD as i32, total as i32, 0, 0, 0, 0] }
++            else if row == 0 { [0; 6] }
++            else { [0, 3, 3, 6, 0, 0] }
++        }).collect::<Vec<_>>();
++        let fresh_values = (0..rows).flat_map(|row| [0, if appended && row > 0 { (row + 1) as i32 } else { 0 }]).collect::<Vec<_>>();
++        let visible = ints(device, &[rows, 3, 2], &visible_values);
++        let fresh = ints(device, &[rows, 2], &fresh_values);
++        let destinations = ints(device, &[rows], &(0..rows).map(|row| if appended { (OLD + row) as i32 } else { -1 }).collect::<Vec<_>>());
++        let expected = oracle(&query_values, &old_key, &old_value, rows, &visible_values,
++            projected_key, projected_value, &fresh_values);
++        let statics = NativeSpecialization::new()
++            .with_static("P", 0).with_static("S", W as u64)
++            .with_static("I", 0).with_static("U", 0)
++            .with_static("F", u64::from(appended)).with_static("N", 0).with_static("NV", 0);
++        let statics = if device.backend() == BackendName::Cuda {
++            statics.with_static("KV", KV as u64).with_static("G", G as u64)
++        } else { statics };
++        let special = if device.backend() == BackendName::Cuda && rows <= 8 {
++            statics.with_param("PARTS", 12).with_param("WARPS", 4)
++                .with_param("SLICES", 1).with_param("MATRIX", 0)
++                .with_param("STAGES", 2).with_param("COLUMNS", 1)
++        } else if device.backend() == BackendName::Cuda {
++            statics.with_param("WARPS", 2).with_param("SPLIT_GROUPS", 1)
++                .with_param("STAGES", 2).with_param("COLUMNS", 1).with_param("QREG", 1).with_param("KEY_TILE", 16)
++        } else if rows <= 8 { statics.with_param("PARTS", 8) } else { statics };
++        macro_rules! call {
++            ($module:ident) => {{
++                let kernel = $module::native_for_device_with(device,
++                    $module::Elements { A: Element::bf16(), H: Element::f16() }, &special).unwrap();
++                kernel.call($module::Args {
++                    query: &query, gate: &gate, key: &key, value: &value,
++                    query_norm: &empty_norm, key_norm: &empty_norm, value_norm: &empty_norm,
++                    rotary_components: &components, rotary_frequencies: &empty_rotary,
++                    rotary_amplitudes: &empty_rotary, coordinates: &coordinates,
++                    visible: &visible, fresh: &fresh, destinations: &destinations,
++                    history_key: &mut history_key, history_value: &mut history_value,
++                    epsilon: 1e-6, scale: 1.0 / 16.0, gate_function: 0, slab_rows: SLAB as u32,
++                }).unwrap().value
++            }};
++        }
++        let output = if rows <= 8 { call!(attention_decode) } else { call!(attention_prefill) };
++        let actual = output.read_to_host().unwrap().chunks_exact(2).map(|b|
++            ReferenceScalar::BF16(u16::from_le_bytes([b[0], b[1]])).to_f64() as f32).collect::<Vec<_>>();
++        let mut worst = 0.0f32;
++        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
++            worst = worst.max((a - e).abs());
++            assert!((a - e).abs() <= 4e-3 + 1.6e-2 * e.abs(), "row class {rows}, appended {appended}, output {i}: {a} != {e}");
++        }
++        if appended {
++            for (destination, source) in [(&mut old_key, &key_values), (&mut old_value, &value_values)] {
++                for (i, x) in source.iter().enumerate() {
++                    destination[OLD * KV * W + i] = rounded(DType::F16, *x);
++                }
++            }
++        }
++        assert_eq!(history_bytes(&key_slabs, total), bytes(DType::F16, &old_key), "key payload and untouched rows");
++        assert_eq!(history_bytes(&value_slabs, total), bytes(DType::F16, &old_value), "value payload and untouched rows");
++        eprintln!("backend {:?}, rows {rows}, appended {appended}, max_abs {worst:e}: exact F16 payload", device.backend());
++    }
++}
++
++#[test]
++fn bf16_activations_append_and_read_f16_history() {
++    let name = std::env::var("SEISMIC_TEST_BACKEND").unwrap_or_else(|_| "cpu".into());
++    let backend = match name.as_str() { "cuda" => BackendName::Cuda, "cpu" => BackendName::Cpu, _ => panic!("select cpu or cuda explicitly") };
++    let device = DeviceCatalog::discover().unwrap().open_backend(backend).unwrap();
++    for rows in [1, 8, 9, 17] { run(&device, rows); }
++}
+--- a/inference/engine/src/options.rs
++++ b/inference/engine/src/options.rs
+@@ -17,7 +17,7 @@
+ const DEFAULT_PROPOSALS: u8 = 3;
+ use crate::census::AllocationCensus;
+ use magnitude_scheduler::ServiceLimits;
+-use magnitude_state::KvCodec;
++pub use magnitude_state::KvCodec;
+ use serde::{Deserialize, Serialize};
+ use std::{path::PathBuf, sync::Arc};
+ 
+@@ -340,6 +340,7 @@
+ #[serde(remote = "KvCodec")]
+ enum KvCodecEncoding {
+     Dense,
++    DenseF16,
+     AffineK8V4,
+     RotatedK4V4,
+ }
+--- a/inference/engine/state/src/advance.rs
++++ b/inference/engine/state/src/advance.rs
+@@ -317,7 +317,7 @@
+ }
+ 
+ fn identify_codec(components: &[ComponentDescriptor]) -> Result<KvCodec, Error> {
+-    for candidate in [KvCodec::Dense, KvCodec::AffineK8V4, KvCodec::RotatedK4V4] {
++    for candidate in [KvCodec::Dense, KvCodec::DenseF16, KvCodec::AffineK8V4, KvCodec::RotatedK4V4] {
+         if components.iter().all(|component| {
+             let dense_dtype = match component.codec.key {
+                 Codec::Dense { dtype } => dtype,
+--- a/inference/engine/state/src/codec.rs
++++ b/inference/engine/state/src/codec.rs
+@@ -83,6 +83,8 @@
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub enum KvCodec {
+     Dense,
++    /// IEEE binary16 history, independent of the activation dtype.
++    DenseF16,
+     AffineK8V4,
+     RotatedK4V4,
+ }
+@@ -94,10 +96,11 @@
+     fn from_str(name: &str) -> Result<Self, String> {
+         match name {
+             "dense" => Ok(Self::Dense),
++            "dense-f16" => Ok(Self::DenseF16),
+             "affine-k8v4" => Ok(Self::AffineK8V4),
+             "rotated-k4v4" => Ok(Self::RotatedK4V4),
+             _ => Err(format!(
+-                "unknown KV codec {name}: expected dense, affine-k8v4 or rotated-k4v4"
++                "unknown KV codec {name}: expected dense, dense-f16, affine-k8v4 or rotated-k4v4"
+             )),
+         }
+     }
+@@ -107,8 +110,17 @@
+     pub const fn identity(self) -> &'static str {
+         match self {
+             Self::Dense => "dense",
++            Self::DenseF16 => "dense_f16",
+             Self::AffineK8V4 => "affine_k8_uniform_v4",
+             Self::RotatedK4V4 => "rotated_k4_uniform_v4",
++        }
++    }
++
++    /// A drafter requires dense history, retaining an explicitly selected F16 policy.
++    pub const fn drafter(self) -> Self {
++        match self {
++            Self::DenseF16 => Self::DenseF16,
++            Self::Dense | Self::AffineK8V4 | Self::RotatedK4V4 => Self::Dense,
+         }
+     }
+ 
+@@ -119,6 +131,10 @@
+             Self::Dense => (
+                 Codec::Dense { dtype: dense_dtype },
+                 Codec::Dense { dtype: dense_dtype },
++            ),
++            Self::DenseF16 => (
++                Codec::Dense { dtype: DType::F16 },
++                Codec::Dense { dtype: DType::F16 },
+             ),
+             Self::AffineK8V4 => (
+                 Codec::Affine {
+@@ -568,6 +584,14 @@
+ 
+         let dense = KvCodec::Dense.spec(DType::BF16, 4, 8);
+         assert_eq!(dense, CodecSpec::dense(DType::BF16, 4, 8));
++        let f16: KvCodec = "dense-f16".parse().unwrap();
++        assert_eq!(f16.spec(DType::BF16, 256, 256), CodecSpec::dense(DType::F16, 256, 256));
++        assert_eq!(f16.drafter(), f16);
++        assert_ne!(f16.identity(), KvCodec::Dense.identity());
++        let layer = ComponentDescriptor::new(LayerRef::Target(3), f16.spec(DType::BF16, 256, 256), 4).unwrap();
++        assert!(layer.planes().iter().all(|plane| plane.dtype == DType::F16));
++        assert_eq!(layer.row_bytes().unwrap() * 17 * 262_144, 18_253_611_008);
++
+     }
+ 
+     #[test]
+--- a/inference/engine/state/src/layout.rs
++++ b/inference/engine/state/src/layout.rs
+@@ -165,7 +165,7 @@
+                     history_component(
+                         attention,
+                         LayerRef::Head(layer(index)?),
+-                        KvCodec::Dense,
++                        target_codec.drafter(),
+                         activation,
+                     )?,
+                 )?,
+@@ -592,6 +592,18 @@
+             layout.head_history[0].components()[1].codec.key,
+             crate::Codec::Dense { dtype: DType::BF16 }
+         ));
++        let f16 = ModelStateLayout::derive(
++            &decoder, &head.iter().collect::<Vec<_>>(), KvCodec::DenseF16, 3,
++        ).unwrap();
++        for domain in f16.target_history.iter().chain(&f16.head_history) {
++            for component in domain.components() {
++                assert_eq!(component.codec.key, crate::Codec::Dense { dtype: DType::F16 });
++                assert_eq!(component.codec.value, crate::Codec::Dense { dtype: DType::F16 });
++                assert!(component.planes().iter().all(|plane| plane.dtype == DType::F16));
++            }
++        }
++        assert_eq!(f16.target_recurrent, layout.target_recurrent);
++
+     }
+ 
+     #[test]
+--- a/inference/seismic-std/lib/kernels/attention.seismic
++++ b/inference/seismic-std/lib/kernels/attention.seismic
+@@ -1,7 +1,7 @@
+ # Online softmax update over one logical history span: the carried maximum `m`,
+ # normalization sum `l` and weighted-value accumulator `acc` absorb the span's scores in
+ # one step. The score tensor is local to the call; the caller authors which span it covers.
+-fn attention_update[M, K, W](qt: &tensor[M, W] A, kt: &tensor[K, W] A, vt: &tensor[K, W] A,
++fn attention_update[M, K, W](qt: &tensor[M, W] A, kt: &tensor[K, W] B, vt: &tensor[K, W] B,
+                              m: &mut tensor[M] f32, l: &mut tensor[M] f32, acc: &mut tensor[M, W] f32, scale: f32):
+     let mut seed = tensor[M, K] f32
+     for i in 0..M:

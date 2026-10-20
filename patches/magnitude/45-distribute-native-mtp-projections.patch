@@ -1,0 +1,107 @@
+--- a/inference/engine/kernels/kernels/cuda/draft_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/draft_rows.cu
+@@ -13,6 +13,13 @@
+ #include "lib/core/activation.cuh"
+ #include <seismic/packets.cuh>
+ #include "lib/core/reduce.cuh"
++
++// Separate module instances seal the same output-row controls used by
++// other native projections. Original/import/oracle modules keep count zero.
++extern "C" {
++__device__ __constant__ unsigned long long seismic_projection_shard_index=0;
++__device__ __constant__ unsigned long long seismic_projection_shard_count=0;
++}
+ 
+ namespace {
+ 
+@@ -33,6 +40,12 @@
+     __shared__ float partials[DRAFT_WARPS];
+     const u64 D = SEISMIC_DIM_D;
+     const u64 row = blockIdx.y;
++    const u64 owners=seismic_projection_shard_count;
++    if (owners!=0) {
++        const u64 groups=(D+127)/128,owner=seismic_projection_shard_index;
++        const u64 first=(u64)blockIdx.x*DRAFT_WARPS*DRAFT_ROWS_PER_WARP;
++        if (first<128*(groups*owner/owners) || first>=128*(groups*(owner+1)/owners) || first>=D) return;
++    }
+     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
+     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
+     // Column 0 of a (token, status) selection row; a failed selection is -1.
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -8,7 +8,7 @@
+ pub(super) struct View {pub buffer:usize,pub bytes:u64,pub extents:Vec<u64>,pub strides:Vec<u64>,pub element_bytes:u64}
+ #[derive(Clone)]
+ pub(super) struct Output {pub buffer:usize,pub first:u64,pub columns:u64,pub pitch:u64,pub rows:u64,pub element_bytes:u64}
+-pub(super) struct Spec {pub inputs:Vec<(usize,u64)>,pub constants:Vec<View>,pub outputs:Vec<Output>}
++pub(super) struct Spec {pub weight_ports:Vec<usize>,pub inputs:Vec<(usize,u64)>,pub constants:Vec<View>,pub outputs:Vec<Output>}
+ fn invalid(message:&str)->CallError {CallError::Execution(ExecutionError::ConstructionContradiction(message.into()))}
+ fn product(xs:&[u64])->Result<u64,CallError> {xs.iter().try_fold(1u64,|a,&b|a.checked_mul(b).ok_or_else(||invalid("projection extent product overflows")))}
+ fn view(dispatch:&Dispatch<'_>,buffer:usize,extents:&[u64],strides:&[u64])->Result<View,CallError> {
+@@ -21,10 +21,11 @@
+ impl Spec {
+     pub(super) fn from(dispatch:&Dispatch<'_>,ordinal:usize)->Result<Option<Self>,CallError> {
+         let launch=&dispatch.kernel.implementation.launches[ordinal].kernel;
+-        if !launch.contains("_gemv") && !launch.contains("_gemm") {return Ok(None);}
++        if !launch.contains("_gemv") && !launch.contains("_gemm") && launch!="draft_rows" {return Ok(None);}
+         let kind=if launch.starts_with("dense_expand_") {0} else if launch.starts_with("dense_output_") {1}
+             else if launch.starts_with("attention_project_") {2} else if launch.starts_with("attention_output_") {3}
+-            else if launch.starts_with("gated_delta_project_") {4} else if launch.starts_with("readout_head_rows_") {5} else {return Ok(None);};
++            else if launch.starts_with("gated_delta_project_") {4} else if launch.starts_with("readout_head_rows_") {5}
++            else if launch.starts_with("head_logits_rows_") {6} else if launch=="draft_rows" {7} else {return Ok(None);};
+         let schema=dispatch.kernel.logical.schema();let mut word=schema.dimensions().len();let mut buffer=0;
+         let mut parameters=Vec::new();let mut results=Vec::new();
+         for parameter in schema.parameters() {
+@@ -43,7 +44,7 @@
+             }
+         }
+         let scratch=dispatch.kernel.implementation.scratch.iter().enumerate().map(|(i,s)|(s.name.as_str(),buffer+i)).collect::<std::collections::HashMap<_,_>>();
+-        let weight_names:&[&str]=match kind {0=>&["gate_weight","up_weight"],1=>&["down_weight"],2=>&["query_weight","gate_weight","key_weight","value_weight"],3=>&["output_weight"],4=>&["qkv_weight","gate_weight","alpha_weight","beta_weight"],_=>&["weight"]};
++        let weight_names:&[&str]=match kind {0=>&["gate_weight","up_weight"],1=>&["down_weight"],2=>&["query_weight","gate_weight","key_weight","value_weight"],3=>&["output_weight"],4=>&["qkv_weight","gate_weight","alpha_weight","beta_weight"],7=>&["combine"],_=>&["weight"]};
+         let weights=weight_names.iter().map(|name|parameters.iter().find(|(n,_)|n==name).map(|(_,v)|v.clone()).ok_or_else(||invalid("projection source weight is absent from its ABI"))).collect::<Result<Vec<_>,_>>()?;
+         if weights.iter().any(|w|w.extents.len()!=2) {return Err(invalid("projection weight is not a canonical matrix"));}
+         let rows=results.first().and_then(|v|v.extents.first()).copied().ok_or_else(||invalid("projection output has no batch extent"))?;
+@@ -51,11 +52,17 @@
+         // module until that precision mode has its own sealed copy contract.
+         if dispatch.kernel.specialization.param("INT8")==Some(1) && rows>16 && rows<=64 {return Ok(None);}
+         let width=weights[0].extents[1];let mut inputs=Vec::new();
+-        if kind==1 || kind==3 {
+-            let name=if kind==1 {"product"} else {"gated"};let input=parameters.iter().find(|(n,_)|n==name).ok_or_else(||invalid("plain projection input is absent"))?;
++        if kind==1 || kind==3 || kind==6 {
++            let name=if kind==1 {"product"} else if kind==3 {"gated"} else {"features"};let input=parameters.iter().find(|(n,_)|n==name).ok_or_else(||invalid("plain projection input is absent"))?;
+             inputs.push((input.1.buffer,input.1.bytes));
+         }
+-        if kind!=1 && kind!=3 {
++        if kind==7 {
++            for name in ["conditioning","tokens"] {
++                let input=parameters.iter().find(|(n,_)|n==name).ok_or_else(||invalid("draft projection input is absent"))?;
++                inputs.push((input.1.buffer,input.1.bytes));
++            }
++        }
++        if kind!=1 && kind!=3 && kind!=6 && kind!=7 {
+             let staged=*scratch.get("staged").ok_or_else(||invalid("normalized projection has no staged input"))?;
+             inputs.push((staged,rows.checked_mul(width).and_then(|n|n.checked_mul(2)).ok_or_else(||invalid("projection staging size overflows"))?));
+         }
+@@ -80,7 +87,7 @@
+         // Representation sizes and extents come from the sealed invocation.
+         if outputs.iter().any(|v|v.element_bytes==0) {return Err(invalid("projection output is not a dense scalar element"));}
+         let _=product(&[rows,width])?;
+-        Ok(Some(Self {inputs,constants,outputs}))
++        Ok(Some(Self {weight_ports:weights.iter().map(|view|view.buffer).collect(),inputs,constants,outputs}))
+     }
+ }
+ 
+@@ -171,7 +178,12 @@
+         for view in &spec.constants {
+             let (allocation,offset)=buffers[view.buffer];let buffer=typed_buffer::<Cuda,Executor>(allocation);
+             if buffer.row_shard_plan().is_some() {
+-                pointers[view.buffer]=buffer.projection_pointer(device.ordinal()).map_err(CallError::Execution)?+offset;
++                if spec.weight_ports.contains(&view.buffer) {
++                    pointers[view.buffer]=buffer.projection_pointer(device.ordinal()).map_err(CallError::Execution)?+offset;
++                }
++                // Tables select arbitrary rows and require their full
++                // canonical read view; never alias or replicate them as
++                // output-row projection weights.
+             } else if remote && allocation.storage().read_only() && view.bytes!=0 {
+                 let copy=constant(source,peer,allocation,offset,view.bytes,builder)?;
+                 pointers[view.buffer]=typed_buffer::<Cuda,Executor>(&copy).pointer();copied.push(copy);

@@ -1,0 +1,49 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -253,6 +253,7 @@
+ // C-fragment columns 2t and 2t+1 of each 8-row column block.
+ template <int NB> struct GroupSums {
+     float half[NB][2][2];
++    float quarter[NB][4][2];
+ };
+ 
+ template <int NB, class W>
+@@ -285,10 +286,13 @@
+             for (int e = 0; e < 4; ++e)
+                 acc[nb][e] = seismic_fma_rn(c.scale[e / 2][group], p[nb][e], acc[nb][e]);
+             if constexpr (W::BIAS) {
+-                static_assert(W::GROUP == 32, "biased groups span half a k-block");
+-#pragma unroll
+-                for (int e = 0; e < 4; ++e)
+-                    acc[nb][e] = seismic_fma_rn(-c.bias[e / 2][group], sums.half[nb][group][e % 2], acc[nb][e]);
++                static_assert(W::GROUP == 16 || W::GROUP == 32, "biased groups span 16 or 32 codes");
++#pragma unroll
++                for (int e = 0; e < 4; ++e) {
++                    const float sum = W::GROUP == 32 ? sums.half[nb][group][e % 2]
++                                                     : sums.quarter[nb][group][e % 2];
++                    acc[nb][e] = seismic_fma_rn(-c.bias[e / 2][group], sum, acc[nb][e]);
++                }
+             }
+         }
+     }
+@@ -375,7 +379,19 @@
+                 }
+             }
+             GroupSums<NB> sums;
+-            if constexpr (BIAS) {
++            if constexpr ((WA::BIAS && WA::GROUP == 16) || (WB::BIAS && WB::GROUP == 16)) {
++                const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
++#pragma unroll
++                for (int nb = 0; nb < NB; ++nb)
++#pragma unroll
++                    for (int group = 0; group < 4; ++group) {
++                        float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++                        Op::mma(x, ones, b[nb][group]);
++                        sums.quarter[nb][group][0] = x[0];
++                        sums.quarter[nb][group][1] = x[1];
++                    }
++            }
++            if constexpr ((WA::BIAS && WA::GROUP == 32) || (WB::BIAS && WB::GROUP == 32)) {
+                 const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
+ #pragma unroll
+                 for (int nb = 0; nb < NB; ++nb)

@@ -1,0 +1,12 @@
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -164,6 +164,9 @@
+     for view in spec.constants.iter().filter(|view|spec.weight_ports.contains(&view.buffer)) {
+         let (allocation,offset)=buffers[view.buffer];
+         let buffer=typed_buffer::<Cuda,Executor>(allocation);
++        // Empty operator ports may alias another matrix's backing without
++        // addressing any rows; they do not constrain its physical partition.
++        if view.bytes==0 {continue;}
+         if let Some(plan)=buffer.row_shard_plan() {
+             if offset!=0 || view.extents[0]!=plan.rows || view.bytes!=plan.canonical_bytes {
+                 return Ok(false);

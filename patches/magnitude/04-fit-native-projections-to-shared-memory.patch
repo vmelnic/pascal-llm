@@ -1,0 +1,771 @@
+diff --git a/design/inference/engine/execution-plan.md b/design/inference/engine/execution-plan.md
+index 5e70352..aa809f4 100644
+--- a/design/inference/engine/execution-plan.md
++++ b/design/inference/engine/execution-plan.md
+@@ -63,6 +63,16 @@ A load and a prepare-only job share this one preparation (device selection, plan
+ device and preparing programs with the kernel cache), so both produce and look up identical tuning
+ keys; the prepare-only job ends there, while a load continues with state planning, graph sealing,
+ resource allocation, weight import and warm-up.
++CUDA projection launch geometry owns the row tile and pipeline depth. Its grid
++covers every submitted row and its declared shared bound includes staged activations,
++code chunks, both coefficient-record buffers and decoded warp coefficients. A
++single-stage candidate synchronizes every consuming warp before tile reuse, then
++waits for loads and a block barrier before multiplication. It preserves the k order,
++F32 accumulation and epilogue rounding of the multistage candidates. A 32-row
++single-stage default fits the Pascal shared-memory floor for every admitted weight
++representation; larger multistage candidates remain subject to the opened device's
++actual limits. Tile choices never select a model family or change stored weights.
++
+ Native entries with declared tuning parameters are tuned on the opened device during this
+ preparation, on the first preparation for each tuning key, whether by a load or by the prepare-only
+ job that follows a catalog installation: each such entry registers a tuning case
+diff --git a/inference/engine/kernels/kernels/attention.seismic b/inference/engine/kernels/kernels/attention.seismic
+index 9bb456b..fe02cde 100644
+--- a/inference/engine/kernels/kernels/attention.seismic
++++ b/inference/engine/kernels/kernels/attention.seismic
+@@ -155,15 +155,16 @@ native attention_output for cuda from "cuda/attention_output.cu":
+         threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_output_gemm_small when M > 16 and M <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (ceil_div(ceil_div(D, 16), 8), 1, 1 + min(1, 128 / M))
++        threadgroups (ceil_div(ceil_div(D, 16), 8), ceil_div(M, ROW_TILE), 1 + min(1, 128 / M))
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch attention_output_gemm when M > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(D, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(D, 16), 8), ceil_div(M, ROW_TILE), 1 + min(1, 128 / M))
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch attention_output_finalize when M > 16 and M <= 128:
+         threadgroups (ceil_div(M * D, 256), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+@@ -341,17 +342,18 @@ native attention_project for cuda from "cuda/attention_project.cu":
+         threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_project_gemm_small when M > 16 and M <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+         threadgroups (ceil_div(ceil_div(Q, 16), 8) + ceil_div(ceil_div(GR, 16), 8) + ceil_div(ceil_div(K, 16), 8)
+-            + ceil_div(ceil_div(V, 16), 8), 1, 1)
++            + ceil_div(ceil_div(V, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch attention_project_gemm when M > 64:
+-        params (code ROTATE in [2, 1, 4])
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
+         threadgroups (ceil_div(ceil_div(Q, 16), 8) + ceil_div(ceil_div(GR, 16), 8) + ceil_div(ceil_div(K, 16), 8)
+-            + ceil_div(ceil_div(V, 16), 8), ceil_div(M, 128), 1)
++            + ceil_div(ceil_div(V, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+ 
+ native attention_project for vulkan from "vulkan/attention_project.comp":
+     static (D, Q, GR, K, V)
+diff --git a/inference/engine/kernels/kernels/cuda/attention_output.cu b/inference/engine/kernels/kernels/cuda/attention_output.cu
+index dd88a6a..b1d0566 100644
+--- a/inference/engine/kernels/kernels/cuda/attention_output.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_output.cu
+@@ -60,14 +60,14 @@ __global__ void attention_output_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     seismic_dependency_start();
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+     extern __shared__ uint4 dynamic_shared[];
+-    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
++    const unsigned long long column = projection::gemm_column<projection::SmallGemm<ROW_TILE, PIPE>>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_D))
+-        projection::gemm_run_split<projection::SmallGemm, S8>(
++        projection::gemm_run_split<projection::SmallGemm<ROW_TILE, PIPE>, S8>(
+             reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_GATED),
+             S8 ? HEADS : SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, column, SEISMIC_DIM_D,
+             OUTPUT, EPILOGUE, PARTIALS);
+@@ -75,10 +75,10 @@ __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void attention_output_gemm(SEISMIC_KERNEL_PARAMS) {
+     seismic_dependency_start();
+-    using Shape = projection::LargeGemm<ROTATE>;
++    using Shape = projection::LargeGemm<ROTATE, ROW_TILE, PIPE>;
+     extern __shared__ uint4 dynamic_shared[];
+     const unsigned long long column = projection::gemm_column<Shape>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_D))
+diff --git a/inference/engine/kernels/kernels/cuda/attention_project.cu b/inference/engine/kernels/kernels/cuda/attention_project.cu
+index f18edd7..af36681 100644
+--- a/inference/engine/kernels/kernels/cuda/attention_project.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_project.cu
+@@ -193,18 +193,18 @@ __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
+-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
++    project_gemm<projection::SmallGemm<ROW_TILE, PIPE>, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+                                              SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
+-    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
++    project_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+                                                        SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda/dense_expand.cu b/inference/engine/kernels/kernels/cuda/dense_expand.cu
+index 51f4906..33de2f4 100644
+--- a/inference/engine/kernels/kernels/cuda/dense_expand.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_expand.cu
+@@ -90,18 +90,18 @@ __global__ void dense_expand_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void dense_expand_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
+-    expand_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
++    expand_gemm<projection::SmallGemm<ROW_TILE, PIPE>, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
+                                            UP, EPILOGUE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void dense_expand_gemm(SEISMIC_KERNEL_PARAMS) {
+-    expand_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
++    expand_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
+                                                       SEISMIC_DIM_F, GATE, UP, EPILOGUE);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda/dense_output.cu b/inference/engine/kernels/kernels/cuda/dense_output.cu
+index 6333779..7a2323d 100644
+--- a/inference/engine/kernels/kernels/cuda/dense_output.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_output.cu
+@@ -59,13 +59,13 @@ __global__ void dense_output_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void dense_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+     extern __shared__ uint4 dynamic_shared[];
+-    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
++    const unsigned long long column = projection::gemm_column<projection::SmallGemm<ROW_TILE, PIPE>>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_H))
+-        projection::gemm_run_split<projection::SmallGemm, S8>(
++        projection::gemm_run_split<projection::SmallGemm<ROW_TILE, PIPE>, S8>(
+             reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT),
+             S8 ? SEISMIC_DIM_F : SEISMIC_PRODUCT_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_F, column,
+             SEISMIC_DIM_H, DOWN, EPILOGUE, PARTIALS);
+@@ -73,9 +73,9 @@ __global__ void dense_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void dense_output_gemm(SEISMIC_KERNEL_PARAMS) {
+-    using Shape = projection::LargeGemm<ROTATE>;
++    using Shape = projection::LargeGemm<ROTATE, ROW_TILE, PIPE>;
+     extern __shared__ uint4 dynamic_shared[];
+     const unsigned long long column = projection::gemm_column<Shape>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_H))
+diff --git a/inference/engine/kernels/kernels/cuda/dense_up.cu b/inference/engine/kernels/kernels/cuda/dense_up.cu
+index 2422b14..4f313cb 100644
+--- a/inference/engine/kernels/kernels/cuda/dense_up.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_up.cu
+@@ -84,18 +84,18 @@ __global__ void dense_up_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_UP_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void dense_up_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+-    up_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP,
++    up_gemm<projection::SmallGemm<ROW_TILE, PIPE>, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, UP,
+                                        EPILOGUE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_UP_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void dense_up_gemm(SEISMIC_KERNEL_PARAMS) {
+-    up_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
++    up_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
+                                                   SEISMIC_DIM_F, UP, EPILOGUE);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda/gated_delta_project.cu b/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
+index eafd016..07a4309 100644
+--- a/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
++++ b/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
+@@ -146,22 +146,22 @@ __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
+     const unsigned long long rows[4] = SEGMENT_ROWS;
+     const Out out[4] = SEGMENT_OUT;
+-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
++    project_gemm<projection::SmallGemm<ROW_TILE, PIPE>, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
+                                             out);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
+     const unsigned long long rows[4] = SEGMENT_ROWS;
+     const Out out[4] = SEGMENT_OUT;
+-    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
++    project_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
+                                                        WEIGHTS, out);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda/head_logits_rows.cu b/inference/engine/kernels/kernels/cuda/head_logits_rows.cu
+index ad9e10e..747c35d 100644
+--- a/inference/engine/kernels/kernels/cuda/head_logits_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/head_logits_rows.cu
+@@ -53,16 +53,17 @@ __global__ void head_logits_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMM_SMALL
+-extern "C" __global__ void head_logits_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+-    logits_gemm<projection::SmallGemm>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
++template <unsigned ROW_TILE, unsigned PIPE>
++__global__ void head_logits_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
++    logits_gemm<projection::SmallGemm<ROW_TILE, PIPE>>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
+                                        (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_HEAD_LOGITS_ROWS_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void head_logits_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+-    logits_gemm<projection::LargeGemm<ROTATE>>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
++    logits_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0,
+                                                (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+index a2110b9..94de527 100644
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -529,7 +529,7 @@ template <int BM_, int WM_, int WN_, int STAGES_, bool ORDERED_ = false, int ROT
+     static constexpr int MI = BM / WM / 16; // m16 tiles per warp
+     static constexpr int NJ = 8 / WN;       // weight tiles per warp
+     static_assert(MI * 16 * WM == BM && NJ * WN == 8, "warp tiling covers the block tile");
+-    static_assert(STAGES >= 2 && STAGES <= 5, "a record buffer is reloaded only after its superblock's k-blocks");
++    static_assert(STAGES >= 1 && STAGES <= 5, "single-stage blocks synchronize before reusing a tile");
+     template <bool S8> static constexpr int A_PITCH = S8 ? 80 : 144;
+     // Activation bytes per row per stage (s8 rows carry their groups).
+     template <bool S8> static constexpr int A_ROW = S8 ? 96 : 144;
+@@ -545,14 +545,18 @@ template <int BM_, int WM_, int WN_, int STAGES_, bool ORDERED_ = false, int ROT
+                                         (Same<WB, NoWeight>::value ? 1 : 2) * WARPS * COEF_WARP;
+     // Shared bytes (the declared `shared_bytes` of a GEMM launch), a bound on
+     // every representation's layout:
+-    //   STAGES * (BM * 144 + STREAMS * 10240) + STREAMS * WARPS * NJ * 256
++    //   STAGES * BM * 144 + STREAMS * max(STAGES * 10240, STAGES * 6144 + 8192)
++    //   + STREAMS * WARPS * NJ * 256
+     // (the 16-bit layout, which also covers S8's smaller rows: INT8 has no
+     // effect with dense weights, so a configuration's GEMM may run either).
+     // Per stream the largest codes (q8: 1024 B per tile, 16 B records) and
+     // records (q6k, 32 B per row, 768 B per tile) take STAGES * 8192 + 4096
+-    // and STAGES * 6144 + 8192 of its STAGES * 10240 bytes.
++    // and STAGES * 6144 + 8192 bytes respectively. The latter dominates at
++    // one stage; two or more stages retain the original conservative bound.
+     template <int STREAMS>
+-    static constexpr int SHARED_BYTES = STAGES * (BM * 144 + STREAMS * 10240) + STREAMS * WARPS * COEF_WARP;
++    static constexpr int SHARED_BYTES = STAGES * BM * 144 + STREAMS *
++        (STAGES * 10240 > STAGES * 6144 + 8192 ? STAGES * 10240 : STAGES * 6144 + 8192) +
++        STREAMS * WARPS * COEF_WARP;
+ };
+ 
+ // The block column and row band of a GEMM block over a grid of block columns
+@@ -598,8 +602,9 @@ template <class Shape> __device__ __forceinline__ u64 gemm_band() {
+ // multiplying warps spill) and bulk (TMA) copies of the 128-byte activation
+ // rows all measured slower.
+ constexpr u32 SMALL_GEMM_ROWS = 64;
+-using SmallGemm = GemmShape<64, 1, 8, 3, true>;
+-template <unsigned ROTATE> using LargeGemm = GemmShape<128, 1, 8, 2, true, ROTATE>;
++template <unsigned ROWS, unsigned STAGES> using SmallGemm = GemmShape<ROWS, 1, 8, STAGES, true>;
++template <unsigned ROTATE, unsigned ROWS, unsigned STAGES>
++using LargeGemm = GemmShape<ROWS, 1, 8, STAGES, true, ROTATE>;
+ // Entries with few output columns split their GEMM over K into SPLIT shares
+ // up to SPLIT_ROWS rows (the declarations' grid z `1 + min(1, 128 / rows)`,
+ // partials scratch and finalize launch): their block columns alone leave most
+@@ -1061,12 +1066,21 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
+         seismic_cp_async_commit();
+     }
+     for (u64 kb = 0; kb < kblocks; ++kb) {
+-        seismic_cp_async_wait<Shape::STAGES - 2>();
+-        __syncthreads();
+-        const u64 next = kb + Shape::STAGES - 1;
+-        if (next < kblocks)
+-            load((int)(next % Shape::STAGES), next);
+-        seismic_cp_async_commit();
++        if constexpr (Shape::STAGES == 1) {
++            // Every consuming warp must finish before any loader reuses the tile.
++            __syncthreads();
++            load(0, kb);
++            seismic_cp_async_commit();
++            seismic_cp_async_wait<0>();
++            __syncthreads();
++        } else {
++            seismic_cp_async_wait<Shape::STAGES - 2>();
++            __syncthreads();
++            const u64 next = kb + Shape::STAGES - 1;
++            if (next < kblocks)
++                load((int)(next % Shape::STAGES), next);
++            seismic_cp_async_commit();
++        }
+         if (active)
+             gemm_multiply<Shape>(acc, weights, (int)(kb % Shape::STAGES), kb, warp, lane);
+     }
+@@ -1216,12 +1230,21 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows
+         seismic_cp_async_commit();
+     }
+     for (u64 kb = 0; kb < kblocks; ++kb) {
+-        seismic_cp_async_wait<Shape::STAGES - 2>();
+-        __syncthreads();
+-        const u64 next = kb + Shape::STAGES - 1;
+-        if (next < kblocks)
+-            load((int)(next % Shape::STAGES), next);
+-        seismic_cp_async_commit();
++        if constexpr (Shape::STAGES == 1) {
++            // Every consuming warp must finish before any loader reuses the tile.
++            __syncthreads();
++            load(0, kb);
++            seismic_cp_async_commit();
++            seismic_cp_async_wait<0>();
++            __syncthreads();
++        } else {
++            seismic_cp_async_wait<Shape::STAGES - 2>();
++            __syncthreads();
++            const u64 next = kb + Shape::STAGES - 1;
++            if (next < kblocks)
++                load((int)(next % Shape::STAGES), next);
++            seismic_cp_async_commit();
++        }
+         if (!active)
+             continue;
+         const int stage = (int)(kb % Shape::STAGES);
+diff --git a/inference/engine/kernels/kernels/cuda/per_layer_gate.cu b/inference/engine/kernels/kernels/cuda/per_layer_gate.cu
+index 96cd574..ca2ccbc 100644
+--- a/inference/engine/kernels/kernels/cuda/per_layer_gate.cu
++++ b/inference/engine/kernels/kernels/cuda/per_layer_gate.cu
+@@ -65,13 +65,13 @@ __global__ void per_layer_gate_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+     extern __shared__ uint4 dynamic_shared[];
+-    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
++    const unsigned long long column = projection::gemm_column<projection::SmallGemm<ROW_TILE, PIPE>>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_P))
+-        projection::gemm_run<projection::SmallGemm, S8>(reinterpret_cast<projection::u8 *>(dynamic_shared),
++        projection::gemm_run<projection::SmallGemm<ROW_TILE, PIPE>, S8>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+                                                         S8 ? STAGING : ROUNDED, SEISMIC_DIM_D, GROUPS,
+                                                         (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column,
+                                                         SEISMIC_DIM_P, GATE, projection::NoWeight{}, EPILOGUE);
+@@ -79,9 +79,9 @@ __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void per_layer_gate_gemm(SEISMIC_KERNEL_PARAMS) {
+-    using Shape = projection::LargeGemm<ROTATE>;
++    using Shape = projection::LargeGemm<ROTATE, ROW_TILE, PIPE>;
+     extern __shared__ uint4 dynamic_shared[];
+     const unsigned long long column = projection::gemm_column<Shape>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_P))
+diff --git a/inference/engine/kernels/kernels/cuda/project_rows.cu b/inference/engine/kernels/kernels/cuda/project_rows.cu
+index 126c33d..d6978b2 100644
+--- a/inference/engine/kernels/kernels/cuda/project_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/project_rows.cu
+@@ -58,13 +58,13 @@ __global__ void project_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
+     extern __shared__ uint4 dynamic_shared[];
+-    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
++    const unsigned long long column = projection::gemm_column<projection::SmallGemm<ROW_TILE, PIPE>>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_N))
+-        projection::gemm_run_split<projection::SmallGemm, S8>(
++        projection::gemm_run_split<projection::SmallGemm<ROW_TILE, PIPE>, S8>(
+             reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
+             S8 ? SEISMIC_DIM_K : SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column,
+             SEISMIC_DIM_N, WEIGHT, EPILOGUE, PARTIALS);
+@@ -72,9 +72,9 @@ __global__ void project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+-    using Shape = projection::LargeGemm<ROTATE>;
++    using Shape = projection::LargeGemm<ROTATE, ROW_TILE, PIPE>;
+     extern __shared__ uint4 dynamic_shared[];
+     const unsigned long long column = projection::gemm_column<Shape>();
+     if (column < projection::gemm_columns(SEISMIC_DIM_N))
+diff --git a/inference/engine/kernels/kernels/cuda/readout_head_rows.cu b/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
+index 9a21204..366bc83 100644
+--- a/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
+@@ -74,15 +74,16 @@ __global__ void readout_head_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM_SMALL
+-extern "C" __global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+-    head_gemm<projection::SmallGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
++template <unsigned ROW_TILE, unsigned PIPE>
++__global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
++    head_gemm<projection::SmallGemm<ROW_TILE, PIPE>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+-    head_gemm<projection::LargeGemm<ROTATE>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
++    head_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
+                                              EPILOGUE);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda/short_conv_project.cu b/inference/engine/kernels/kernels/cuda/short_conv_project.cu
+index e8b4189..36369dc 100644
+--- a/inference/engine/kernels/kernels/cuda/short_conv_project.cu
++++ b/inference/engine/kernels/kernels/cuda/short_conv_project.cu
+@@ -103,18 +103,18 @@ __global__ void short_conv_project_gemv16(SEISMIC_KERNEL_PARAMS) {
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMM_SMALL
+-template <unsigned INT8>
++template <unsigned INT8, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void short_conv_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
+     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2>;
+-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, SEISMIC_DIM_CH,
++    project_gemm<projection::SmallGemm<ROW_TILE, PIPE>, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, SEISMIC_DIM_CH,
+                                             SEGMENTS);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMM
+-template <unsigned ROTATE>
++template <unsigned ROTATE, unsigned ROW_TILE, unsigned PIPE>
+ __global__ void short_conv_project_gemm(SEISMIC_KERNEL_PARAMS) {
+-    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H,
++    project_gemm<projection::LargeGemm<ROTATE, ROW_TILE, PIPE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H,
+                                                        SEISMIC_DIM_CH, SEGMENTS);
+ }
+ #endif
+diff --git a/inference/engine/kernels/kernels/cuda_dense.seismic b/inference/engine/kernels/kernels/cuda_dense.seismic
+index 7b844c2..f367d17 100644
+--- a/inference/engine/kernels/kernels/cuda_dense.seismic
++++ b/inference/engine/kernels/kernels/cuda_dense.seismic
+@@ -47,15 +47,16 @@ native dense_expand for cuda from "cuda/dense_expand.cu":
+         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_expand_gemm_small when O > 16 and O <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (ceil_div(ceil_div(F, 16), 8), 1, 1)
++        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + 2 * max(PIPE * 10240, PIPE * 6144 + 8192) + 2 * 2048)
+     launch dense_expand_gemm when O > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, 128), 1)
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 2 * 10240) + 2 * 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + 2 * max(PIPE * 10240, PIPE * 6144 + 8192) + 2 * 2048)
+ 
+ # `dense_expand`'s bands with one weight stream.
+ native dense_up for cuda from "cuda/dense_up.cu":
+@@ -80,15 +81,16 @@ native dense_up for cuda from "cuda/dense_up.cu":
+         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_up_gemm_small when O > 16 and O <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (ceil_div(ceil_div(F, 16), 8), 1, 1)
++        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch dense_up_gemm when O > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, 128), 1)
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+ 
+ # `dense_expand`'s bands over two segments along x: u (the B and X streams
+ # paired) then C (one stream).
+@@ -114,15 +116,16 @@ native short_conv_project for cuda from "cuda/short_conv_project.cu":
+         threadgroups (ceil_div(2 * ceil_div(CH, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch short_conv_project_gemm_small when M > 16 and M <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (2 * ceil_div(ceil_div(CH, 16), 8), 1, 1)
++        threadgroups (2 * ceil_div(ceil_div(CH, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + 2 * max(PIPE * 10240, PIPE * 6144 + 8192) + 2 * 2048)
+     launch short_conv_project_gemm when M > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (2 * ceil_div(ceil_div(CH, 16), 8), ceil_div(M, 128), 1)
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (2 * ceil_div(ceil_div(CH, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 2 * 10240) + 2 * 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + 2 * max(PIPE * 10240, PIPE * 6144 + 8192) + 2 * 2048)
+ 
+ # A stage launch rounds the hidden rows to A (and the INT8 candidate's q8_1
+ # rows), then `project_rows`' bands over them.
+@@ -146,15 +149,16 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
+         threadgroups (ceil_div(ceil_div(P, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch per_layer_gate_gemm_small when M > 16 and M <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (ceil_div(ceil_div(P, 16), 8), 1, 1)
++        threadgroups (ceil_div(ceil_div(P, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch per_layer_gate_gemm when M > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(P, 16), 8), ceil_div(M, 128), 1)
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(P, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+ 
+ # `attention_output`'s bands (GEMV to 16 rows reading the rows in place, the
+ # INT8 candidate on the small GEMM, split-K to 128 rows) with a store
+@@ -179,15 +183,16 @@ native project_rows for cuda from "cuda/project_rows.cu":
+         threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch project_rows_gemm_small when M > 16 and M <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (ceil_div(ceil_div(N, 16), 8), 1, 1 + min(1, 128 / M))
++        threadgroups (ceil_div(ceil_div(N, 16), 8), ceil_div(M, ROW_TILE), 1 + min(1, 128 / M))
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch project_rows_gemm when M > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(N, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(N, 16), 8), ceil_div(M, ROW_TILE), 1 + min(1, 128 / M))
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch project_rows_finalize when M > 16 and M <= 128:
+         threadgroups (ceil_div(M * N, 256), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+@@ -211,15 +216,16 @@ native dense_output for cuda from "cuda/dense_output.cu":
+         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_output_gemm_small when O > 16 and O <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+-        threadgroups (ceil_div(ceil_div(H, 16), 8), 1, 1 + min(1, 128 / O))
++        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(O, ROW_TILE), 1 + min(1, 128 / O))
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch dense_output_gemm when O > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(O, 128), 1 + min(1, 128 / O))
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(O, ROW_TILE), 1 + min(1, 128 / O))
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch dense_output_finalize when O > 16 and O <= 128:
+         threadgroups (ceil_div(O * H, 256), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+diff --git a/inference/engine/kernels/kernels/draft.seismic b/inference/engine/kernels/kernels/draft.seismic
+index 0d76a8c..c18e659 100644
+--- a/inference/engine/kernels/kernels/draft.seismic
++++ b/inference/engine/kernels/kernels/draft.seismic
+@@ -124,14 +124,15 @@ native head_logits_rows for cuda from "cuda/head_logits_rows.cu":
+         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch head_logits_rows_gemm_small when O > 16 and O <= 64:
+-        threadgroups (ceil_div(ceil_div(V, 16), 8), 1, 1)
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
++        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch head_logits_rows_gemm when O > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, 128), 1)
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+ 
+ # Vulkan: the K1 projection without a prologue (see `readout_head_rows`).
+ native head_logits_rows for vulkan from "vulkan/head_logits_rows.comp":
+diff --git a/inference/engine/kernels/kernels/readout.seismic b/inference/engine/kernels/kernels/readout.seismic
+index 5f91c2d..67f9f24 100644
+--- a/inference/engine/kernels/kernels/readout.seismic
++++ b/inference/engine/kernels/kernels/readout.seismic
+@@ -122,14 +122,15 @@ native readout_head_rows for cuda from "cuda/readout_head_rows.cu":
+         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch readout_head_rows_gemm_small when O > 16 and O <= 64:
+-        threadgroups (ceil_div(ceil_div(V, 16), 8), 1, 1)
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
++        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch readout_head_rows_gemm when O > 64:
+-        params (code ROTATE in [2, 1, 4])
+-        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, 128), 1)
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
++        threadgroups (ceil_div(ceil_div(V, 16), 8), ceil_div(O, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+ 
+ # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Output
+ # rows O <= 8 run the GEMV launch (SIMDGROUPS x ROWS lane groups of LANES
+diff --git a/inference/engine/kernels/kernels/recurrent.seismic b/inference/engine/kernels/kernels/recurrent.seismic
+index b57366f..d4883ff 100644
+--- a/inference/engine/kernels/kernels/recurrent.seismic
++++ b/inference/engine/kernels/kernels/recurrent.seismic
+@@ -146,17 +146,18 @@ native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
+             + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch gated_delta_project_gemm_small when M > 16 and M <= 64:
++        params (code ROW_TILE in [32, 64], code PIPE in [1, 3])
+         reads (INT8)
+         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
+-            + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), 1, 1)
++            + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (3 * (64 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+     launch gated_delta_project_gemm when M > 64:
+-        params (code ROTATE in [2, 1, 4])
++        params (code ROTATE in [2, 1, 4], code ROW_TILE in [32, 128], code PIPE in [1, 2])
+         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
+-            + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, 128), 1)
++            + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, ROW_TILE), 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes (2 * (128 * 144 + 10240) + 2048)
++        shared_bytes (PIPE * ROW_TILE * 144 + max(PIPE * 10240, PIPE * 6144 + 8192) + 2048)
+ 
+ # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Rows
+ # M <= 8 run the GEMV launch (SIMDGROUPS x ROWS lane groups of LANES lanes
+diff --git a/inference/engine/kernels/tests/cuda_common/mod.rs b/inference/engine/kernels/tests/cuda_common/mod.rs
+index 4905b7c..782bd4e 100644
+--- a/inference/engine/kernels/tests/cuda_common/mod.rs
++++ b/inference/engine/kernels/tests/cuda_common/mod.rs
+@@ -344,6 +344,10 @@ impl Mapping {
+             .with_launch_param(2, "KSPLIT", self.ksplit)
+             .with_launch_param(3, "KSPLIT", self.ksplit)
+             .with_launch_param(5, "ROTATE", self.rotate)
++            .with_launch_param(4, "ROW_TILE", 32)
++            .with_launch_param(4, "PIPE", 1)
++            .with_launch_param(5, "ROW_TILE", 32)
++            .with_launch_param(5, "PIPE", 1)
+     }
+     /// Dense output owns KSPLIT on its two GEMV launches and ROTATE on its
+     /// GEMM.
+@@ -355,6 +359,10 @@ impl Mapping {
+             .with_launch_param(1, "KSPLIT", self.ksplit)
+             .with_launch_param(2, "KSPLIT", self.ksplit)
+             .with_launch_param(4, "ROTATE", self.rotate)
++            .with_launch_param(3, "ROW_TILE", 32)
++            .with_launch_param(3, "PIPE", 1)
++            .with_launch_param(4, "ROW_TILE", 32)
++            .with_launch_param(4, "PIPE", 1)
+     }
+     /// Attention output owns KSPLIT on its two GEMV launches and ROTATE on
+     /// its GEMM.
+@@ -366,6 +374,10 @@ impl Mapping {
+             .with_launch_param(1, "KSPLIT", self.ksplit)
+             .with_launch_param(2, "KSPLIT", self.ksplit)
+             .with_launch_param(4, "ROTATE", self.rotate)
++            .with_launch_param(3, "ROW_TILE", 32)
++            .with_launch_param(3, "PIPE", 1)
++            .with_launch_param(4, "ROW_TILE", 32)
++            .with_launch_param(4, "PIPE", 1)
+     }
+     /// Attention projection owns KSPLIT on its two GEMV launches and ROTATE
+     /// on its GEMM.
+@@ -377,6 +389,10 @@ impl Mapping {
+             .with_launch_param(2, "KSPLIT", self.ksplit)
+             .with_launch_param(3, "KSPLIT", self.ksplit)
+             .with_launch_param(5, "ROTATE", self.rotate)
++            .with_launch_param(4, "ROW_TILE", 32)
++            .with_launch_param(4, "PIPE", 1)
++            .with_launch_param(5, "ROW_TILE", 32)
++            .with_launch_param(5, "PIPE", 1)
+     }
+     /// The recurrent projection shares the attention projection's GEMV and
+     /// GEMM launch indices.
+@@ -391,6 +407,10 @@ impl Mapping {
+         spec.with_launch_param(1, "KSPLIT", self.ksplit)
+             .with_launch_param(2, "KSPLIT", self.ksplit)
+             .with_launch_param(4, "ROTATE", self.rotate)
++            .with_launch_param(3, "ROW_TILE", 32)
++            .with_launch_param(3, "PIPE", 1)
++            .with_launch_param(4, "ROW_TILE", 32)
++            .with_launch_param(4, "PIPE", 1)
+     }
+     /// Whether `rows` rows run the INT8 path (only the small-band GEMM has
+     /// one).

@@ -1,0 +1,29 @@
+--- a/inference/seismic/lang/native-library/cuda/packets.cuh
++++ b/inference/seismic/lang/native-library/cuda/packets.cuh
+@@ -169,6 +169,15 @@
+     static constexpr bool value = true;
+ };
+ 
++// A dense source already in the SIMT operand's activation element widens
++// its original bits directly, including signed zero and NaN payloads.
++template <class O, class E> struct NativeSIMTOperand {
++    static constexpr bool value = false;
++};
++template <class E> struct NativeSIMTOperand<OpSIMT<E>, E> {
++    static constexpr bool value = true;
++};
++
+ // ---------------------------------------------------------------------------
+ // Packed weights in the mma16 layout. Every decoder provides
+ //   GEMV:  Super fetch_superblock(tile, superblock, kblocks, lane) (the lane
+@@ -1163,7 +1172,9 @@
+     template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, typename O::Pair (&a)[4]) const {
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) {
+-            if constexpr (NativeOperand<O, E>::value) {
++            if constexpr (NativeSIMTOperand<O, E>::value) {
++                a[i] = pair(raw, step, i);
++            } else if constexpr (NativeOperand<O, E>::value) {
+                 a[i] = raw.w[step][i][0];
+             } else {
+                 const float2 values = pair(raw, step, i);

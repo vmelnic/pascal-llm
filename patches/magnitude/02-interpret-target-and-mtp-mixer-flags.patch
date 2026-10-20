@@ -1,0 +1,155 @@
+diff --git a/design/inference/engine/model-input.md b/design/inference/engine/model-input.md
+index 66100ef..d9650b8 100644
+--- a/design/inference/engine/model-input.md
++++ b/design/inference/engine/model-input.md
+@@ -27,6 +27,11 @@ the model definition, token plan, and generic prepared media to create one close
+ contract. The contract contains the final token coordinates, media spans, patch order, attention
+ coordinates, attention window ranges, and position-encoding interpolation indices and coefficients
+ needed by execution.
++A hybrid target's per-block mixer metadata may cover target blocks alone or all
++stored blocks including its embedded prediction head. Both forms bind the same
++target geometry. Every supplied flag is validated; prediction-head flags must
++agree with that head's supported mixer semantics. A trailing head block never
++becomes an additional target decoder block.
+ The adapter is configured with tokenizer-derived family marker identities before it prepares a
+ request; the model definition and media alone cannot identify those tokens.
+ For text-only input, the same closed contract records the family-supplied coordinates directly;
+diff --git a/inference/engine/families/qwen35/src/lib.rs b/inference/engine/families/qwen35/src/lib.rs
+index 5bee712..aa1f4ce 100644
+--- a/inference/engine/families/qwen35/src/lib.rs
++++ b/inference/engine/families/qwen35/src/lib.rs
+@@ -462,14 +462,27 @@ pub fn inspect_components(
+                 })
+                 .collect::<Vec<_>>()
+         }
+-        Some(Value::Array(flags)) if flags.len() as u64 == layer_count => flags
+-            .iter()
+-            .map(|v| match v {
+-                Scalar::Bool(true) => Ok(LocalMixerKind::Recurrent),
+-                Scalar::Bool(false) => Ok(LocalMixerKind::Attention),
+-                _ => Err(invalid("invalid per-layer recurrent flags")),
+-            })
+-            .collect::<Result<Vec<_>, _>>()?,
++        Some(Value::Array(flags))
++            if flags.len() as u64 == layer_count || flags.len() as u64 == block_count =>
++        {
++            // Some GGUF exporters describe every stored block, including MTP.
++            // Validate that suffix against the attention-only head contract,
++            // then bind only the target blocks into decoder geometry.
++            let mut layers = Vec::with_capacity(layer_count as usize);
++            for (index, flag) in flags.iter().enumerate() {
++                let kind = match flag {
++                    Scalar::Bool(true) => LocalMixerKind::Recurrent,
++                    Scalar::Bool(false) => LocalMixerKind::Attention,
++                    _ => return Err(invalid("invalid per-layer recurrent flags")),
++                };
++                if (index as u64) < layer_count {
++                    layers.push(kind);
++                } else if kind != LocalMixerKind::Attention {
++                    return Err(invalid("Qwen nextn prediction layers must use attention"));
++                }
++            }
++            layers
++        }
+         _ => return Err(invalid("invalid per-layer recurrent flags")),
+     };
+     let embedding = directory
+diff --git a/inference/engine/families/qwen35/tests/interpretation.rs b/inference/engine/families/qwen35/tests/interpretation.rs
+index 803cce9..e313dff 100644
+--- a/inference/engine/families/qwen35/tests/interpretation.rs
++++ b/inference/engine/families/qwen35/tests/interpretation.rs
+@@ -846,3 +846,94 @@ fn qwen_adapter_rejects_media_with_wrong_processor_identity() {
+     let altered = PreparedMedia::new("b".repeat(64), original.tensors().to_vec()).unwrap();
+     assert!(adapter.prepare(&model, plan, &[altered]).is_err());
+ }
++
++#[test]
++fn explicit_mtp_flags_preserve_target_and_head_geometry() {
++    let identity = PackageIdentity {
++        target: ArtifactIdentity([3; 32]),
++        projector: None,
++    };
++    let expected = inspect_components(&mtp_directory(), None, identity).unwrap();
++    for flags in [
++        vec![Scalar::Bool(true), Scalar::Bool(false)],
++        vec![Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(false)],
++    ] {
++        let mut directory = mtp_directory();
++        directory.metadata.push(Metadata {
++            name: "qwen35.attention.recurrent_layers".into(),
++            value: Value::Array(flags),
++        });
++        let actual = inspect_components(&directory, None, identity).unwrap();
++        assert_eq!(actual.decoder.blocks, expected.decoder.blocks);
++        assert_eq!(actual.head, expected.head);
++    }
++}
++
++#[test]
++fn explicit_mtp_flags_reject_invalid_suffix_and_lengths() {
++    for flags in [
++        vec![Scalar::Bool(true)],
++        vec![
++            Scalar::Bool(true),
++            Scalar::Bool(false),
++            Scalar::Bool(false),
++            Scalar::Bool(false),
++        ],
++        vec![Scalar::Bool(true), Scalar::Bool(false), Scalar::Bool(true)],
++        vec![Scalar::Bool(true), Scalar::Bool(false), Scalar::Unsigned(0)],
++        vec![
++            Scalar::Unsigned(1),
++            Scalar::Bool(false),
++            Scalar::Bool(false),
++        ],
++    ] {
++        let mut directory = mtp_directory();
++        directory.metadata.push(Metadata {
++            name: "qwen35.attention.recurrent_layers".into(),
++            value: Value::Array(flags),
++        });
++        assert!(inspect_components(
++            &directory,
++            None,
++            PackageIdentity {
++                target: ArtifactIdentity([3; 32]),
++                projector: None,
++            },
++        )
++        .is_err());
++    }
++}
++
++/// Qualification against downloaded headers, without opening tensor payloads.
++#[test]
++#[ignore = "requires locally supplied 64-target-block, one-MTP GGUF headers"]
++fn local_mtp_headers_bind_original_target_and_head_geometry() {
++    let paths = std::env::var_os("MAGNITUDE_MTP_GGUF_HEADERS")
++        .expect("set MAGNITUDE_MTP_GGUF_HEADERS to a path list of GGUF headers");
++    let mut count = 0;
++    for path in std::env::split_paths(&paths) {
++        let directory = magnitude_artifacts::gguf::inspect_header(&path).unwrap();
++        let model = inspect_components(
++            &directory,
++            None,
++            PackageIdentity {
++                target: ArtifactIdentity([0; 32]),
++                projector: None,
++            },
++        )
++        .unwrap();
++        assert_eq!(model.decoder.blocks.len(), 64, "{}", path.display());
++        assert_eq!(
++            model.head.as_ref().unwrap().depth(),
++            1,
++            "{}",
++            path.display()
++        );
++        println!(
++            "{}: 64 target blocks, one MTP block admitted",
++            path.display()
++        );
++        count += 1;
++    }
++    assert!(count > 0);
++}

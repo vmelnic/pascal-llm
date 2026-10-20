@@ -1,0 +1,51 @@
+--- a/inference/seismic/runtime/src/native/cuda.rs
++++ b/inference/seismic/runtime/src/native/cuda.rs
+@@ -18,7 +18,7 @@
+ use crate::api::CallError;
+ use crate::driver::{typed_buffer, Allocation};
+ use seismic_compiler::errors::ExecutionError;
+-use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch};
++use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch, TimelineAnchor};
+ use std::any::Any;
+ use std::sync::Arc;
+ 
+@@ -38,6 +38,14 @@
+     timed: bool,
+     retained: &Arc<dyn Any + Send + Sync>,
+ ) -> Result<RouteSubmission, CallError> {
++    // Attribute a real sealed-model submission with the existing CUDA event
++    // machinery. This diagnostic deliberately disables graph replay; it is
++    // never used as the production throughput measurement.
++    let diagnose = std::env::var_os("MAGNITUDE_PROFILE_CUDA").is_some()
++        && list.plans().is_some();
++    let anchor = diagnose.then(|| TimelineAnchor::record(device, super::trace::host_seconds))
++        .transpose().map_err(CallError::Execution)?;
++    let timed = timed || diagnose;
+     let mut batch = if timed {
+         DirectBatch::timed(device)
+     } else {
+@@ -79,10 +87,20 @@
+             }
+         }
+     }
+-    batch
+-        .commit()
+-        .map(RouteSubmission::Cuda)
+-        .map_err(CallError::Execution)
++    let submission = batch.commit().map_err(CallError::Execution)?;
++    if let Some(anchor) = anchor {
++        submission.finish().map_err(CallError::Execution)?;
++        let labels = super::launch_labels(list, repetitions);
++        let intervals = submission.launch_intervals(&anchor)
++            .map_err(CallError::Execution)?
++            .expect("diagnostic CUDA batches have launch marks");
++        for ((entry, launch), interval) in labels.iter().zip(intervals) {
++            if let Some((start, end)) = interval {
++                eprintln!("magnitude-cuda-profile entry={entry} launch={launch} seconds={:.9}", end-start);
++            }
++        }
++    }
++    Ok(RouteSubmission::Cuda(submission))
+ }
+ 
+ /// Visit every launch of one pass over `list` in order; `None` for an

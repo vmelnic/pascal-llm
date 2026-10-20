@@ -1,0 +1,635 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -261,10 +261,124 @@
+ // Only actual activation rows are evaluated. Every row uses the same fixed
+ // group association at every M; resident decoding and F32 scale/bias folds
+ // are shared with the tensor-core path.
++
++template<int NB,int COLS,class W,class Pro>
++__device__ __forceinline__ void gemv_simt_columns(float (&acc)[NB][4],const typename W::Raw &raw,const W &w,
++    const Coefficients<W::GROUPS> &c,u64 k0,const Pro &pro) {
++    const u32 t=threadIdx.x%4;
++    constexpr int STEPS=W::GROUP/16;
++#pragma unroll
++    for(int group=0;group<W::GROUPS;++group) {
++        float p[COLS][2]={};float sum[COLS]={};
++#pragma unroll
++        for(int j=0;j<STEPS;++j) {
++            float2 a[4];w.template decode<packets::OpSIMT<Act>>(raw,group*STEPS+j,a);
++#pragma unroll
++            for(int half=0;half<2;++half) {
++#pragma unroll
++                for(int column=0;column<COLS;++column) {
++                    const u64 k=k0+16*(group*STEPS+j)+2*t+8*half;
++                    const float2 x=Op::unpack(pro.pair(nullptr,column,k));
++#pragma unroll
++                    for(int r=0;r<2;++r) {
++                        const float2 v=a[2*half+r];
++                        p[column][r]=seismic_fma_rn(v.x,x.x,p[column][r]);
++                        p[column][r]=seismic_fma_rn(v.y,x.y,p[column][r]);
++                    }
++                    if constexpr(W::BIAS) {
++                        sum[column]=seismic_add_rn(sum[column],x.x);
++                        sum[column]=seismic_add_rn(sum[column],x.y);
++                    }
++                }
++            }
++        }
++#pragma unroll
++        for(int column=0;column<COLS;++column) {
++#pragma unroll
++            for(u32 mask=1;mask<=2;mask*=2) {
++#pragma unroll
++                for(int r=0;r<2;++r)p[column][r]=seismic_add_rn(p[column][r],seismic_shfl_xor_f32(p[column][r],mask));
++                if constexpr(W::BIAS)sum[column]=seismic_add_rn(sum[column],seismic_shfl_xor_f32(sum[column],mask));
++            }
++            if(t==column/2) {
++#pragma unroll
++                for(int r=0;r<2;++r) {
++                    float v=acc[0][2*r+column%2];
++                    v=seismic_fma_rn(c.scale[r][group],p[column][r],v);
++                    if constexpr(W::BIAS)v=seismic_fma_rn(-c.bias[r][group],sum[column],v);
++                    acc[0][2*r+column%2]=v;
++                }
++            }
++        }
++    }
++}
++
++template<int NB,int COLS,class WA,class WB,class Pro>
++__device__ __forceinline__ void gemv_simt_columns_pair(float (&aa)[NB][4],float (&ab)[NB][4],
++    const typename WA::Raw &ra,const typename WB::Raw &rb,const WA &wa,const WB &wb,
++    const Coefficients<WA::GROUPS> &ca,const Coefficients<WB::GROUPS> &cb,u64 k0,const Pro &pro) {
++    static_assert(WA::GROUP==WB::GROUP,"same group widths share activation columns");
++    const u32 t=threadIdx.x%4;constexpr int STEPS=WA::GROUP/16;
++#pragma unroll
++    for(int group=0;group<WA::GROUPS;++group) {
++        float pa[COLS][2]={},pb[COLS][2]={},sum[COLS]={};
++#pragma unroll
++        for(int j=0;j<STEPS;++j) {
++            float2 a[4],b[4];wa.template decode<packets::OpSIMT<Act>>(ra,group*STEPS+j,a);
++            wb.template decode<packets::OpSIMT<Act>>(rb,group*STEPS+j,b);
++#pragma unroll
++            for(int half=0;half<2;++half) {
++#pragma unroll
++                for(int column=0;column<COLS;++column) {
++                    const u64 k=k0+16*(group*STEPS+j)+2*t+8*half;
++                    const float2 x=Op::unpack(pro.pair(nullptr,column,k));
++#pragma unroll
++                    for(int r=0;r<2;++r) {
++                        const float2 va=a[2*half+r],vb=b[2*half+r];
++                        pa[column][r]=seismic_fma_rn(va.x,x.x,pa[column][r]);
++                        pa[column][r]=seismic_fma_rn(va.y,x.y,pa[column][r]);
++                        pb[column][r]=seismic_fma_rn(vb.x,x.x,pb[column][r]);
++                        pb[column][r]=seismic_fma_rn(vb.y,x.y,pb[column][r]);
++                    }
++                    if constexpr(WA::BIAS||WB::BIAS) {
++                        sum[column]=seismic_add_rn(sum[column],x.x);
++                        sum[column]=seismic_add_rn(sum[column],x.y);
++                    }
++                }
++            }
++        }
++#pragma unroll
++        for(int column=0;column<COLS;++column) {
++#pragma unroll
++            for(u32 mask=1;mask<=2;mask*=2) {
++#pragma unroll
++                for(int r=0;r<2;++r) {
++                    pa[column][r]=seismic_add_rn(pa[column][r],seismic_shfl_xor_f32(pa[column][r],mask));
++                    pb[column][r]=seismic_add_rn(pb[column][r],seismic_shfl_xor_f32(pb[column][r],mask));
++                }
++                if constexpr(WA::BIAS||WB::BIAS)sum[column]=seismic_add_rn(sum[column],seismic_shfl_xor_f32(sum[column],mask));
++            }
++            if(t==column/2) {
++#pragma unroll
++                for(int r=0;r<2;++r) {
++                    float a=aa[0][2*r+column%2],b=ab[0][2*r+column%2];
++                    a=seismic_fma_rn(ca.scale[r][group],pa[column][r],a);
++                    b=seismic_fma_rn(cb.scale[r][group],pb[column][r],b);
++                    if constexpr(WA::BIAS)a=seismic_fma_rn(-ca.bias[r][group],sum[column],a);
++                    if constexpr(WB::BIAS)b=seismic_fma_rn(-cb.bias[r][group],sum[column],b);
++                    aa[0][2*r+column%2]=a;ab[0][2*r+column%2]=b;
++                }
++            }
++        }
++    }
++}
++
+ template <int NB, class W, class Pro>
+ __device__ __forceinline__ void gemv_accumulate_simt(
+     float (&acc)[NB][4], const typename W::Raw &raw, const W &w,
+     const Coefficients<W::GROUPS> &coefficients, u32 M, u64 k0, const Pro &pro) {
++    if(M==2) { gemv_simt_columns<NB,2>(acc,raw,w,coefficients,k0,pro);return; }
++
+     const u32 t = threadIdx.x % 4;
+     constexpr int STEPS = W::GROUP / 16;
+ #pragma unroll
+@@ -333,6 +447,8 @@
+     const typename WA::Raw &ra, const typename WB::Raw &rb,
+     const WA &wa, const WB &wb, const Coefficients<WA::GROUPS> &ca,
+     const Coefficients<WB::GROUPS> &cb, u32 M, u64 k0, const Pro &pro) {
++
++    if(M==4) { gemv_simt_columns_pair<NB,4>(aa,ab,ra,rb,wa,wb,ca,cb,k0,pro);return; }
+     static_assert(WA::GROUP == WB::GROUP, "shared activations need equal group widths");
+     const u32 t = threadIdx.x % 4;
+     constexpr int STEPS = WA::GROUP / 16;
+@@ -486,6 +602,67 @@
+     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+     if (tile0 >= tiles)
+         return;
++    if constexpr(PAIR && !WA::DENSE && !WB::DENSE && WA::GROUP==WB::GROUP) {
++        if(M==2) {
++    const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
++    struct NativeStage {
++        typename WA::Raw raw_a[TPW];typename WB::Raw raw_b[TPW];
++        Coefficients<WA::GROUPS> ca[TPW];Coefficients<WB::GROUPS> cb[TPW];
++    };
++    auto load_native=[&](NativeStage &stage,u64 kb) {
++#pragma unroll
++        for(int i=0;i<TPW;++i) {
++            const u64 tile=tile0+i;if(tile>=tiles)continue;
++            stage.raw_a[i]=wa.fetch(tile,kb,lane);
++#pragma unroll
++            for(int r=0;r<2;++r)
++#pragma unroll
++                for(int group=0;group<WA::GROUPS;++group)
++                    wa.coefficient(tile*16+g+8*r,kb,group,stage.ca[i].scale[r][group],stage.ca[i].bias[r][group]);
++            if constexpr(PAIR) {
++                stage.raw_b[i]=wb.fetch(tile,kb,lane);
++#pragma unroll
++                for(int r=0;r<2;++r)
++#pragma unroll
++                    for(int group=0;group<WB::GROUPS;++group)
++                        wb.coefficient(tile*16+g+8*r,kb,group,stage.cb[i].scale[r][group],stage.cb[i].bias[r][group]);
++            }
++        }
++    };
++    NativeStage current;
++    if(4*begin<last)load_native(current,4*begin);
++#pragma unroll 1
++    for(u64 kb=4*begin;kb<last;++kb) {
++        NativeStage next;
++        if(kb+1<last)load_native(next,kb+1);
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto &raw_a=current.raw_a[i];
++            const auto &ca=current.ca[i];
++            if constexpr (PAIR) {
++                const auto &raw_b=current.raw_b[i];
++                const auto &cb=current.cb[i];
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            }
++        }
++        if(kb+1<last)current=next;
++    }
++        } else {
+     const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
+ #pragma unroll 1
+     for (u64 kb = 4 * begin; kb < last; ++kb) {
+@@ -525,6 +702,48 @@
+             }
+         }
+     }
++        }
++    } else {
++    const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
++#pragma unroll 1
++    for (u64 kb = 4 * begin; kb < last; ++kb) {
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto raw_a = wa.fetch(tile, kb, lane);
++            Coefficients<WA::GROUPS> ca;
++#pragma unroll
++            for (int r = 0; r < 2; ++r)
++#pragma unroll
++                for (int group = 0; group < WA::GROUPS; ++group)
++                    wa.coefficient(tile * 16 + g + 8 * r, kb, group, ca.scale[r][group], ca.bias[r][group]);
++            if constexpr (PAIR) {
++                const auto raw_b = wb.fetch(tile, kb, lane);
++                Coefficients<WB::GROUPS> cb;
++#pragma unroll
++                for (int r = 0; r < 2; ++r)
++#pragma unroll
++                    for (int group = 0; group < WB::GROUPS; ++group)
++                        wb.coefficient(tile * 16 + g + 8 * r, kb, group, cb.scale[r][group], cb.bias[r][group]);
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            }
++        }
++    }
++    }
+ #else
+     // Codes and packed coefficients of one superblock of the group's tiles.
+     struct Stage {
+@@ -656,13 +875,11 @@
+ // Launch shape of a GEMV: WARPS warps per block in groups of KSPLIT; a group
+ // owns TPW tiles for up to 8 * NB activation rows. Threads per block = 32 *
+ // WARPS; tile groups per block = WARPS / KSPLIT.
+-template <int WARPS_, int TPW_, int KSPLIT_, int NB_, bool SPLIT_ROWS_ = false> struct GemvShape {
++template <int WARPS_, int TPW_, int KSPLIT_, int NB_> struct GemvShape {
+     static constexpr int WARPS = WARPS_;
+     static constexpr int TPW = TPW_;
+     static constexpr int KSPLIT = KSPLIT_;
+     static constexpr int NB = NB_;
+-    static constexpr bool SPLIT_ROWS = SPLIT_ROWS_;
+-    static_assert(!SPLIT_ROWS || NB == 1, "split rows use one activation column");
+     static constexpr int GROUPS = WARPS / KSPLIT;
+     static_assert(WARPS % KSPLIT == 0, "KSPLIT divides WARPS");
+     static_assert(GROUPS <= 15, "one named barrier per group");
+@@ -671,9 +888,7 @@
+     __device__ static __forceinline__ u32 group() { return threadIdx.x / 32 / KSPLIT; }
+     __device__ static __forceinline__ u32 part() { return threadIdx.x / 32 % KSPLIT; }
+     // Global tile-group index of this warp.
+-    __device__ static __forceinline__ u64 tile_group() {
+-        return (u64)(SPLIT_ROWS ? blockIdx.y : blockIdx.x) * GROUPS + group();
+-    }
++    __device__ static __forceinline__ u64 tile_group() { return (u64)blockIdx.x * GROUPS + group(); }
+ };
+ 
+ // Shared memory of a GEMV block: the KSPLIT reduction of each tile group.
+@@ -685,24 +900,6 @@
+ template <class Shape> __device__ __forceinline__ u64 gemv_groups(u64 rows) {
+     return ((rows + 15) / 16 + Shape::TPW - 1) / Shape::TPW;
+ }
+-
+-// A split-row block reads and publishes one original logical batch row.
+-// The existing product/reduction arithmetic remains the scalar-column path.
+-template <class Source> struct GemvRowSource {
+-    Source source;
+-    u32 row;
+-    static constexpr int FACTORS = Source::FACTORS;
+-    __device__ __forceinline__ u32 pair(const float *factors, u32 m, u64 k) const {
+-        return source.pair(factors, row + m, k);
+-    }
+-};
+-template <class Epi> struct GemvRowEpilogue {
+-    Epi epi;
+-    u32 row;
+-    __device__ __forceinline__ void operator()(u32 m, u64 n, float first, float second) const {
+-        epi(row + m, n, first, second);
+-    }
+-};
+ 
+ // Run a GEMV warp over one segment: `group` is the segment-local tile group.
+ // `ready()` returns the activation source once the warp's first weight loads
+@@ -710,20 +907,9 @@
+ template <class Shape, class Ready, class WA, class WB, class Epi, class Shared>
+ __device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
+                                                    u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
+-    if constexpr (Shape::SPLIT_ROWS) {
+-        const u32 row = blockIdx.x;
+-        if (row >= M)
+-            return;
+-        const auto row_ready = [&] { return GemvRowSource<decltype(ready())>{ready(), row}; };
+-        const GemvRowEpilogue<Epi> row_epi{epi, row};
+-        gemv_group<Shape::TPW, Shape::KSPLIT, 1>(row_ready, 1u, kblocks, group * Shape::TPW,
+-                                               (rows + 15) / 16, rows, wa, wb, row_epi,
+-                                               shared.reduce[Shape::group()], 1 + Shape::group(), Shape::part());
+-    } else {
+-        gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB>(ready, M, kblocks, group * Shape::TPW,
+-                                                       (rows + 15) / 16, rows, wa, wb, epi,
+-                                                       shared.reduce[Shape::group()], 1 + Shape::group(), Shape::part());
+-    }
++    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB>(ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows,
++                                                     wa, wb, epi, shared.reduce[Shape::group()], 1 + Shape::group(),
++                                                     Shape::part());
+ }
+ 
+ template <class Shape, class Pro, class WA, class WB, class Epi, class Shared>
+--- a/inference/engine/kernels/kernels/cuda/dense_expand.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_expand.cu
+@@ -33,11 +33,11 @@
+                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, 0, 0))
+ 
+ // The GEMV over NB column blocks of 8 rows.
+-template <int NB, int KSPLIT, bool SPLIT_ROWS = false>
++template <int NB, int KSPLIT>
+ __device__ __forceinline__ void expand_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
+                                             unsigned M, unsigned long long H, unsigned long long F,
+                                             const packets::W0 &gate, const packets::W1 &up, const Epi &epi) {
+-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB, SPLIT_ROWS>;
++    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
+     __shared__ projection::GemvShared<Shape, Source::type> shared;
+     const Source::type x = Source::make(pro, row, M, H, staged);
+     const unsigned long long group = Shape::tile_group();
+@@ -111,7 +111,7 @@
+ template <unsigned KSPLIT>
+ __global__ void dense_expand_gemv_rows2(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ uint4 dynamic_shared[];
+-    expand_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 2u,
++    expand_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 2u,
+                    SEISMIC_DIM_H, SEISMIC_DIM_F, GATE, UP, EPILOGUE);
+ }
+ #endif
+@@ -120,7 +120,7 @@
+ template <unsigned KSPLIT>
+ __global__ void dense_expand_gemv_rows4(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ uint4 dynamic_shared[];
+-    expand_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 4u,
++    expand_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 4u,
+                    SEISMIC_DIM_H, SEISMIC_DIM_F, GATE, UP, EPILOGUE);
+ }
+ #endif
+--- a/inference/engine/kernels/kernels/cuda/dense_output.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_output.cu
+@@ -26,10 +26,10 @@
+         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_SCALE), SEISMIC_DIM_DS, 0, 0), 1.0f)
+ 
+ // The GEMV over NB column blocks of 8 rows.
+-template <int NB, int KSPLIT, bool SPLIT_ROWS = false>
++template <int NB, int KSPLIT>
+ __device__ __forceinline__ void output_gemv(const Pro &product, unsigned M, unsigned long long H, unsigned long long F,
+                                             const packets::W0 &down, const Epi &epi) {
+-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB, SPLIT_ROWS>;
++    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
+     __shared__ projection::GemvShared<Shape, Pro> shared;
+     const unsigned long long group = Shape::tile_group();
+     if (group < projection::gemv_groups<Shape>(H))
+@@ -98,14 +98,14 @@
+ #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS2
+ template <unsigned KSPLIT>
+ __global__ void dense_output_gemv_rows2(SEISMIC_KERNEL_PARAMS) {
+-    output_gemv<1, KSPLIT, true>(PRODUCT, 2u, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
++    output_gemv<1, KSPLIT>(PRODUCT, 2u, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV_ROWS4
+ template <unsigned KSPLIT>
+ __global__ void dense_output_gemv_rows4(SEISMIC_KERNEL_PARAMS) {
+-    output_gemv<1, KSPLIT, true>(PRODUCT, 4u, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
++    output_gemv<1, KSPLIT>(PRODUCT, 4u, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
+ }
+ #endif
+ 
+--- a/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
++++ b/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
+@@ -32,12 +32,12 @@
+ 
+ // The segmented GEMV over NB column blocks of 8 rows: segment rows `rows`,
+ // weights `w0..w3`, epilogues `out` (each placing its segment's columns).
+-template <int NB, int KSPLIT, bool SPLIT_ROWS = false>
++template <int NB, int KSPLIT>
+ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
+                                              unsigned M, unsigned long long H, const unsigned long long (&rows)[4],
+                                              const packets::W0 &w0, const packets::W1 &w1, const packets::W2 &w2,
+                                              const packets::W3 &w3, const Out (&out)[4]) {
+-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB, SPLIT_ROWS>;
++    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
+     __shared__ projection::GemvShared<Shape, Source::type> shared;
+     // Every warp runs `x` (block-collective at M = 1), including a group
+     // past the last segment, which has no rows.
+@@ -173,7 +173,7 @@
+     extern __shared__ uint4 dynamic_shared[];
+     const unsigned long long rows[4] = SEGMENT_ROWS;
+     const Out out[4] = SEGMENT_OUT;
+-    project_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 2u,
++    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 2u,
+                     SEISMIC_DIM_H, rows, WEIGHTS, out);
+ }
+ #endif
+@@ -184,7 +184,7 @@
+     extern __shared__ uint4 dynamic_shared[];
+     const unsigned long long rows[4] = SEGMENT_ROWS;
+     const Out out[4] = SEGMENT_OUT;
+-    project_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 4u,
++    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 4u,
+                     SEISMIC_DIM_H, rows, WEIGHTS, out);
+ }
+ #endif
+--- a/inference/engine/kernels/kernels/cuda/attention_project.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_project.cu
+@@ -65,11 +65,11 @@
+ 
+ // The segmented GEMV over NB column blocks of 8 rows: query | gate | key |
+ // value.
+-template <int NB, int KSPLIT, bool SPLIT_ROWS = false>
++template <int NB, int KSPLIT>
+ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
+                                              unsigned M, unsigned long long D, const Segments &s,
+                                              unsigned project_mode) {
+-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB, SPLIT_ROWS>;
++    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
+     __shared__ projection::GemvShared<Shape, Source::type> shared;
+     const unsigned long long kblocks = D / 64;
+     unsigned long long group = Shape::tile_group();
+@@ -79,9 +79,7 @@
+     const int segment = projection::locate_segment(group, groups);
+     if (project_mode != 0 && segment < 2) {
+         seismic_dependency_start();
+-        const unsigned row_start = SPLIT_ROWS ? blockIdx.x : 0;
+-        const unsigned row_count = SPLIT_ROWS ? 1 : M;
+-        project_zero(s.out[segment], M, s.rows[segment], row_start, row_count, group * Shape::TPW * 16,
++        project_zero(s.out[segment], M, s.rows[segment], 0, M, group * Shape::TPW * 16,
+                      Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+         return;
+     }
+@@ -224,7 +222,7 @@
+ template <unsigned KSPLIT>
+ __global__ void attention_project_gemv_rows2(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ uint4 dynamic_shared[];
+-    project_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
++    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
+                             2u, SEISMIC_DIM_D, SEGMENTS,
+                             (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+ }
+@@ -234,7 +232,7 @@
+ template <unsigned KSPLIT>
+ __global__ void attention_project_gemv_rows4(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ uint4 dynamic_shared[];
+-    project_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
++    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
+                             4u, SEISMIC_DIM_D, SEGMENTS,
+                             (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+ }
+--- a/inference/engine/kernels/kernels/cuda/attention_output.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_output.cu
+@@ -26,10 +26,10 @@
+     }
+ 
+ // The GEMV over NB column blocks of 8 rows.
+-template <int NB, int KSPLIT, bool SPLIT_ROWS = false>
++template <int NB, int KSPLIT>
+ __device__ __forceinline__ void output_gemv(const Pro &heads, unsigned M, unsigned long long K, unsigned long long D,
+                                             const packets::W0 &output, const Epi &epi) {
+-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB, SPLIT_ROWS>;
++    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
+     __shared__ projection::GemvShared<Shape, Pro> shared;
+     projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(heads), M, K / 64, Shape::tile_group(),
+                                           D, output, projection::NoWeight{}, epi);
+@@ -102,14 +102,14 @@
+ #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS2
+ template <unsigned KSPLIT>
+ __global__ void attention_output_gemv_rows2(SEISMIC_KERNEL_PARAMS) {
+-    output_gemv<1, KSPLIT, true>(GATED_ROWS, 2u, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
++    output_gemv<1, KSPLIT>(GATED_ROWS, 2u, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
+ }
+ #endif
+ 
+ #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS4
+ template <unsigned KSPLIT>
+ __global__ void attention_output_gemv_rows4(SEISMIC_KERNEL_PARAMS) {
+-    output_gemv<1, KSPLIT, true>(GATED_ROWS, 4u, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
++    output_gemv<1, KSPLIT>(GATED_ROWS, 4u, HEADS, SEISMIC_DIM_D, OUTPUT, EPILOGUE);
+ }
+ #endif
+ 
+--- a/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
+@@ -28,11 +28,11 @@
+                   projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f)
+ 
+ // The GEMV over NB column blocks of 8 rows.
+-template <int NB, int KSPLIT, bool SPLIT_ROWS = false>
++template <int NB, int KSPLIT>
+ __device__ __forceinline__ void head_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged, unsigned O,
+                                           unsigned long long D, unsigned long long V, const packets::W0 &head,
+                                           const Epi &epi) {
+-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB, SPLIT_ROWS>;
++    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
+     __shared__ projection::GemvShared<Shape, Source::type> shared;
+     const Source::type x = Source::make(pro, row, O, D, staged);
+     const unsigned long long group = Shape::tile_group();
+@@ -93,7 +93,7 @@
+ template <unsigned KSPLIT>
+ __global__ void readout_head_rows_gemv_rows2(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ uint4 dynamic_shared[];
+-    head_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 2u,
++    head_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 2u,
+                  SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+ }
+ #endif
+@@ -102,7 +102,7 @@
+ template <unsigned KSPLIT>
+ __global__ void readout_head_rows_gemv_rows4(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ uint4 dynamic_shared[];
+-    head_gemv<1, KSPLIT, true>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 4u,
++    head_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING, 4u,
+                  SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+ }
+ #endif
+--- a/inference/engine/kernels/kernels/cuda_dense.seismic
++++ b/inference/engine/kernels/kernels/cuda_dense.seismic
+@@ -59,11 +59,11 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + 2 * max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 2 * 4096)
+     launch dense_expand_gemv_rows2 when O == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (2, ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_expand_gemv_rows4 when O == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (4, ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # `dense_expand`'s bands with one weight stream.
+@@ -237,9 +237,9 @@
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_output_gemv_rows2 when O == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (2, ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_output_gemv_rows4 when O == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (4, ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1)
+-        threads_per_threadgroup (256, 1, 1)
++        threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
++        threads_per_threadgroup (256, 1, 1)
+--- a/inference/engine/kernels/kernels/attention.seismic
++++ b/inference/engine/kernels/kernels/attention.seismic
+@@ -170,11 +170,11 @@
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_output_gemv_rows2 when M == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (2, ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_output_gemv_rows4 when M == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (4, ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # Vulkan: the K1 projection (see `attention_project`): GEMV to 8 rows,
+@@ -363,11 +363,11 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 4096)
+     launch attention_project_gemv_rows2 when M == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (2, ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_project_gemv_rows4 when M == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (4, ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ native attention_project for vulkan from "vulkan/attention_project.comp":
+--- a/inference/engine/kernels/kernels/recurrent.seismic
++++ b/inference/engine/kernels/kernels/recurrent.seismic
+@@ -159,13 +159,13 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 4096)
+     launch gated_delta_project_gemv_rows2 when M == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (2, ceil_div(ceil_div((2 * NK + NV) * W, 16)
+-            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
++            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch gated_delta_project_gemv_rows4 when M == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (4, ceil_div(ceil_div((2 * NK + NV) * W, 16)
+-            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
++            + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Rows
+--- a/inference/engine/kernels/kernels/readout.seismic
++++ b/inference/engine/kernels/kernels/readout.seismic
+@@ -132,11 +132,11 @@
+         shared_bytes (PIPE * ROW_TILE * 144 + max(max(PIPE * 10240, PIPE * 6144 + 8192), PIPE * 4096 + 8192 * min(PIPE, 2)) + 4096)
+     launch readout_head_rows_gemv_rows2 when O == 2:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (2, ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch readout_head_rows_gemv_rows4 when O == 4:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+-        threadgroups (4, ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1)
++        threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+ 
+ # Vulkan: the K1 projection library (`vulkan/common/projection.glsl`). Output

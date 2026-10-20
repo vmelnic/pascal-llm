@@ -1,0 +1,19 @@
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -148,6 +148,16 @@
+     let peers=source.projection_peers.lock().expect("projection peer registry lock poisoned").iter().map(std::sync::Weak::upgrade).collect::<Option<Vec<_>>>();
+     let Some(peers)=peers.filter(|peers|peers.len()>1) else {return Ok(false);};
+     let Some(spec)=Spec::from(dispatch,ordinal)? else {return Ok(false);};
++    if std::env::var_os("MAGNITUDE_TRACE_PROJECTION_VIEWS").is_some() {
++        static SEEN:std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>=std::sync::OnceLock::new();
++        for view in spec.constants.iter().filter(|view|spec.weight_ports.contains(&view.buffer)) {
++            let (allocation,offset)=buffers[view.buffer];
++            let buffer=typed_buffer::<Cuda,Executor>(allocation);
++            let plan=buffer.row_shard_plan().map(|p|(p.rows,p.canonical_bytes));
++            let line=format!("magnitude-projection-view entry={} launch={} buffer={} extents={:?} bytes={} offset={} plan={:?}",dispatch.kernel.name,dispatch.kernel.implementation.launches[ordinal].kernel,view.buffer,view.extents,view.bytes,offset,plan);
++            if SEEN.get_or_init(Default::default).lock().expect("projection diagnostic lock poisoned").insert(line.clone()) {eprintln!("{line}");}
++        }
++    }
+     // Local aliases belong to the allocation's complete row partition.
+     // A prefix/slice may have different cuts; its original canonical module
+     // remains valid and must not receive partial physical aliases.

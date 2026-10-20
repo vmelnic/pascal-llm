@@ -1,0 +1,25 @@
+--- a/inference/engine/kernels/kernels/cuda/draft_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/draft_rows.cu
+@@ -32,7 +32,6 @@
+ 
+ } // namespace
+ 
+-#ifdef SEISMIC_FORMING_DRAFT_ROWS_JOIN
+ extern "C" __global__ void draft_rows_join(SEISMIC_KERNEL_PARAMS) {
+     using Conditioning = ELEMENT_OF(SEISMIC_CONDITIONING);
+     using EmbeddingNorm = ELEMENT_OF(SEISMIC_EMBEDDING_NORM);
+@@ -102,9 +101,7 @@
+     for (u64 column=threadIdx.x;column<2*D;column+=blockDim.x)
+         staged[row*2*D+column]=joined[column];
+ }
+-#endif
+ 
+-#ifdef SEISMIC_FORMING_DRAFT_ROWS
+ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
+     extern __shared__ float joined[];
+     const u64 D=SEISMIC_DIM_D;
+@@ -159,4 +156,3 @@
+     }
+ }
+ 
+-#endif

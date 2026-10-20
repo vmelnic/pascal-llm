@@ -1,0 +1,15 @@
+diff --git a/inference/seismic/lang/native-library/cuda/slab.cuh b/inference/seismic/lang/native-library/cuda/slab.cuh
+index 97f1f86..7ba6197 100644
+--- a/inference/seismic/lang/native-library/cuda/slab.cuh
++++ b/inference/seismic/lang/native-library/cuda/slab.cuh
+@@ -15,6 +15,10 @@ __device__ __forceinline__ u8 *region(const u32 *table, u64 slab_index) {
+ }
+ 
+ __device__ __forceinline__ u8 *row(const u32 *table, u64 row_index, u64 rows_per_slab, u64 row_bytes) {
++    // A bank larger than the slab budget occupies one slab. Its row offset
++    // is exactly zero; avoid the runtime-wide divide and remainder.
++    if (rows_per_slab == 1)
++        return region(table, row_index);
+     return region(table, row_index / rows_per_slab)
+         + (row_index % rows_per_slab) * row_bytes;
+ }

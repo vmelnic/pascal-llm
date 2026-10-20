@@ -1,0 +1,2586 @@
+--- /dev/null
++++ b/design/inference/engine/multi-device.md
+@@ -0,0 +1,38 @@
++---
++applies_to:
++  - inference/engine/executor/src/planning/placement.rs
++  - inference/engine/state/src/physical.rs
++---
++
++# Physical decoder placement
++
++A load names an ordered set of distinct physical devices. Contiguous decoder
++stages are assigned from the artifact's semantic weight roles and state
++descriptors. Entry, readout and the drafter belong to the first device. Each
++stage must fit its own stable capacity, including its exact resident weights,
++history, banks, graph resources, boundary buffers and overlapping startup
++storage. A partition minimizes the greatest physical occupancy among feasible
++cuts. Shared history constrains cuts: a reader and its source stay together.
++No model-family name participates in placement or execution.
++
++One conversation owns one logical state transaction across all stages. Physical
++history domains are grouped by owner. Recurrent components preserve their
++original indices and common bank IDs while each owner backs its own slabs.
++Growth succeeds on every required owner before logical backing is published;
++a failed growth rolls back unpublished physical allocations. Relocation copies
++all owners before publishing a new bank placement. Cancellation or a failed
++stage publishes no accepted successor and drains already submitted work.
++
++Each native graph and every binding retain their physical device. A boundary
++waits for its producer and transports the exact declared hidden-row bytes into
++receiver-owned storage before submission. The original graph binding checks
++continue to reject foreign-device tensors. Transfers report physical endpoints,
++payload bytes and elapsed time. Weights, history codecs, activation rounding,
++intermediate precision and target verification semantics are unchanged.
++
++Scheduling remains the shared session scheduler: it bounds launch rows and
++in-flight state, preserves per-session isolation and admits growth only when
++all affected physical owners can back it. Adding devices does not create
++independent conversation commits or exclusive per-device sessions. Acceptance
++requires loading the original artifact on the selected devices and real
++concurrent Pi tool loops; planner or transfer fixtures alone are insufficient.
+--- a/design/inference/engine/state-transactions.md
++++ b/design/inference/engine/state-transactions.md
+@@ -15,7 +15,10 @@
+ state when the request can continue.
+ Recurrent state lives in bank slabs; a bank contains one conversation's recurrent-layer state
+ and tape. Banks are claimed and returned through shared ownership exactly as separate allocations
+-would be. A bank's components derive from its layers: convolution windows, gated delta states,
++would be. Their components may have different physical device owners while sharing one
++logical bank numbering and one conversation commit. Every owner's backing is acquired
++before publishing a bank slab; a failed growth rolls back all unpublished acquisitions.
++Relocation copies every owner's components before changing the common bank placement. A bank's components derive from its layers: convolution windows, gated delta states,
+ Mamba-2 state-space states (always F32) and their tapes. A bank publishes its state after an
+ advance's committed rows and records every later row on its tape: the input rows of each
+ convolution window, the gated delta rule's innovations, keys and decays, and the Mamba-2 additive
+@@ -40,7 +43,9 @@
+ - **Block(rate)**: one row per `rate` tokens. It is an interface only, and a store rejects it with
+   a typed error.
+ 
+-A model has one Window domain per distinct window size. Qwen's stores have one Token domain.
++A single-device model has one Window domain per distinct window size and one Token domain.
++Physical placement splits stored domains by owner while preserving their history kinds,
++component identities and one transaction across those domains.
+ 
+ Each accepted history holds, per stored domain, an ordered list of spans; one span is contiguous
+ within one slab of its domain and spans need not ascend in address order. An advance of `n` rows
+--- a/inference/engine/cli/src/main.rs
++++ b/inference/engine/cli/src/main.rs
+@@ -46,6 +46,7 @@
+     lookahead: bool,
+     telemetry_endpoint: String,
+     device: DeviceRequest,
++    peer_devices: Vec<DeviceRequest>,
+     kernel_cache: Option<PathBuf>,
+ }
+ 
+@@ -53,7 +54,7 @@
+ [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
+ [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
+ [--kv-codec dense|dense-f16|affine-k8v4] [--admit-error-class CLASS]... [--lookahead on|off] [--telemetry URL] \
+-[--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
++[--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--peer-device SELECTOR]... [--cache-dir DIR]";
+ 
+ /// `on` or `off`.
+ fn switch(flag: &str, value: &str) -> Result<bool, String> {
+@@ -99,6 +100,7 @@
+     let mut lookahead = defaults.lookahead;
+     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
+     let mut device = DeviceRequest::Automatic;
++    let mut peer_devices=Vec::new();
+     let mut kernel_cache = None;
+     let mut args = std::env::args().skip(1);
+     while let Some(flag) = args.next() {
+@@ -136,6 +138,7 @@
+                     .parse()
+                     .map_err(|error| format!("--device: {error}"))?
+             }
++            "--peer-device" => peer_devices.push(value(&flag,&mut args)?.parse().map_err(|error|format!("--peer-device: {error}"))?),
+             "--cache-dir" => kernel_cache = Some(PathBuf::from(value(&flag, &mut args)?)),
+             "--help" | "-h" => {
+                 println!("{USAGE}");
+@@ -172,6 +175,7 @@
+         lookahead,
+         telemetry_endpoint,
+         device,
++        peer_devices,
+         kernel_cache,
+     })
+ }
+@@ -271,7 +275,7 @@
+         .init();
+     let mut service = standard_service_limits();
+     service.prefill_tokens = options.prefill_tokens;
+-    let resolved = EngineConfiguration {
++    let mut resolved = EngineConfiguration {
+         package: PackageOptions {
+             target: options.target,
+             projector: options.projector,
+@@ -298,6 +302,7 @@
+         "magnitude-engine: host resolution in {:.2} s",
+         load_started.elapsed().as_secs_f64()
+     );
++    resolved.manifest.peer_devices=options.peer_devices;
+     let geometry = &resolved.host.definition().decoder;
+     let (context_tokens, vocabulary) = (geometry.context_limit, geometry.vocabulary);
+     let worker_started = Instant::now();
+--- a/inference/engine/executor/src/domain/family.rs
++++ b/inference/engine/executor/src/domain/family.rs
+@@ -47,6 +47,9 @@
+         Ok(0)
+     }
+ 
++    fn target_weight_bytes_on(&self,_:&seismic::Device) -> Result<u64,&'static str> { Ok(0) }
++    fn prepared_program_bytes_on(&self,_:&seismic::Device) -> Result<u64,&'static str> { Ok(0) }
++    fn target_constant_bytes_on(&self,_:&seismic::Device) -> Result<u64,&'static str> { Ok(0) }
+     fn target_constant_bytes(&self) -> Result<u64, &'static str> {
+         Ok(0)
+     }
+@@ -181,6 +184,9 @@
+         self.resident.storage_bytes()
+     }
+ 
++    fn target_weight_bytes_on(&self,device:&seismic::Device) -> Result<u64,&'static str> { self.resident.storage_bytes_on(device) }
++    fn prepared_program_bytes_on(&self,device:&seismic::Device) -> Result<u64,&'static str> { self.programs.device_storage_bytes_on(device) }
++    fn target_constant_bytes_on(&self,device:&seismic::Device) -> Result<u64,&'static str> { self.target.constant_bytes_on(device) }
+     fn prepared_program_bytes(&self) -> Result<u64, &'static str> {
+         self.programs.device_storage_bytes()
+     }
+--- a/inference/engine/executor/src/domain/heap.rs
++++ b/inference/engine/executor/src/domain/heap.rs
+@@ -68,6 +68,7 @@
+     catalog: DeviceCatalog,
+     reserves: MemoryReserves,
+     device: Rc<Device>,
++    peers: Vec<Rc<Device>>,
+     capacity_bytes: u64,
+     heap: MemoryHeap,
+     /// Host-resident gathered tables' bytes (§3.7 of the model-family plan):
+@@ -98,6 +99,7 @@
+             catalog,
+             reserves,
+             device,
++            peers: Vec::new(),
+             capacity_bytes,
+             heap: MemoryHeap::new(),
+             host_table_bytes: 0,
+@@ -106,6 +108,18 @@
+         Ok(heap)
+     }
+ 
++    pub fn open_placed(catalog:DeviceCatalog,reserves:MemoryReserves,devices:&[Rc<Device>]) -> Result<Self,MemoryPolicyError> {
++        let mut heap=Self::open(catalog,reserves,devices[0].clone())?;
++        let host=heap.catalog.host_memory_status().map_err(MemoryPolicyError::Observation)?;
++        for device in devices.iter().skip(1) {
++            let capacity=crate::platform::fit_capacities(&heap.catalog.topology(),device.info(),&host,&heap.reserves)?
++                .into_iter().find(|(role,_)|*role==DomainRole::Allocation).expect("physical allocation domain").1.capacity_bytes;
++            heap.capacity_bytes=heap.capacity_bytes.checked_add(capacity).expect("physical accounting capacity overflow");
++            heap.peers.push(device.clone());
++        }
++        heap.refresh()?;Ok(heap)
++    }
++    pub fn devices(&self) -> impl Iterator<Item=&Rc<Device>> { std::iter::once(&self.device).chain(self.peers.iter()) }
+     pub fn device(&self) -> &Rc<Device> {
+         &self.device
+     }
+@@ -124,11 +138,13 @@
+     /// ceiling from the readings, and refresh the heap's view from them.
+     /// A failed observation revokes unspent grants and leaves the heap Blind.
+     pub fn refresh(&mut self) -> Result<Vec<DomainReading>, MemoryPolicyError> {
+-        let readings =
+-            crate::platform::refresh_device_ceiling(&self.catalog, &self.device, &self.reserves);
++        let readings=self.devices().try_fold(Vec::new(),|mut all,device| {
++            all.extend(crate::platform::refresh_device_ceiling(&self.catalog,device,&self.reserves)?);
++            Ok::<_,MemoryPolicyError>(all)
++        });
+         let (available_bytes, band) = match &readings {
+             Ok(readings) => (
+-                self.ceiling(readings, DomainRole::Allocation),
++                readings.iter().filter(|reading|reading.role==DomainRole::Allocation).map(|reading|reading.ceiling_bytes).sum::<u64>().saturating_sub(if self.peers.is_empty() && Self::host_role(readings)==DomainRole::Allocation { self.host_table_bytes } else { 0 }),
+                 MemoryBand::from(crate::platform::band_of(readings)),
+             ),
+             Err(_) => (0, MemoryBand::Blind),
+@@ -137,7 +153,7 @@
+             .observe(MemoryObservation {
+                 capacity_bytes: self.capacity_bytes,
+                 available_bytes,
+-                charged_bytes: self.device.memory_usage().charged,
++                charged_bytes: self.devices().map(|device|device.memory_usage().charged).sum(),
+                 band,
+             })
+             .expect("a Seismic reading of the allocation domain is a valid observation");
+@@ -150,7 +166,19 @@
+     /// claims. The readings exclude existing charges, so only the added peak
+     /// is compared.
+     pub fn check(&mut self, required: u64, staged: u64) -> Result<(), ClaimRefusal> {
+-        let readings = self.refresh().map_err(ClaimRefusal::Blind)?;
++        let costs=vec![required;self.peers.len()+1];
++        self.check_placed_inner(&costs,required,staged)
++    }
++    fn check_placed_inner(&mut self,costs:&[u64],required:u64,staged:u64) -> Result<(),ClaimRefusal> {
++        assert_eq!(costs.len(),self.peers.len()+1,"physical claim owner count");
++        let readings=self.refresh().map_err(ClaimRefusal::Blind)?;
++        let outstanding=self.heap.claims().map(|claim|claim.bytes).sum::<u64>();
++        for (reading,&cost) in readings.iter().filter(|reading|reading.role==DomainRole::Allocation).zip(costs) {
++            if reading.band==ReadingBand::Reclaim { return Err(ClaimRefusal::Reclaim { role:reading.role }); }
++            let available=reading.ceiling_bytes.saturating_sub(outstanding).saturating_sub(
++                if Self::host_role(&readings)==DomainRole::Allocation { self.host_table_bytes } else { 0 });
++            if cost>available { return Err(ClaimRefusal::Deficit { role:reading.role,constraint:reading.constraint,required:cost,available }); }
++        }
+         let allocation = readings
+             .iter()
+             .find(|reading| reading.role == DomainRole::Allocation)
+@@ -297,6 +325,15 @@
+             .map_err(ClaimRefusal::Accounting)
+     }
+ 
++    /// Exact per-owner peak checked atomically before a logical accounting claim.
++    /// The counter sums charges; every physical allocation domain grants independently.
++    pub fn claim_placed(&mut self,costs:&[u64],staged:u64,class:HoldingClass) -> Result<ClaimId,ClaimRefusal> {
++        let required=costs.iter().try_fold(0u64,|sum,&bytes|sum.checked_add(bytes))
++            .ok_or(ClaimRefusal::Accounting(MemoryError::HoldingOverflow))?;
++        self.check_placed_inner(costs,required,staged)?;
++        self.heap.claim(MemoryNeed { minimum_bytes:required,preferred_bytes:required,class })
++            .map(|claim|claim.id).map_err(ClaimRefusal::Accounting)
++    }
+     pub fn release(&mut self, claim: ClaimId) {
+         self.heap
+             .cancel_claim(claim)
+--- a/inference/engine/executor/src/domain/state.rs
++++ b/inference/engine/executor/src/domain/state.rs
+@@ -8,8 +8,14 @@
+ 
+ /// A comparison with Seismic's live charge. `unattributed` remains explicit
+ /// for any storage whose owner has not yet been classified.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone,Debug,PartialEq,Eq)]
++pub struct PhysicalCharge {
++    pub device: seismic::DeviceSelector,
++    pub charged:u64,pub model:u64,pub context:u64,pub compute:u64,pub auxiliary:u64,
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct MemoryChargeReconciliation {
++    pub physical:Vec<PhysicalCharge>,
+     pub charged: u64,
+     pub target_state: StateHoldingCensus,
+     pub head_state: Option<StateHoldingCensus>,
+@@ -55,7 +61,7 @@
+         }
+         self.orphan_lookahead(bindings)
+             .map_err(|error| error.to_string())?;
+-        let before = self.domain.device().memory_usage().charged;
++        let before = self.memory.borrow().devices().map(|device|device.memory_usage().charged).sum::<u64>();
+         self.family.unbind_optional();
+         if let Some(loader) = &self.head_loader {
+             loader.unload();
+@@ -64,7 +70,7 @@
+             loader.unload();
+         }
+         self.sync_optional_holding()?;
+-        let after = self.domain.device().memory_usage().charged;
++        let after = self.memory.borrow().devices().map(|device|device.memory_usage().charged).sum::<u64>();
+         before
+             .checked_sub(after)
+             .ok_or_else(|| "optional component release increased Seismic's charge".to_owned())
+@@ -128,11 +134,28 @@
+             .and_then(|bytes| bytes.checked_add(bound_constants))
+             .and_then(|bytes| bytes.checked_add(external_pins))
+             .ok_or("classified charge sum overflows")?;
+-        let charged = self.domain.device().memory_usage().charged;
++        let charged = self.memory.borrow().devices().map(|device|device.memory_usage().charged).sum::<u64>();
+         let unattributed = charged
+             .checked_sub(classified)
+             .ok_or("classified holdings exceed Seismic's charge")?;
++        let target_backing=self.target_store.backing_by_owner();
++        let head_backing=self.head_store.as_ref().map(|store|store.backing_by_owner());
++        let physical=if self.memory.borrow().devices().count()>1 {
++            self.memory.borrow().devices().enumerate().map(|(index,device)| {
++                let (mut state,mut seed)=target_backing[index];
++                if let Some(head)=&head_backing { state+=head[index].0;seed+=head[index].1; }
++                let model=self.family.target_weight_bytes_on(device)?+self.family.target_constant_bytes_on(device)?+seed;
++                let context=state.checked_sub(seed).ok_or("physical state seed exceeds backing")?;
++                let auxiliary=if index==0 { optional_weights+self.family.optional_constant_bytes()? } else { 0 };
++                let actual=device.memory_usage().charged;
++                let compute=actual.checked_sub(model+context+auxiliary).ok_or("physical classified storage exceeds charge")?;
++                let fixed_compute=self.resources.committed_bytes_on(index,device.info().selector)+self.family.prepared_program_bytes_on(device)?;
++                if compute<fixed_compute { return Err("physical compute classification exceeds charged remainder".to_string()); }
++                Ok(PhysicalCharge { device:device.info().selector,charged:actual,model,context,compute,auxiliary })
++            }).collect::<Result<Vec<_>,String>>()?
++        } else { Vec::new() };
+         Ok(MemoryChargeReconciliation {
++            physical,
+             charged,
+             target_state,
+             head_state,
+@@ -638,13 +661,13 @@
+     /// counts that no request or launch holds, crediting only Seismic's
+     /// measured decrease.
+     fn release_idle_graph_slots(&mut self) -> Result<u64, DomainError> {
+-        let before = self.domain.device().memory_usage().charged;
++        let before = self.memory.borrow().devices().map(|device|device.memory_usage().charged).sum::<u64>();
+         if self.resources.release_idle_slots() == 0 {
+             return Ok(0);
+         }
+         self.sync_static_holding().map_err(DomainError::Input)?;
+         before
+-            .checked_sub(self.domain.device().memory_usage().charged)
++            .checked_sub(self.memory.borrow().devices().map(|device|device.memory_usage().charged).sum::<u64>())
+             .ok_or_else(|| DomainError::invariant("graph slot release increased Seismic's charge"))
+     }
+ 
+--- a/inference/engine/executor/src/lib.rs
++++ b/inference/engine/executor/src/lib.rs
+@@ -94,7 +94,7 @@
+     ProgramPlan, ReadoutBinding, ReadoutHead, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
+     ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SelectorBinding,
+     StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan,
+-    TensorOperations,
++    TensorOperations, LayerPlacement, PhysicalStage, PhysicalStageBudget, PhysicalStageCharge,
+     SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
+     VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
+ };
+--- a/inference/engine/executor/src/native/attestation.rs
++++ b/inference/engine/executor/src/native/attestation.rs
+@@ -44,6 +44,7 @@
+ }
+ 
+ pub struct AttestedPrograms {
++    peers: Vec<Rc<AttestedPrograms>>,
+     backend: BackendName,
+     tuned: Vec<TunedEntry>,
+     pub(super) owner: Tensor,
+@@ -412,6 +413,16 @@
+             )
+             .map_err(|error| error.to_string())?,
+         ));
++        if !self.peers.is_empty() {
++            let classes = crate::programs::native_state::state_copy_classes(target_state,head_state,&row_classes)?;
++            let mut graphs = Vec::new();
++            for peer in &self.peers {
++                graphs.push(crate::programs::native_state::PreparedStateCopyGraphs::prepare(
++                    &peer.owner.device(),&peer.state,classes.clone()).map_err(|error|error.to_string())?);
++            }
++            let root = self.state_graphs.as_mut().ok_or("state graph root is absent")?;
++            Rc::get_mut(root).ok_or("state graphs already published")?.install_peers(graphs);
++        }
+         Ok(())
+     }
+ 
+@@ -432,6 +443,27 @@
+         self.state_graphs.as_ref()
+     }
+ 
++    pub fn install_layer_placement(&mut self, placement: &crate::LayerPlacement, peers: Vec<Rc<AttestedPrograms>>) -> Result<(),String> {
++        if placement.stages().len()!=peers.len()+1 { return Err("physical programs differ from the stage count".into()); }
++        for (index,block) in self.target.blocks.iter_mut().enumerate() {
++            let owner = placement.block_owner(index).ok_or("target block has no physical owner")?;
++            if owner!=0 {
++                let peer = &peers[owner-1];
++                if peer.backend!=self.backend { return Err("physical program backend differs".into()); }
++                *block = peer.target.blocks.get(index).ok_or("physical program has no assigned block")?.clone();
++            }
++        }
++        self.peers = peers;
++        Ok(())
++    }
++    pub fn peers(&self) -> &[Rc<AttestedPrograms>] { &self.peers }
++    pub fn prepare_target_graphs_placed(&self, devices: &[Device], placement: &crate::LayerPlacement,
++        load: &crate::ModelLoadPlan, geometry: &magnitude_family_contracts::Decoder,
++        state: &crate::StateResourcePlan, plan: &crate::TargetProgramPlan, limits: crate::ResourceLimits)
++        -> Result<crate::PreparedTargetGraphs,String> {
++        let owners = (0..geometry.blocks.len()).map(|index|placement.block_owner(index).ok_or("target owner is absent")).collect::<Result<Vec<_>,_>>()?;
++        crate::programs::native_target_graph::PreparedTargetGraphs::prepare_placed(devices,&owners,&self.target,load,geometry,state,plan,limits)
++    }
+     pub fn install_target_graphs(&mut self, graphs: crate::PreparedTargetGraphs) {
+         self.target_graphs = Some(graphs);
+     }
+@@ -1237,6 +1269,7 @@
+             });
+         }
+         let attested = Self {
++            peers: Vec::new(),
+             backend: device.backend(),
+             tuned,
+             owner: prepared.owner.clone(),
+@@ -1772,12 +1805,18 @@
+         self.invocation_workspace_bytes
+     }
+     pub(crate) fn device_storage_bytes(&self) -> Result<u64, &'static str> {
+-        let mut seen = HashSet::new();
+-        let mut bytes = self.owner.storage_bytes();
++        let mut seen=HashSet::new();
++        self.device_storage_bytes_seen(&mut seen,None)
++    }
++    pub(crate) fn device_storage_bytes_on(&self,device:&seismic::Device) -> Result<u64,&'static str> {
++        self.device_storage_bytes_seen(&mut HashSet::new(),Some(device))
++    }
++    fn device_storage_bytes_seen(&self,seen:&mut HashSet<usize>,filter:Option<&seismic::Device>) -> Result<u64,&'static str> {
++        let mut bytes=if filter.is_none_or(|device|self.owner.belongs_to(device)) { self.owner.storage_bytes() } else { 0 };
+         macro_rules! charge {
+             ($handle:expr) => {{
+                 let handle = $handle;
+-                if seen.insert(handle.prepared_storage_identity()) {
++                if filter.is_none_or(|device|handle.device().info().selector==device.info().selector) && seen.insert(handle.prepared_storage_identity()) {
+                     bytes = bytes
+                         .checked_add(handle.invocation_workspace_bytes())
+                         .ok_or("prepared program charge overflows")?;
+@@ -2074,6 +2113,7 @@
+                 AttestedImport::Repack(handle) => charge!(handle),
+             }
+         }
++        for peer in &self.peers { bytes=bytes.checked_add(peer.device_storage_bytes_seen(seen,filter)?).ok_or("physical prepared storage overflows")?; }
+         Ok(bytes)
+     }
+     pub fn qualification(&self) -> &QualificationReport {
+--- a/inference/engine/executor/src/planning/mod.rs
++++ b/inference/engine/executor/src/planning/mod.rs
+@@ -8,6 +8,7 @@
+ mod components;
+ mod execution_plan;
+ mod programs;
++mod placement;
+ mod resources;
+ mod weights;
+ 
+@@ -20,6 +21,7 @@
+ pub use execution_plan::{
+     BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
+ };
++pub use placement::{LayerPlacement, PhysicalStage, PhysicalStageBudget, PhysicalStageCharge};
+ pub use programs::{
+     Dflash2Binding, DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
+     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, SelectorBinding,
+--- /dev/null
++++ b/inference/engine/executor/src/planning/placement.rs
+@@ -0,0 +1,182 @@
++//! Physical layer placement. Each stage has its own capacity and byte terms;
++//! this plan never turns separate allocation pools into one memory domain.
++use super::{ModelLoadPlan, PlannedMethod, WeightStorageIdentity};
++use magnitude_family_contracts::{ModelDefinition, WeightScope};
++use magnitude_state::{KvCodec, LayerRef, ModelStateLayout};
++use seismic::DeviceSelector;
++use std::collections::HashSet;
++use std::ops::Range;
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PhysicalStageBudget {
++    pub device: DeviceSelector,
++    pub capacity_bytes: u64,
++    /// Independently derived bound for graph activations, intermediates,
++    /// boundary buffers and concurrently live startup storage on this device.
++    pub reserved_bytes: u64,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct PhysicalStageCharge {
++    pub weights: u64,
++    pub history: u64,
++    pub recurrent: u64,
++}
++impl PhysicalStageCharge {
++    fn add(self, other: Self) -> Result<Self, String> {
++        let add = |a: u64, b: u64| a.checked_add(b).ok_or("physical stage byte count overflows");
++        Ok(Self { weights: add(self.weights, other.weights)?,
++                  history: add(self.history, other.history)?,
++                  recurrent: add(self.recurrent, other.recurrent)? })
++    }
++    pub fn total(self) -> Result<u64, String> {
++        self.weights.checked_add(self.history).and_then(|n| n.checked_add(self.recurrent))
++            .ok_or_else(|| "physical stage byte count overflows".into())
++    }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PhysicalStage {
++    pub budget: PhysicalStageBudget,
++    pub blocks: Range<usize>,
++    pub charge: PhysicalStageCharge,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct LayerPlacement {
++    stages: Vec<PhysicalStage>,
++    owners: Vec<usize>,
++    recurrent_owners: Vec<usize>,
++}
++
++fn block_index(scope: WeightScope) -> Option<usize> {
++    match scope {
++        WeightScope::TargetSublayer(index) | WeightScope::TargetBranch { sublayer: index, .. } =>
++            Some(index.block as usize),
++        _ => None,
++    }
++}
++
++impl LayerPlacement {
++    /// Search nonempty contiguous stages, keeping entry/readout/drafter on
++    /// stage zero. The exact importer roles and state descriptors are the
++    /// authority; model names and GGUF filename patterns are not inspected.
++    pub fn derive(
++        definition: &ModelDefinition, load: &ModelLoadPlan, method: PlannedMethod,
++        codec: KvCodec, budgets: &[PhysicalStageBudget], banks: usize,
++    ) -> Result<Self, String> {
++        let n = definition.decoder.blocks.len();
++        if budgets.is_empty() || budgets.len() > n || banks == 0 {
++            return Err("placement needs nonempty stages and a positive physical bank bound".into());
++        }
++        let mut selectors = HashSet::new();
++        for budget in budgets {
++            if !selectors.insert(budget.device) || budget.reserved_bytes >= budget.capacity_bytes {
++                return Err("placement has a repeated device or no independently available capacity".into());
++            }
++        }
++        let mut blocks = vec![PhysicalStageCharge::default(); n];
++        let mut root = PhysicalStageCharge::default();
++        // Deduplicate identical resident storage inside a block/root. Storage
++        // tied across different owners is copied and charged on every owner.
++        let mut seen: HashSet<(Option<usize>, WeightStorageIdentity)> = HashSet::new();
++        for weight in load.weights() {
++            let owner = block_index(weight.role.scope);
++            if !seen.insert((owner, weight.storage_identity())) { continue; }
++            let bytes = weight.storage_bytes()?;
++            let charge = match owner {
++                Some(index) => blocks.get_mut(index).ok_or("weight names a missing decoder block")?,
++                None => &mut root,
++            };
++            charge.weights = charge.weights.checked_add(bytes).ok_or("resident byte count overflows")?;
++        }
++        let drafter = if load.head().is_some() { crate::operators::draft::drafter_blocks(definition) }
++                      else { Vec::new() };
++        let layout = ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
++        let context = usize::try_from(definition.decoder.context_limit).map_err(|_| "context exceeds host address range")?;
++        for domain in layout.target_history.iter().chain(&layout.head_history) {
++            let rows = domain.kind().checkpoint_rows(context).map_err(|error| error.to_string())?;
++            for component in domain.components() {
++                let bytes = (component.row_bytes().map_err(|error| error.to_string())? as u64)
++                    .checked_mul(rows as u64).ok_or("history byte count overflows")?;
++                let charge = match component.layer {
++                    LayerRef::Target(index) => &mut blocks[index as usize],
++                    LayerRef::Head(_) => &mut root,
++                };
++                charge.history = charge.history.checked_add(bytes).ok_or("history byte count overflows")?;
++            }
++        }
++        let mut allowed_cuts = vec![true; n+1];
++        for domain in &layout.target_history {
++            if let magnitude_state::HistoryDomainLayout::Shared { source: LayerRef::Target(source), layers } = domain {
++                for layer in layers {
++                    if let LayerRef::Target(reader) = *layer {
++                        let low = (*source).min(reader) as usize;
++                        let high = (*source).max(reader) as usize;
++                        for cut in low+1..=high { allowed_cuts[cut] = false; }
++                    }
++                }
++            }
++        }
++        let mut recurrent_blocks = Vec::with_capacity(layout.target_recurrent.len());
++        let mut component = 0;
++        for (index, block) in definition.decoder.blocks.iter().enumerate() {
++            let paired = crate::operators::paired_block(block).map_err(|error| error.to_string())?;
++            let count = paired.mixer.bank_components();
++            for spec in layout.target_recurrent.get(component..component+count)
++                .ok_or("recurrent component topology differs from the decoder")? {
++                let bytes = (spec.bytes()? as u64).checked_mul(banks as u64).ok_or("bank byte count overflows")?;
++                blocks[index].recurrent = blocks[index].recurrent.checked_add(bytes).ok_or("bank byte count overflows")?;
++                recurrent_blocks.push(index);
++            }
++            component += count;
++        }
++        if component != layout.target_recurrent.len() { return Err("unassigned recurrent state component".into()); }
++        // DP minimizes the greatest occupancy of any physical device. It
++        // never grants a capacity deficit on one card using another's bytes.
++        let mut costs = vec![vec![f64::INFINITY; n+1]; budgets.len()+1];
++        let mut previous = vec![vec![None; n+1]; budgets.len()+1];
++        costs[0][0] = 0.0;
++        for stage in 0..budgets.len() {
++            for start in stage..n {
++                if !costs[stage][start].is_finite() { continue; }
++                let mut charge = if stage == 0 { root } else { PhysicalStageCharge::default() };
++                for end in start+1..=n {
++                    charge = charge.add(blocks[end-1])?;
++                    let total = charge.total()?.checked_add(budgets[stage].reserved_bytes)
++                        .ok_or("physical peak byte count overflows")?;
++                    if total > budgets[stage].capacity_bytes { break; }
++                    if !allowed_cuts[end] { continue; }
++                    let cost = costs[stage][start].max(total as f64 / budgets[stage].capacity_bytes as f64);
++                    if cost < costs[stage+1][end] {
++                        costs[stage+1][end] = cost;
++                        previous[stage+1][end] = Some(start);
++                    }
++                }
++            }
++        }
++        if !costs[budgets.len()][n].is_finite() { return Err("no contiguous placement fits every selected physical device".into()); }
++        let mut ranges = vec![0..0; budgets.len()];
++        let mut end = n;
++        for stage in (0..budgets.len()).rev() {
++            let start = previous[stage+1][end].ok_or("placement reconstruction has no predecessor")?;
++            ranges[stage] = start..end;
++            end = start;
++        }
++        let mut owners = vec![0; n];
++        let mut stages = Vec::with_capacity(budgets.len());
++        for (stage, range) in ranges.into_iter().enumerate() {
++            let mut charge = if stage == 0 { root } else { PhysicalStageCharge::default() };
++            for index in range.clone() { charge = charge.add(blocks[index])?; owners[index] = stage; }
++            stages.push(PhysicalStage { budget: budgets[stage].clone(), blocks: range, charge });
++        }
++        let recurrent_owners = recurrent_blocks.into_iter().map(|index| owners[index]).collect();
++        Ok(Self { stages, owners, recurrent_owners })
++    }
++    pub fn stages(&self) -> &[PhysicalStage] { &self.stages }
++    pub fn block_owner(&self, block: usize) -> Option<usize> { self.owners.get(block).copied() }
++    pub fn layer_owner(&self, layer: LayerRef) -> Option<usize> {
++        match layer { LayerRef::Target(index) => self.block_owner(index as usize), LayerRef::Head(_) => Some(0) }
++    }
++    pub fn recurrent_owners(&self) -> &[usize] { &self.recurrent_owners }
++}
+--- a/inference/engine/executor/src/planning/resources.rs
++++ b/inference/engine/executor/src/planning/resources.rs
+@@ -165,6 +165,7 @@
+ /// which the plan charges once at the largest family's workspace.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct NativeGraphCharge {
++    pub boundary_bytes: u64,
+     pub workspace_bytes: u64,
+     pub output_bytes: u64,
+     pub upload_bytes: u64,
+@@ -213,6 +214,12 @@
+         )
+     }
+ 
++    pub(crate) fn with_boundary(mut self,bytes:u64) -> Result<Self,String> {
++        self.boundary_bytes=bytes;
++        self.committed_bytes=self.committed_bytes.checked_add(bytes.checked_mul(self.activations as u64).ok_or("physical boundary charge overflows")?)
++            .ok_or("physical activation charge overflows")?;
++        Ok(self)
++    }
+     fn from_prepared(graphs: &PreparedTargetGraphs, slots: GraphSlots) -> Result<Self, String> {
+         Self::from_footprint(
+             FamilyFootprint {
+@@ -245,6 +252,7 @@
+             })
+             .ok_or("graph charge overflows")?;
+         Ok(Self {
++            boundary_bytes: 0,
+             workspace_bytes: footprint.workspace_bytes,
+             output_bytes: footprint.output_bytes,
+             upload_bytes: footprint.upload_bytes,
+@@ -288,6 +296,9 @@
+     pub history: Vec<HistoryDomainPlan>,
+     pub domains: Vec<HistoryStorePlan>,
+     pub recurrent_components: Vec<ComponentSpec>,
++    pub history_owners: Vec<usize>,
++    pub component_owners: Vec<usize>,
++    pub physical_devices: Vec<seismic::DeviceSelector>,
+     pub bank_capacity: BankCapacity,
+     pub recurrent_bank_bytes: u64,
+     pub zero_seed_bytes: u64,
+@@ -428,32 +439,49 @@
+             .map_err(|_| "bank slab count exceeds u32".into())
+     }
+ 
+-    pub fn bank_slab_layout(&self) -> Result<Option<SlabLayout>, String> {
+-        if self.recurrent_components.is_empty() {
+-            return Ok(None);
+-        }
+-        let regions = self
+-            .recurrent_components
+-            .iter()
+-            .map(|component| SlabRegion {
++    pub fn bank_slab_layouts(&self) -> Result<Vec<(usize, SlabLayout)>, String> {
++        if self.recurrent_components.is_empty() { return Ok(Vec::new()); }
++        let mut regions = std::collections::BTreeMap::<usize,Vec<SlabRegion>>::new();
++        if self.component_owners.len() != self.recurrent_components.len() { return Err("bank owners differ from component topology".into()); }
++        for (&owner, component) in self.component_owners.iter().zip(&self.recurrent_components) {
++            regions.entry(owner).or_default().push(SlabRegion {
+                 element: slab_element(component.dtype),
+                 row_shape: component.shape.iter().map(|&size| size as u64).collect(),
+-            })
+-            .collect::<Vec<_>>();
+-        let logical_banks = self
+-            .bank_capacity
+-            .storage_total()
+-            .map_err(|error| error.to_string())?;
+-        SlabLayout::for_regions(
+-            u64::from(self.bank_slab_banks()?),
+-            logical_banks as u64,
+-            &regions,
+-        )
+-        .map(Some)
+-        .map_err(|error| error.to_string())
++            });
++        }
++        let banks = self.bank_capacity.storage_total().map_err(|error| error.to_string())? as u64;
++        regions.into_iter().map(|(owner,regions)| {
++            let layout = SlabLayout::for_regions(u64::from(self.bank_slab_banks()?),banks,&regions).map_err(|error| error.to_string())?;
++            Ok((owner,layout))
++        }).collect()
++    }
++    /// Reporting total only: allocations remain in the listed physical layouts.
++    pub fn bank_slab_layout(&self) -> Result<Option<SlabLayout>, String> {
++        let layouts = self.bank_slab_layouts()?;
++        if layouts.is_empty() { return Ok(None); }
++        let mut total = SlabLayout { slab_bytes: 0, address_table_bytes: 0 };
++        for (_,layout) in layouts {
++            total.slab_bytes = total.slab_bytes.checked_add(layout.slab_bytes).ok_or("physical bank bytes overflow")?;
++            total.address_table_bytes = total.address_table_bytes.checked_add(layout.address_table_bytes).ok_or("physical bank table bytes overflow")?;
++        }
++        Ok(Some(total))
+     }
+ 
+     /// Every stored domain's address table and first slab.
++    pub fn startup_bytes_by_owner(&self, owners: usize) -> Result<Vec<u64>, String> {
++        let mut bytes = vec![0u64; owners];
++        for (domain,&owner) in self.domains.iter().zip(&self.history_owners) {
++            let layout = domain.slab_layout()?;
++            let n = layout.address_table_bytes.checked_add(layout.slab_bytes).ok_or("physical history peak overflows")?;
++            let total = bytes.get_mut(owner).ok_or("physical history owner is absent")?;
++            *total = total.checked_add(n).ok_or("physical state peak overflows")?;
++        }
++        for (owner,layout) in self.bank_slab_layouts()? {
++            let total = bytes.get_mut(owner).ok_or("physical recurrent owner is absent")?;
++            *total = total.checked_add(layout.slab_bytes).and_then(|n|n.checked_add(layout.address_table_bytes)).ok_or("physical state peak overflows")?;
++        }
++        Ok(bytes)
++    }
+     pub fn startup_history_bytes(&self) -> Result<u64, String> {
+         self.domains.iter().try_fold(0u64, |total, domain| {
+             let layout = domain.slab_layout()?;
+@@ -528,11 +556,20 @@
+ 
+     /// The planned store and its one binding right.
+     pub fn allocate(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
+-        let (store, bindings) = StateStore::new(
+-            device,
++        self.allocate_on_devices(vec![device])
++    }
++
++    pub fn allocate_on_devices(&self, devices: Vec<Rc<Device>>) -> Result<StoreBindings, String> {
++        if !self.physical_devices.is_empty() && self.physical_devices != devices.iter().map(|device| device.info().selector).collect::<Vec<_>>() {
++            return Err("state physical devices differ from the admitted placement".into());
++        }
++        let (store, bindings) = StateStore::new_placed(
++            devices,
+             self.context_rows,
+             self.max_advance,
+             self.history.clone(),
++            self.history_owners.clone(),
++            self.component_owners.clone(),
+             self.recurrent_components.clone(),
+             self.bank_capacity,
+         )
+@@ -580,6 +617,7 @@
+ /// relevant projection of this value rather than recomputing capacity.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct ResourcePlan {
++    physical: Option<super::LayerPlacement>,
+     pub(super) domain_capacity_bytes: u64,
+     capacity: StateCapacityPlan,
+     target_state: StateStorePlan,
+@@ -587,6 +625,8 @@
+     retained_entry_bytes: u64,
+     bytes: ResourceBytes,
+     pub(super) qualification_peak_bytes: u64,
++    target_peer_graphs: Vec<NativeGraphCharge>,
++    state_peer_graphs: Vec<NativeGraphCharge>,
+     target_graph: NativeGraphCharge,
+     target_readout_graph: NativeGraphCharge,
+     head_graph: Option<NativeGraphCharge>,
+@@ -634,12 +674,24 @@
+     }
+ 
+     /// The device's one workspace arena, which every family binds.
++    pub fn physical(&self) -> Option<&super::LayerPlacement> { self.physical.as_ref() }
++    pub fn target_peer_graphs(&self) -> &[NativeGraphCharge] { &self.target_peer_graphs }
++    pub fn state_peer_graphs(&self) -> &[NativeGraphCharge] { &self.state_peer_graphs }
++    pub fn peer_arena_bytes(&self,index:usize) -> u64 {
++        self.target_peer_graphs[index].workspace_bytes.max(self.state_peer_graphs[index].workspace_bytes)
++    }
++    pub fn scratch_by_owner(&self) -> Vec<u64> {
++        let mut bytes=vec![graph_scratch_bytes(&self.graph_charges()).expect("validated graph charge")];
++        bytes.extend(self.target_peer_graphs.iter().zip(&self.state_peer_graphs).enumerate()
++            .map(|(index,(target,state))|self.peer_arena_bytes(index)+target.committed_bytes+state.committed_bytes));
++        bytes
++    }
+     pub fn arena_bytes(&self) -> u64 {
+         arena_bytes(&self.graph_charges())
+     }
+ 
+     pub(super) fn validate(mut self) -> Result<Self, String> {
+-        if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges())? {
++        if self.bytes.scratch != self.scratch_by_owner().iter().sum::<u64>() {
+             return Err(
+                 "resource plan pooled byte charge differs from admitted Seismic footprints".into(),
+             );
+@@ -702,6 +754,7 @@
+ /// stage topology and reports the exact storage footprint.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct StateResourcePlan {
++    physical: Option<super::LayerPlacement>,
+     definition: ModelDefinition,
+     load: ModelLoadPlan,
+     codec: KvCodec,
+@@ -782,6 +835,26 @@
+         limits: ResourceLimits,
+         capacity_bytes: ResourceCapacity,
+     ) -> Result<StateResourcePlan, String> {
++        Self::state_plan_inner(definition,load,method,codec,limits,capacity_bytes,None)
++    }
++
++    pub fn state_plan_placed(
++        definition: &ModelDefinition, load: &ModelLoadPlan, method: PlannedMethod,
++        codec: KvCodec, limits: ResourceLimits, placement: &super::LayerPlacement,
++        tensor_operations: TensorOperations,
++    ) -> Result<StateResourcePlan, String> {
++        // This counter bounds logical addresses and accounting only. Every
++        // allocation and populated-context fit is independently placed.
++        let accounting_bytes = placement.stages().iter().try_fold(0u64,|n,stage|
++            n.checked_add(stage.budget.capacity_bytes).ok_or("physical capacity accounting overflows"))?;
++        Self::state_plan_inner(definition,load,method,codec,limits,
++            ResourceCapacity { domain_bytes: accounting_bytes,tensor_operations },Some(placement))
++    }
++    fn state_plan_inner(
++        definition: &ModelDefinition, load: &ModelLoadPlan, method: PlannedMethod,
++        codec: KvCodec, limits: ResourceLimits, capacity_bytes: ResourceCapacity,
++        physical: Option<&super::LayerPlacement>,
++    ) -> Result<StateResourcePlan, String> {
+         if limits.max_launch_slots == 0
+             || limits.max_launch_slots > limits.max_launch_rows
+             || limits.max_launch_rows == 0
+@@ -805,8 +878,12 @@
+         } else {
+             Vec::new()
+         };
+-        let layout =
++        let mut layout =
+             ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
++        if let Some(placement) = physical {
++            layout.target_history = split_physical_history(layout.target_history,placement)?;
++            layout.head_history = split_physical_history(layout.head_history,placement)?;
++        }
+         let history_domains = || layout.target_history.iter().chain(&layout.head_history);
+         let checkpoint_history_row_bytes = history_row_bytes(&layout.target_history)?
+             .checked_add(history_row_bytes(&layout.head_history)?)
+@@ -906,15 +983,19 @@
+             token: capacity.history_rows,
+             domain_bytes: capacity_bytes.domain_bytes,
+         };
+-        let target_state = state_store_plan(
++        let mut target_state = state_store_plan(
+             rows,
+             layout.target_history,
+             layout.target_recurrent,
+             bank_capacity,
+         )?;
+-        let head_state = (!layout.head_history.is_empty())
++        let mut head_state = (!layout.head_history.is_empty())
+             .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity))
+             .transpose()?;
++        if let Some(placement) = physical {
++            install_state_owners(&mut target_state,placement,true)?;
++            if let Some(head) = &mut head_state { install_state_owners(head,placement,false)?; }
++        }
+         let planned_recurrent = target_state
+             .recurrent_pool_bytes
+             .checked_add(
+@@ -949,6 +1030,7 @@
+             )
+             .ok_or("startup bank slab charge overflows")?;
+         Ok(StateResourcePlan {
++            physical: physical.cloned(),
+             definition: definition.clone(),
+             load: load.clone(),
+             codec,
+@@ -988,7 +1070,16 @@
+         let source_import_peak = source_import_peak_bytes(source_import_peak)?;
+         let qualification_peak_bytes = qualification_peak.max(source_import_peak);
+         let slots = limits.startup_slots();
+-        let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
++        let boundary_bytes=target_graphs.boundary_input().map(|(element,shape)|element.canonical_byte_len(&shape))
++            .transpose().map_err(|error|error.to_string())?.unwrap_or(0);
++        let target_graph=NativeGraphCharge::from_prepared(target_graphs,slots.target)?.with_boundary(boundary_bytes)?;
++        let target_peer_graphs=target_graphs.peer_families().iter().enumerate().map(|(index,family)| {
++            let mut footprint=FamilyFootprint::serial(family);footprint.runs_in_flight=target_graphs.stage_runs(index+1);
++            NativeGraphCharge::from_footprint(footprint,slots.target)?.with_boundary(boundary_bytes)
++        }).collect::<Result<Vec<_>,String>>()?;
++        let state_peer_graphs=state_graphs.peer_families().map(|family|
++            NativeGraphCharge::from_footprint(FamilyFootprint::serial(family),slots.state)).collect::<Result<Vec<_>,String>>()?;
++        if target_peer_graphs.len()!=state_peer_graphs.len() { return Err("physical state/target graph owners differ".into()); }
+         let target_readout_graph = NativeGraphCharge::from_footprint(
+             FamilyFootprint::serial(target_readout_graphs.family()),
+             slots.readout,
+@@ -1023,14 +1114,27 @@
+         .into_iter()
+         .flatten()
+         .collect::<Vec<_>>();
+-        let scratch = graph_scratch_bytes(&charges)?;
+-        let prepared_programs = crate::AttestedPrograms::planned_invocation_workspace_bytes(
++        let scratch=target_peer_graphs.iter().zip(&state_peer_graphs).try_fold(graph_scratch_bytes(&charges)?,|bytes,(target,state)|
++            bytes.checked_add(graph_scratch_bytes(&[target,state])?).ok_or_else(||"physical graph total overflows".to_string()))?;
++        let prepared_programs_per_owner = crate::AttestedPrograms::planned_invocation_workspace_bytes(
+             &load
+                 .program_plan(definition, state.codec)
+                 .map_err(|error| error.to_string())?,
+             backend,
+         )
+         .map_err(|error| error.to_string())?;
++        let prepared_programs=prepared_programs_per_owner.checked_mul((target_peer_graphs.len()+1) as u64).ok_or("physical program charge overflows")?;
++        if let Some(placement)=&state.physical {
++            for (index,stage) in placement.stages().iter().enumerate() {
++                let graph_bytes=if index==0 { graph_scratch_bytes(&charges)? } else {
++                    graph_scratch_bytes(&[&target_peer_graphs[index-1],&state_peer_graphs[index-1]])?
++                };
++                let actual_peak=stage.charge.total()?.checked_add(graph_bytes).and_then(|n|n.checked_add(prepared_programs_per_owner))
++                    .and_then(|n|n.checked_add(qualification_peak_bytes)).ok_or("physical peak overflows")?;
++                if actual_peak>stage.budget.capacity_bytes { return Err(format!("physical owner {} requires {} bytes, capacity {}",stage.budget.device,actual_peak,stage.budget.capacity_bytes)); }
++                eprintln!("magnitude-engine: physical stage owner={} blocks={:?} weights={} history={} recurrent={} graph={} programs={} startup_peak={} capacity={}",stage.budget.device,stage.blocks,stage.charge.weights,stage.charge.history,stage.charge.recurrent,graph_bytes,prepared_programs_per_owner,actual_peak,stage.budget.capacity_bytes);
++            }
++        }
+         let [target_weights, head_weights, vision_weights] = weight_bytes_by_component(load)?;
+         let bytes = ResourceBytes {
+             target_weights,
+@@ -1087,6 +1191,7 @@
+             ));
+         }
+         ResourcePlan {
++            physical: state.physical,
+             domain_capacity_bytes: capacity_bytes.domain_bytes,
+             capacity: state.capacity,
+             target_state: state.target_state,
+@@ -1094,6 +1199,8 @@
+             retained_entry_bytes: state.retained_entry_bytes,
+             bytes,
+             qualification_peak_bytes,
++            target_peer_graphs,
++            state_peer_graphs,
+             target_graph,
+             target_readout_graph,
+             head_graph,
+@@ -1203,6 +1310,9 @@
+         context_rows: rows.context,
+         max_advance: rows.max_advance,
+         history,
++        history_owners: vec![0; domains.len()],
++        component_owners: vec![0; recurrent_components.len()],
++        physical_devices: Vec::new(),
+         domains,
+         recurrent_components,
+         bank_capacity,
+@@ -1319,3 +1429,37 @@
+             .ok_or_else(|| "recurrent bank byte count overflow".into())
+     })
+ }
++
++fn split_physical_history(layouts: Vec<HistoryDomainLayout>, placement: &super::LayerPlacement)
++    -> Result<Vec<HistoryDomainLayout>, String> {
++    let mut result = Vec::new();
++    for layout in layouts {
++        if matches!(layout, HistoryDomainLayout::Shared { .. }) { result.push(layout); continue; }
++        let mut components = std::collections::BTreeMap::<usize,Vec<ComponentDescriptor>>::new();
++        for component in layout.components() {
++            let owner = placement.layer_owner(component.layer).ok_or("history layer has no physical owner")?;
++            components.entry(owner).or_default().push(component.clone());
++        }
++        for (_,components) in components {
++            result.push(match layout.kind() {
++                HistoryDomainKind::Token => HistoryDomainLayout::Token { components },
++                HistoryDomainKind::Window { rows } => HistoryDomainLayout::Window { rows, components },
++                HistoryDomainKind::Block { rate } => HistoryDomainLayout::Block { rate, components },
++                HistoryDomainKind::Shared { .. } => unreachable!(),
++            });
++        }
++    }
++    Ok(result)
++}
++fn install_state_owners(state: &mut StateStorePlan, placement: &super::LayerPlacement, target: bool)
++    -> Result<(), String> {
++    state.history_owners = state.domains.iter().map(|domain| {
++        let mut owners = domain.components.iter().map(|component| placement.layer_owner(component.layer));
++        let owner = owners.next().flatten().ok_or("history domain has no physical owner")?;
++        if owners.any(|next| next != Some(owner)) { return Err("history domain crosses physical owners".into()); }
++        Ok(owner)
++    }).collect::<Result<_,String>>()?;
++    state.component_owners = if target { placement.recurrent_owners().to_vec() } else { vec![0;state.recurrent_components.len()] };
++    state.physical_devices = placement.stages().iter().map(|stage|stage.budget.device).collect();
++    Ok(())
++}
+--- a/inference/engine/executor/src/programs/native_state.rs
++++ b/inference/engine/executor/src/programs/native_state.rs
+@@ -153,8 +153,9 @@
+                         map_rows: class_rows as u64,
+                         slab_rows,
+                     };
+-                    let plan = self.graphs.plan(&class)?;
+-                    let bindings = self.graphs.bindings(&class, &view)?;
++                    let graphs = self.graphs.for_device(view.device().info().selector)?;
++                    let plan = graphs.plan(&class)?;
++                    let bindings = graphs.bindings(&class, &view)?;
+                     // Native copy bodies skip negative map entries. Padding
+                     // must not launch concurrent writes to a real row.
+                     let mut from = words(&copy.from)?;
+@@ -163,7 +164,7 @@
+                     to.resize(class_rows, -1);
+                     self.graphs.run(
+                         &class,
+-                        state_graph_workspace.slot_mut(),
++                        state_graph_workspace.slot_mut_on(plan.device().info().selector).map_err(device)?,
+                         bindings,
+                         plan.new_outputs().map_err(device)?,
+                         &bytes(&from),
+@@ -189,6 +190,7 @@
+ }
+ 
+ pub struct PreparedStateCopyGraphs {
++    peers: Vec<PreparedStateCopyGraphs>,
+     variants: Vec<PreparedStateCopyGraph>,
+     family: NativeGraphFamily,
+ }
+@@ -247,7 +249,7 @@
+             .map(|variant| variant.plan.clone())
+             .collect::<Vec<_>>();
+         let family = NativeGraphFamily::new(&plans).map_err(device)?;
+-        Ok(Self { variants, family })
++        Ok(Self { variants, family, peers: Vec::new() })
+     }
+ 
+     pub fn workspace_bytes_max(&self) -> u64 {
+@@ -258,6 +260,12 @@
+         self.family.output_bytes()
+     }
+ 
++    pub fn install_peers(&mut self, peers: Vec<Self>) { self.peers = peers; }
++    pub fn peer_families(&self) -> impl Iterator<Item=&NativeGraphFamily> { self.peers.iter().map(Self::family) }
++    fn for_device(&self, owner: seismic::DeviceSelector) -> Result<&Self,SubmitError> {
++        std::iter::once(self).chain(self.peers.iter()).find(|graphs|graphs.family.device().info().selector==owner)
++            .ok_or_else(||invalid("state plane belongs to an unprepared physical owner"))
++    }
+     pub fn family(&self) -> &NativeGraphFamily {
+         &self.family
+     }
+@@ -515,7 +523,10 @@
+ 
+     #[test]
+     fn state_copy_classes_include_recurrent_banks() {
+-        let plan = StateStorePlan {
++        let mut plan = StateStorePlan {
++            history_owners: Vec::new(),
++            component_owners: Vec::new(),
++            physical_devices: Vec::new(),
+             context_rows: 8,
+             max_advance: 8,
+             history: Vec::new(),
+@@ -533,6 +544,8 @@
+             zero_seed_bytes: 16,
+             recurrent_pool_bytes: 48,
+         };
++        plan.history_owners = vec![0; plan.domains.len()];
++        plan.component_owners = vec![0; plan.recurrent_components.len()];
+         let classes = state_copy_classes(&plan, None, &[1, 2]).unwrap();
+         assert_eq!(classes.len(), 1);
+         assert_eq!(classes[0].element, Element::f32());
+--- a/inference/engine/executor/src/programs/native_target.rs
++++ b/inference/engine/executor/src/programs/native_target.rs
+@@ -98,6 +98,15 @@
+         Ok(outputs)
+     }
+ 
++    fn switch_device(&mut self, next: &Device) -> Result<(), SubmitError> {
++        self.flush()?;
++        wait_all(std::mem::take(&mut self.completions))?;
++        self.device=next.clone();
++        self.sequence=next.native_sequence();
++        self.queued=0;self.limit=1;
++        Ok(())
++    }
++
+     /// Submit what is queued.
+     fn flush(&mut self) -> Result<(), SubmitError> {
+         self.queued = 0;
+@@ -234,6 +243,7 @@
+ }
+ 
+ impl NativeTargetProgram {
++    pub(crate) fn constant_bytes_on(&self,device:&Device) -> Result<u64,&'static str> { self.graphs.constant_bytes_on(device) }
+     pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+         self.graphs.constant_bytes()
+     }
+@@ -732,6 +742,14 @@
+             );
+         }
+         for index in 0..self.geometry.blocks.len() {
++            let destination=self.graphs.prepared.block_owner(index);
++            if destination.info().selector!=submitter.device.info().selector {
++                submitter.switch_device(destination)?;
++                hidden=graph_workspace.transfer_from(destination.info().selector,&hidden).map_err(device)?;
++                for (lease,previous) in graph_outputs.iter_mut().zip(pending.iter_mut()) {
++                    if let Some(output)=previous.take() { lease.recycle(output).map_err(SubmitError::Invariant)?; }
++                }
++            }
+             let block_started = self.trace.blocks.then(Instant::now);
+             // A block with listing classes lists the history row tiles the
+             // launch's rows see in the smallest class that holds them; a
+@@ -763,7 +781,7 @@
+                 .map_err(invalid)?;
+             let parity = (index + 1) % 2;
+             let mut active = graph_workspace
+-                .slot_mut()
++                .slot_mut_on(destination.info().selector).map_err(device)?
+                 .activate(&graph.plan)
+                 .map_err(device)?;
+             let tap_rows = graph
+@@ -891,13 +909,9 @@
+                 .exported(&graph.output)
+                 .ok_or_else(|| invalid("target block output was not exported"))?;
+             let previous = index % 2;
+-            graph_outputs[previous]
+-                .recycle(
+-                    pending[previous]
+-                        .take()
+-                        .ok_or_else(|| invalid("prior target graph output is absent"))?,
+-                )
+-                .map_err(SubmitError::Invariant)?;
++            if let Some(previous_output)=pending[previous].take() {
++                graph_outputs[previous].recycle(previous_output).map_err(SubmitError::Invariant)?;
++            }
+             pending[parity] = Some(outputs);
+             if let Some(started) = block_started {
+                 let kind = match &graph.state {
+@@ -911,6 +925,13 @@
+                 );
+             }
+         }
++        if submitter.device.info().selector!=self.device.info().selector {
++            submitter.switch_device(&self.device)?;
++            hidden=graph_workspace.transfer_from(self.device.info().selector,&hidden).map_err(device)?;
++            for (lease,previous) in graph_outputs.iter_mut().zip(pending.iter_mut()) {
++                if let Some(output)=previous.take() { lease.recycle(output).map_err(SubmitError::Invariant)?; }
++            }
++        }
+         let (readout_workspace, readout_output) = readout;
+         let result =
+             self.graph_readout(batch, &hidden, readout_workspace, readout_output, submitter)?;
+@@ -919,13 +940,9 @@
+         // slot returns to the lease; the device queue orders any reuse.
+         drop(hidden);
+         let last = self.geometry.blocks.len() % 2;
+-        graph_outputs[last]
+-            .recycle(
+-                pending[last]
+-                    .take()
+-                    .ok_or_else(|| invalid("final target graph output is absent"))?,
+-            )
+-            .map_err(SubmitError::Invariant)?;
++        if let Some(final_output)=pending[last].take() {
++            graph_outputs[last].recycle(final_output).map_err(SubmitError::Invariant)?;
++        }
+         Ok((
+             result,
+             CommitSpan {
+--- a/inference/engine/executor/src/programs/native_target_graph.rs
++++ b/inference/engine/executor/src/programs/native_target_graph.rs
+@@ -152,6 +152,10 @@
+     mixers: Vec<MixerKind>,
+     classes: usize,
+     family: NativeGraphFamily,
++    peer_families: Vec<NativeGraphFamily>,
++    devices: Vec<Device>,
++    block_owners: Vec<usize>,
++    boundary_input: Option<(Element,[u64;2])>,
+     max_output_bytes: u64,
+     /// Decoder blocks, each one graph run per step.
+     blocks: usize,
+@@ -356,11 +360,12 @@
+             .map_or(Ok(0), |(element, extents)| element.canonical_byte_len(&extents))
+             .map_err(|error| error.to_string())?;
+         let per_layer_rows = per_layer_rows_bytes(self.per_layer_rows)?;
+-        distinct_storage_bytes(
+-            self.blocks_by_class
+-                .iter()
+-                .flat_map(|graphs| graphs.values().flat_map(|graph| graph.constants.iter())),
+-        )?
++        let constants = (0..self.devices.len()).try_fold(0u64,|bytes,owner| {
++            let selected = self.blocks_by_class.iter().enumerate().filter(|(index,_)|self.block_owners[*index]==owner)
++                .flat_map(|(_,graphs)|graphs.values().flat_map(|graph|graph.constants.iter()));
++            bytes.checked_add(distinct_storage_bytes(selected)?).ok_or_else(||"physical graph constant charge overflows".to_owned())
++        })?;
++        constants
+         .checked_add(taps)
+         .and_then(|bytes| bytes.checked_add(per_layer_rows))
+         .ok_or_else(|| "target binding charge overflows".into())
+@@ -375,6 +380,20 @@
+         plan: &TargetProgramPlan,
+         limits: ResourceLimits,
+     ) -> Result<Self, String> {
++        Self::prepare_placed(&[device.clone()], &vec![0;geometry.blocks.len()],handles,load,geometry,state,plan,limits)
++    }
++    pub(crate) fn prepare_placed(
++        devices: &[Device], owners: &[usize], handles: &AttestedTarget,
++        load: &ModelLoadPlan, geometry: &Decoder, state: &StateResourcePlan,
++        plan: &TargetProgramPlan, limits: ResourceLimits,
++    ) -> Result<Self,String> {
++        let device = devices.first().ok_or("target graphs need a physical device")?;
++        if owners.len() != geometry.blocks.len() || owners.iter().any(|&owner|owner>=devices.len()) {
++            return Err("target graph owners differ from the decoder topology".into());
++        }
++        if devices.iter().any(|peer|peer.backend()!=device.backend() || peer.forms_tensor_operations()!=device.forms_tensor_operations()) {
++            return Err("physical target devices have incompatible operator capabilities".into());
++        }
+         let mixers = geometry
+             .blocks
+             .iter()
+@@ -419,6 +438,9 @@
+         // class: the plan names weights by kind only, and each block binds
+         // its own resident weights to it.
+         let (tap_width, tapped) = block_taps(plan, geometry)?;
++        if devices.len()>1 && (tap_width.is_some() || plan.per_layer().is_some()) {
++            return Err("distributed target graphs do not yet transport tapped or per-layer entry rows".into());
++        }
+         let shapes = block_graph_shapes(load, geometry, state, &tapped)?;
+         let mut blocks_by_class: Vec<BTreeMap<BlockClass, PreparedTargetBlockGraph>> =
+             vec![BTreeMap::new(); handles.blocks.len()];
+@@ -433,7 +455,7 @@
+             certificate.per_layer.as_ref(),
+         )?;
+         let mut per_layer_entries = BTreeMap::new();
+-        let mut plans = Vec::new();
++        let mut plans = vec![Vec::new(); devices.len()];
+         let mut max_output_bytes = 0u64;
+         let trace = std::env::var_os("MAGNITUDE_V4_TRACE_GRAPH_SEAL").is_some();
+         let began_all = Instant::now();
+@@ -451,21 +473,21 @@
+                 )?;
+                 sealed_graphs += 1;
+                 max_output_bytes = max_output_bytes.max(entry.plan.output_bytes());
+-                plans.push(entry.plan.clone());
++                plans[0].push(entry.plan.clone());
+                 entries.insert((rows, source), entry);
+             }
+             if let Some(per_layer) = &per_layer {
+                 let entry = per_layer.prepare(device, rows)?;
+                 sealed_graphs += 1;
+                 max_output_bytes = max_output_bytes.max(entry.plan.output_bytes());
+-                plans.push(entry.plan.clone());
++                plans[0].push(entry.plan.clone());
+                 per_layer_entries.insert(rows, entry);
+             }
+             for (index, handle) in handles.blocks.iter().enumerate() {
+                 let mixer = mixers[index];
+                 // Output scales are values of the sealed graph.
+                 let shared = (0..index).find(|&first| {
+-                    shapes[first] == shapes[index]
++                    owners[first] == owners[index] && shapes[first] == shapes[index]
+                         && handles.blocks[first].output_scales == handle.output_scales
+                 });
+                 let listings = block_listings(state, plan.blocks()[index], index, rows)?;
+@@ -492,7 +514,7 @@
+                         }),
+                         _ => return Err("a tapped block has no tap entry".into()),
+                     };
+-                    let block = PreparedTargetBlockGraph::prepare(device, handle, tap,
++                    let block = PreparedTargetBlockGraph::prepare(&devices[owners[index]], handle, tap,
+                         plan.blocks()[index].per_layer(),
+                         load, geometry, state, index, rows, segments, slots, listed,
+                         &certificate.blocks[index][&(RowForm::of(rows), listed > 0)])
+@@ -501,7 +523,7 @@
+                         ))?;
+                     sealed_graphs += 1;
+                     max_output_bytes = max_output_bytes.max(block.plan.output_bytes());
+-                    plans.push(block.plan.clone());
++                    plans[owners[index]].push(block.plan.clone());
+                     blocks_by_class[index].insert(class, block);
+                     if trace {
+                         eprintln!(
+@@ -513,7 +535,8 @@
+             }
+         }
+         let seal_seconds = began_all.elapsed().as_secs_f64();
+-        let family = NativeGraphFamily::new(&plans).map_err(|error| error.to_string())?;
++        let mut families = plans.iter().map(|plans|NativeGraphFamily::new(plans).map_err(|error|error.to_string())).collect::<Result<Vec<_>,_>>()?;
++        let family = families.remove(0);
+         let seal = SealReport {
+             classes: launch_classes.len(),
+             sealed_graphs,
+@@ -526,6 +549,10 @@
+             mixers,
+             classes: launch_classes.len(),
+             family,
++            peer_families: families,
++            devices: devices.to_vec(),
++            block_owners: owners.to_vec(),
++            boundary_input: (devices.len()>1).then_some((activation(geometry),[largest_rows,geometry.hidden])),
+             max_output_bytes,
+             blocks: handles.blocks.len(),
+             tap_buffer: tap_width.map(|width| (activation(geometry), [largest_rows, width])),
+@@ -567,7 +594,7 @@
+     /// the embedding entry, the per-layer entry of a per-layer model, and
+     /// every block.
+     pub fn runs_per_step(&self) -> usize {
+-        1 + usize::from(self.per_layer_rows.is_some()) + self.blocks
++        self.stage_runs(0)
+     }
+ }
+ 
+@@ -584,6 +611,13 @@
+         self.classes
+     }
+ 
++    pub fn peer_families(&self) -> &[NativeGraphFamily] { &self.peer_families }
++    pub fn devices(&self) -> &[Device] { &self.devices }
++    pub fn block_owner(&self, index: usize) -> &Device { &self.devices[self.block_owners[index]] }
++    pub fn boundary_input(&self) -> Option<(Element,[u64;2])> { self.boundary_input }
++    pub fn stage_runs(&self, owner: usize) -> usize {
++        self.block_owners.iter().filter(|&&stage|stage==owner).count() + if owner==0 { 1 + usize::from(!self.per_layer_entries.is_empty()) } else { 0 }
++    }
+     pub fn family(&self) -> &NativeGraphFamily {
+         &self.family
+     }
+@@ -603,7 +637,7 @@
+                     .map_err(|error| format!("target embedding graph class {key:?}: {error}"))?,
+             );
+         }
+-        let mut constants = ConstantTensors::new(resident.embedding.tensor().device());
++        let mut constants = self.devices.iter().map(|device|ConstantTensors::new(device.clone())).collect::<Vec<_>>();
+         let mut bound = Vec::with_capacity(self.blocks_by_class.len());
+         if resident.blocks != self.blocks_by_class.len() {
+             return Err("resident target blocks disagree with the prepared graphs".into());
+@@ -614,7 +648,7 @@
+                 let constant_tensors = graph
+                     .constants
+                     .iter()
+-                    .map(|constant| Ok((constant.port(), constants.tensor(constant)?)))
++                    .map(|constant| Ok((constant.port(), constants[self.block_owners[index]].tensor(constant)?)))
+                     .collect::<Result<Vec<_>, String>>()?;
+                 let fixed = graph
+                     .weights
+@@ -686,7 +720,7 @@
+             prepared: self.clone(),
+             entry_bound,
+             bound,
+-            constants: constants.into_tensors(),
++            constants: constants.into_iter().flat_map(ConstantTensors::into_tensors).collect(),
+             taps,
+             per_layer,
+         })
+@@ -794,6 +828,19 @@
+             .iter()
+             .chain(&self.taps)
+             .chain(self.per_layer.as_ref().map(|per_layer| &per_layer.rows))
++            .try_fold(0u64, |bytes, tensor| {
++                bytes
++                    .checked_add(tensor.storage_bytes())
++                    .ok_or("target graph constant charge overflows")
++            })
++    }
++
++    pub(crate) fn constant_bytes_on(&self,device:&Device) -> Result<u64, &'static str> {
++        self.constants
++            .iter()
++            .chain(&self.taps)
++            .chain(self.per_layer.as_ref().map(|per_layer| &per_layer.rows))
++            .filter(|tensor|tensor.belongs_to(device))
+             .try_fold(0u64, |bytes, tensor| {
+                 bytes
+                     .checked_add(tensor.storage_bytes())
+--- a/inference/engine/executor/src/residency.rs
++++ b/inference/engine/executor/src/residency.rs
+@@ -305,6 +305,8 @@
+     programs: Rc<crate::native::AttestedPrograms>,
+     execution: ExecutionPlan,
+     domain: ResourceDomainId,
++    peers: Vec<ResidencyStore>,
++    placement: Option<crate::LayerPlacement>,
+     resident: HashMap<ResidencyKey, ResidentWeight>,
+     mapped_import: MappedImportReport,
+     import_progress: Option<ImportProgress>,
+@@ -330,10 +332,40 @@
+             programs,
+             execution,
+             domain,
++            peers: Vec::new(),
++            placement: None,
+             resident: HashMap::new(),
+             mapped_import: MappedImportReport::default(),
+             import_progress: None,
+         })
++    }
++
++    pub fn new_placed(devices: &[Rc<Device>], programs: Rc<crate::native::AttestedPrograms>,
++        execution: ExecutionPlan, domain: ResourceDomainId, placement: &crate::LayerPlacement)
++        -> Result<Self,WeightImportError> {
++        if devices.len()!=placement.stages().len() || programs.peers().len()+1!=devices.len() {
++            return Err(invalid("physical residency owners differ from the admitted stages"));
++        }
++        let mut store=Self::new(devices[0].clone(),programs.clone(),execution.clone(),domain.clone())?;
++        store.peers=devices.iter().skip(1).zip(programs.peers()).map(|(device,programs)|
++            Self::new(device.clone(),programs.clone(),execution.clone(),domain.clone())).collect::<Result<Vec<_>,_>>()?;
++        store.placement=Some(placement.clone());Ok(store)
++    }
++    pub(crate) fn import_role(&mut self, role: WeightRole,artifact: &GgufArtifact,
++        descriptor: &WeightDescriptor,target: DType) -> Result<ResidentWeight,WeightImportError> {
++        let owner=match role.scope {
++            WeightScope::TargetSublayer(index)|WeightScope::TargetBranch { sublayer:index,.. } =>
++                self.placement.as_ref().and_then(|placement|placement.block_owner(index.block as usize)).unwrap_or(0),
++            _=>0,
++        };
++        if owner==0 { return self.import_gguf_local(artifact,descriptor,target); }
++        let weight=self.peers[owner-1].import_gguf_local(artifact,descriptor,target)?;
++        // Progress belongs to the logical import, cache/charge to the owner.
++        if let Some(progress)=&mut self.import_progress {
++            progress.completed=progress.completed.saturating_add(weight.storage_bytes()).min(progress.total);
++            (progress.observer)(progress.completed,progress.total);
++        }
++        Ok(weight)
+     }
+ 
+     /// Cache a completed import, counting it toward the import in progress.
+@@ -357,17 +389,17 @@
+         self.device.info().id == device.info().id
+     }
+     pub fn len(&self) -> usize {
+-        self.resident.len()
++        self.resident.len()+self.peers.iter().map(Self::len).sum::<usize>()
+     }
+     pub fn is_empty(&self) -> bool {
+-        self.resident.is_empty()
++        self.resident.is_empty() && self.peers.iter().all(Self::is_empty)
+     }
+ 
+     /// Charges of completed resident imports held by this cache. Tied roles
+     /// share one key and one allocation; a failed component import may leave
+     /// a partial set, which this observation still counts exactly.
+     pub fn resident_bytes(&self) -> Result<u64, &'static str> {
+-        self.resident.values().try_fold(0u64, |bytes, weight| {
++        self.resident.values().try_fold(self.peers.iter().map(Self::resident_bytes).sum::<Result<u64,_>>()?, |bytes, weight| {
+             bytes
+                 .checked_add(weight.storage_bytes())
+                 .ok_or("resident cache charge overflows")
+@@ -477,6 +509,12 @@
+         descriptor: &WeightDescriptor,
+         target: DType,
+     ) -> Result<ResidentWeight, WeightImportError> {
++        let role=self.execution.weights().find(|weight|weight.component.identity==artifact.identity() && weight.descriptor==*descriptor)
++            .ok_or_else(||invalid("weight is absent from the admitted plan"))?.role;
++        self.import_role(role,artifact,descriptor,target)
++    }
++    fn import_gguf_local(&mut self,artifact: &GgufArtifact,descriptor: &WeightDescriptor,target: DType)
++        -> Result<ResidentWeight,WeightImportError> {
+         let (key, descriptor, scale, launch, mut program) =
+             match self.prepare_gguf(artifact, descriptor, target, None)? {
+                 ImportPreparation::Resident(weight) => return Ok(weight),
+--- a/inference/engine/executor/src/resident_weights.rs
++++ b/inference/engine/executor/src/resident_weights.rs
+@@ -73,8 +73,8 @@
+     ) -> Result<Self, ResidencyError> {
+         let mut roles = HashMap::with_capacity(weights.len());
+         for (role, descriptor) in weights {
+-            let weight = residency.import_gguf(
+-                artifact,
++            let weight = residency.import_role(
++                role, artifact,
+                 descriptor,
+                 operators::resident_dtype(role.kind, activation),
+             )?;
+@@ -198,6 +198,20 @@
+         let mut total = Some(0u64);
+         self.visit_weights(|weight| {
+             let tensor = weight.tensor();
++            if seen.iter().any(|other| other.shares_allocation(tensor)) {
++                return;
++            }
++            total = total.and_then(|bytes| bytes.checked_add(weight.storage_bytes()));
++            seen.push(tensor);
++        });
++        total.ok_or("resident target charge overflows")
++    }
++    pub(crate) fn storage_bytes_on(&self,device:&seismic::Device) -> Result<u64, &'static str> {
++        let mut seen = Vec::<&seismic::Tensor>::new();
++        let mut total = Some(0u64);
++        self.visit_weights(|weight| {
++            let tensor=weight.tensor();
++            if !tensor.belongs_to(device) { return; }
+             if seen.iter().any(|other| other.shares_allocation(tensor)) {
+                 return;
+             }
+--- a/inference/engine/executor/src/resources/graph.rs
++++ b/inference/engine/executor/src/resources/graph.rs
+@@ -3,7 +3,7 @@
+ use crate::{CapacityError, InvariantError, ResourceDomainId, ResourceKind};
+ use seismic::{
+     NativeExecutionArena, NativeGraphFamily, NativeGraphFamilyOutputSlot, NativeGraphFamilySlot,
+-    NativeGraphOutputs, NativeGraphPlan, Tensor, WorkflowTensor,
++    NativeGraphOutputs, NativeGraphPlan, Tensor, WorkflowTensor, DeviceSelector, Element,
+ };
+ use std::{cell::RefCell, rc::Rc};
+ 
+@@ -16,7 +16,21 @@
+ /// follows the live requests: the pool starts with what one request needs
+ /// and grows one slot at a time under a heap claim, and slots idle beyond
+ /// that start are released as surplus.
++struct PhysicalActivation {
++    slot: NativeGraphFamilySlot,
++    boundary: Option<Tensor>,
++}
++#[derive(Clone,Debug)]
++pub struct PeerTransferStat {
++    pub source: DeviceSelector, pub destination: DeviceSelector,
++    pub calls: u64, pub bytes: u64, pub seconds: f64,
++}
++
+ pub struct NativeGraphPool {
++    owner: DeviceSelector,
++    boundary: Option<(Element,[u64;2])>,
++    peers: Vec<NativeGraphPool>,
++    transfers: Rc<RefCell<Vec<PeerTransferStat>>>,
+     domain: ResourceDomainId,
+     family: NativeGraphFamily,
+     arena: NativeExecutionArena,
+@@ -32,7 +46,7 @@
+     minimum_outputs: usize,
+     /// Output slots allocated now, lent or free.
+     outputs: usize,
+-    workspace: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
++    workspace: Rc<RefCell<Vec<PhysicalActivation>>>,
+     output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+ }
+ 
+@@ -45,8 +59,25 @@
+         charge: crate::NativeGraphCharge,
+         arena: &NativeExecutionArena,
+     ) -> Result<Self, super::AllocationError> {
++        Self::new_with_boundary(domain,family,charge,arena,None)
++    }
++    pub(crate) fn new_with_boundary(
++        domain: ResourceDomainId, family: &NativeGraphFamily,
++        charge: crate::NativeGraphCharge, arena: &NativeExecutionArena,
++        boundary: Option<(Element,[u64;2])>,
++    ) -> Result<Self,super::AllocationError> {
++        let boundary_bytes = boundary.map(|(element,shape)|element.canonical_byte_len(&shape))
++            .transpose().map_err(|error|super::AllocationError::Device(error.to_string()))?.unwrap_or(0);
++        if boundary_bytes!=charge.boundary_bytes { return Err(super::AllocationError::Plan(InvariantError {
++            context: "physical graph pool",detail: "boundary allocation differs from its admitted charge".into(),
++        })); }
+         let workspace = (0..charge.activations)
+-            .map(|_| family.new_slot_in(arena, charge.upload_regions))
++            .map(|_| {
++                let slot = family.new_slot_in(arena,charge.upload_regions)?;
++                let input = boundary.map(|(element,shape)|Tensor::zeros(&family.device(),element,&shape))
++                    .transpose().map_err(seismic::WorkflowError::TensorView)?;
++                Ok::<PhysicalActivation,seismic::WorkflowError>(PhysicalActivation { slot,boundary: input })
++            })
+             .collect::<Result<Vec<_>, _>>()
+             .map_err(|error| super::AllocationError::Device(error.to_string()))?;
+         let output = (0..charge.output_slots)
+@@ -56,6 +87,7 @@
+         let activation_bytes = charge
+             .upload_bytes
+             .checked_mul(charge.upload_regions as u64)
++            .and_then(|bytes|bytes.checked_add(boundary_bytes))
+             .ok_or_else(|| {
+                 super::AllocationError::Plan(crate::InvariantError {
+                     context: "graph pool",
+@@ -63,6 +95,10 @@
+                 })
+             })?;
+         Ok(Self {
++            owner: family.device().info().selector,
++            boundary,
++            peers: Vec::new(),
++            transfers: Rc::new(RefCell::new(Vec::new())),
+             domain,
+             family: family.clone(),
+             arena: arena.clone(),
+@@ -78,19 +114,40 @@
+         })
+     }
+ 
++    pub(crate) fn install_peers(&mut self, peers: Vec<Self>) -> Result<(),super::AllocationError> {
++        if peers.iter().any(|peer|peer.domain!=self.domain || !peer.peers.is_empty()
++            || peer.minimum_activations!=self.minimum_activations || peer.minimum_outputs!=self.minimum_outputs
++            || peer.owner==self.owner) { return Err(super::AllocationError::Plan(InvariantError {
++                context: "physical graph pool",detail: "peer pool shape or ownership differs".into(),
++            })); }
++        self.peers=peers;
++        Ok(())
++    }
++    pub fn transfers(&self) -> Vec<PeerTransferStat> { self.transfers.borrow().clone() }
++    fn new_activation(&self) -> Result<PhysicalActivation,seismic::WorkflowError> {
++        let slot=self.family.new_slot_in(&self.arena,self.upload_regions)?;
++        let boundary=self.boundary.map(|(element,shape)|Tensor::zeros(&self.family.device(),element,&shape))
++            .transpose().map_err(seismic::WorkflowError::TensorView)?;
++        Ok(PhysicalActivation { slot,boundary })
++    }
+     pub fn domain(&self) -> &ResourceDomainId {
+         &self.domain
+     }
+ 
+     /// Physical arenas owned by this pool, including slots currently lent
+     /// to a submission or a published output view.
++    pub fn committed_bytes_on(&self,owner:DeviceSelector) -> u64 {
++        let local=if self.owner==owner { self.activation_bytes*self.activations as u64+self.output_bytes*self.outputs as u64 } else { 0 };
++        local+self.peers.iter().map(|peer|peer.committed_bytes_on(owner)).sum::<u64>()
++    }
+     pub fn committed_bytes(&self) -> u64 {
+         self.activation_bytes * self.activations as u64 + self.output_bytes * self.outputs as u64
++            + self.peers.iter().map(Self::committed_bytes).sum::<u64>()
+     }
+ 
+     /// The charge of one more output slot.
+     pub fn output_slot_bytes(&self) -> u64 {
+-        self.output_bytes
++        self.output_bytes + self.peers.iter().map(Self::output_slot_bytes).sum::<u64>()
+     }
+ 
+     /// Whether the family claims its activation on demand: it holds none
+@@ -102,61 +159,66 @@
+     /// The charge of one more activation: its upload regions. Its workspace
+     /// is the shared arena, already charged.
+     pub fn activation_slot_bytes(&self) -> u64 {
+-        self.activation_bytes
++        self.activation_bytes + self.peers.iter().map(Self::activation_slot_bytes).sum::<u64>()
+     }
+ 
+     /// Allocate one more activation in the arena. The caller holds a heap
+     /// claim for [`Self::activation_slot_bytes`] across this call.
+     pub(crate) fn grow_activation(&mut self) -> Result<(), seismic::WorkflowError> {
+-        let slot = self.family.new_slot_in(&self.arena, self.upload_regions)?;
+-        self.workspace.borrow_mut().push(slot);
++        let root=self.new_activation()?;
++        let peers=self.peers.iter().map(Self::new_activation).collect::<Result<Vec<_>,_>>()?;
++        self.workspace.borrow_mut().push(root);
+         self.activations += 1;
++        for (pool,slot) in self.peers.iter_mut().zip(peers) {
++            pool.workspace.borrow_mut().push(slot);pool.activations+=1;
++        }
+         Ok(())
+     }
+ 
+     /// Release free activations beyond the startup count; returns how many
+     /// were released. A lent activation stays until its launch completes.
+     pub(crate) fn release_idle_activations(&mut self) -> usize {
+-        let mut free = self.workspace.borrow_mut();
+-        let releasable = self
+-            .activations
+-            .saturating_sub(self.minimum_activations)
+-            .min(free.len());
+-        let kept = free.len() - releasable;
+-        free.truncate(kept);
+-        self.activations -= releasable;
+-        releasable
++        let count=std::iter::once(&*self).chain(self.peers.iter()).map(|pool|
++            pool.activations.saturating_sub(pool.minimum_activations).min(pool.workspace.borrow().len())).min().unwrap_or(0);
++        for pool in std::iter::once(self) { // root and its leaves are mutated after computing the common count
++            let mut free=pool.workspace.borrow_mut();let kept=free.len()-count;free.truncate(kept);pool.activations-=count;
++            for peer in &mut pool.peers {
++                let mut free=peer.workspace.borrow_mut();let kept=free.len()-count;free.truncate(kept);peer.activations-=count;
++            }
++        }
++        count
+     }
+ 
+     pub fn available_workspace(&self) -> usize {
+-        self.workspace.borrow().len()
++        self.peers.iter().map(Self::available_workspace).fold(self.workspace.borrow().len(),usize::min)
+     }
+ 
+     pub fn available_output(&self) -> usize {
+-        self.output.borrow().len()
++        self.peers.iter().map(Self::available_output).fold(self.output.borrow().len(),usize::min)
+     }
+ 
+     /// Allocate one more output slot. The caller holds a heap claim for
+     /// [`Self::output_slot_bytes`] across this call.
+     pub(crate) fn grow_output(&mut self) -> Result<(), seismic::TensorError> {
+         let slot = self.family.new_output_slot()?;
+-        self.output.borrow_mut().push(slot);
+-        self.outputs += 1;
++        let peers=self.peers.iter().map(|pool|pool.family.new_output_slot()).collect::<Result<Vec<_>,_>>()?;
++        self.output.borrow_mut().push(slot); self.outputs += 1;
++        for (pool,slot) in self.peers.iter_mut().zip(peers) {
++            pool.output.borrow_mut().push(slot);pool.outputs+=1;
++        }
+         Ok(())
+     }
+ 
+     /// Release free output slots beyond the startup count; returns how many
+     /// were released. Lent slots stay until their last view drops.
+     pub(crate) fn release_idle_outputs(&mut self) -> usize {
+-        let mut free = self.output.borrow_mut();
+-        let releasable = self
+-            .outputs
+-            .saturating_sub(self.minimum_outputs)
+-            .min(free.len());
+-        let kept = free.len() - releasable;
+-        free.truncate(kept);
+-        self.outputs -= releasable;
+-        releasable
++        let count=std::iter::once(&*self).chain(self.peers.iter()).map(|pool|
++            pool.outputs.saturating_sub(pool.minimum_outputs).min(pool.output.borrow().len())).min().unwrap_or(0);
++        let mut free=self.output.borrow_mut();let kept=free.len()-count;free.truncate(kept);self.outputs-=count;
++        for peer in &mut self.peers {
++            let mut free=peer.output.borrow_mut();let kept=free.len()-count;free.truncate(kept);peer.outputs-=count;
++        }
++        count
+     }
+ 
+     pub fn acquire_workspace(&self) -> Result<NativeGraphWorkspaceLease, CapacityError> {
+@@ -165,11 +227,12 @@
+             required: 1,
+             available: 0,
+         })?;
+-        Ok(NativeGraphWorkspaceLease {
+-            domain: self.domain.clone(),
+-            slot: Some(slot),
+-            free: self.workspace.clone(),
+-        })
++        let mut lease=NativeGraphWorkspaceLease {
++            owner:self.owner,peers:Vec::new(),transfers:self.transfers.clone(),
++            domain:self.domain.clone(),slot:Some(slot),free:self.workspace.clone(),
++        };
++        for peer in &self.peers { lease.peers.push(peer.acquire_workspace()?); }
++        Ok(lease)
+     }
+ 
+     pub fn acquire_output(&self) -> Result<NativeGraphOutputLease, CapacityError> {
+@@ -178,18 +241,22 @@
+             required: 1,
+             available: 0,
+         })?;
+-        Ok(NativeGraphOutputLease {
+-            domain: self.domain.clone(),
+-            slot: Some(slot),
+-            free: self.output.clone(),
+-        })
++        let mut lease=NativeGraphOutputLease {
++            owner:self.owner,peers:Vec::new(),active_owner:None,
++            domain:self.domain.clone(),slot:Some(slot),free:self.output.clone(),
++        };
++        for peer in &self.peers { lease.peers.push(peer.acquire_output()?); }
++        Ok(lease)
+     }
+ }
+ 
+ pub struct NativeGraphWorkspaceLease {
++    owner: DeviceSelector,
++    peers: Vec<NativeGraphWorkspaceLease>,
++    transfers: Rc<RefCell<Vec<PeerTransferStat>>>,
+     domain: ResourceDomainId,
+-    slot: Option<NativeGraphFamilySlot>,
+-    free: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
++    slot: Option<PhysicalActivation>,
++    free: Rc<RefCell<Vec<PhysicalActivation>>>,
+ }
+ 
+ impl NativeGraphWorkspaceLease {
+@@ -197,8 +264,34 @@
+         &self.domain
+     }
+ 
++    fn on_owner(&mut self,owner:DeviceSelector) -> Option<&mut Self> {
++        if self.owner==owner { Some(self) } else { self.peers.iter_mut().find(|peer|peer.owner==owner) }
++    }
++    pub fn slot_mut_on(&mut self,owner:DeviceSelector) -> Result<&mut NativeGraphFamilySlot,seismic::WorkflowError> {
++        self.on_owner(owner).map(Self::slot_mut).ok_or(seismic::WorkflowError::NativeGraphSlotMismatch)
++    }
++    pub fn transfer_from(&mut self,owner:DeviceSelector,source:&Tensor) -> Result<Tensor,seismic::TensorError> {
++        let stats=self.transfers.clone();
++        let leaf=self.on_owner(owner).ok_or_else(||seismic::TensorError::DeviceTransfer("receiver has no physical graph activation".into()))?;
++        let backing=leaf.slot.as_mut().expect("physical graph activation is live").boundary.as_mut()
++            .ok_or_else(||seismic::TensorError::DeviceTransfer("receiver has no admitted boundary buffer".into()))?;
++        let rows=*source.extents().first().ok_or_else(||seismic::TensorError::DeviceTransfer("boundary source has no row axis".into()))?;
++        let mut destination=backing.slice_leading(0,rows)?;
++        let started=std::time::Instant::now();
++        destination.copy_from_peer(source)?;
++        let seconds=started.elapsed().as_secs_f64();
++        let from=source.device().info().selector;
++        let mut records=stats.borrow_mut();
++        if let Some(record)=records.iter_mut().find(|record|record.source==from && record.destination==owner) {
++            record.calls+=1;record.bytes+=source.byte_len();record.seconds+=seconds;
++        } else { records.push(PeerTransferStat { source:from,destination:owner,calls:1,bytes:source.byte_len(),seconds }); }
++        if std::env::var_os("MAGNITUDE_TRACE_TRANSFERS").is_some() {
++            eprintln!("magnitude-engine: peer transfer {from} -> {owner}: {} bytes in {:.6} s",source.byte_len(),seconds);
++        }
++        Ok(destination)
++    }
+     pub fn slot_mut(&mut self) -> &mut NativeGraphFamilySlot {
+-        self.slot.as_mut().expect("graph workspace lease is live")
++        &mut self.slot.as_mut().expect("graph workspace lease is live").slot
+     }
+ }
+ 
+@@ -214,6 +307,9 @@
+ /// a one-shot Seismic output value; successful work returns that value after
+ /// every exported tensor view has been released.
+ pub struct NativeGraphOutputLease {
++    owner: DeviceSelector,
++    peers: Vec<NativeGraphOutputLease>,
++    active_owner: Option<DeviceSelector>,
+     domain: ResourceDomainId,
+     slot: Option<NativeGraphFamilyOutputSlot>,
+     free: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
+@@ -228,7 +324,16 @@
+         &mut self,
+         plan: &NativeGraphPlan,
+     ) -> Result<NativeGraphOutputs, InvariantError> {
++        let owner=plan.device().info().selector;
++        if self.active_owner.is_some() { return Err(InvariantError { context:"physical graph output",detail:"a prior physical output is still active".into() }); }
++        if owner!=self.owner {
++            let peer=self.peers.iter_mut().find(|peer|peer.owner==owner).ok_or_else(||InvariantError {
++                context:"physical graph output",detail:"graph owner has no admitted output pool".into(),
++            })?;
++            let outputs=peer.activate(plan)?;self.active_owner=Some(owner);return Ok(outputs);
++        }
+         let slot = self.slot.take().expect("graph output lease is live");
++        self.active_owner=Some(owner);
+         slot.activate(plan).map_err(|error| InvariantError {
+             context: "target graph output",
+             detail: error.to_string(),
+@@ -236,6 +341,12 @@
+     }
+ 
+     pub fn recycle(&mut self, outputs: NativeGraphOutputs) -> Result<(), InvariantError> {
++        if let Some(owner)=self.active_owner {
++            if owner!=self.owner {
++                let peer=self.peers.iter_mut().find(|peer|peer.owner==owner).expect("activated owner is retained");
++                peer.recycle(outputs)?;self.active_owner=None;return Ok(());
++            }
++        }
+         if self.slot.is_some() {
+             return Err(InvariantError {
+                 context: "target graph output",
+@@ -246,13 +357,20 @@
+             context: "target graph output",
+             detail: error.to_string(),
+         })?);
++        self.active_owner=None;
+         Ok(())
+     }
+ 
+     /// Publish a completed graph's outputs. Every exported tensor returned
+     /// through this owner retains the physical output arena. Final drop
+     /// recycles it into the same admitted pool.
+-    pub fn publish(self, outputs: NativeGraphOutputs) -> GraphOutputOwner {
++    pub fn publish(mut self, outputs: NativeGraphOutputs) -> GraphOutputOwner {
++        if let Some(owner)=self.active_owner {
++            if owner!=self.owner {
++                let index=self.peers.iter().position(|peer|peer.owner==owner).expect("activated owner is retained");
++                return self.peers.remove(index).publish(outputs);
++            }
++        }
+         assert!(self.slot.is_none(), "graph output was not activated");
+         GraphOutputOwner {
+             claim: Rc::new(GraphOutputClaim {
+--- a/inference/engine/executor/src/resources.rs
++++ b/inference/engine/executor/src/resources.rs
+@@ -191,6 +191,7 @@
+     domain: ResourceDomainId,
+     /// The device's one graph workspace, which every pool's activations bind.
+     arena: seismic::NativeExecutionArena,
++    peer_arenas: Vec<seismic::NativeExecutionArena>,
+     target_graph: NativeGraphPool,
+     target_readout_graph: NativeGraphPool,
+     head_graph: Option<NativeGraphPool>,
+@@ -201,6 +202,11 @@
+ impl AllocatedResources {
+     /// The workspace arena once, and the arenas these pools own while their
+     /// slots are lent to launches or output views.
++    pub fn committed_bytes_on(&self,index:usize,owner:seismic::DeviceSelector) -> u64 {
++        let arena=if index==0 { self.arena.bytes() } else { self.peer_arenas[index-1].bytes() };
++        arena+[Some(&self.target_graph),Some(&self.target_readout_graph),self.head_graph.as_ref(),self.vision_graph.as_ref(),Some(&self.state_graph)]
++            .into_iter().flatten().map(|pool|pool.committed_bytes_on(owner)).sum::<u64>()
++    }
+     pub fn committed_bytes(&self) -> Result<u64, &'static str> {
+         [
+             Some(&self.target_graph),
+@@ -211,7 +217,7 @@
+         ]
+         .into_iter()
+         .flatten()
+-        .try_fold(self.arena.bytes(), |bytes, pool| {
++        .try_fold(self.arena.bytes()+self.peer_arenas.iter().map(|arena|arena.bytes()).sum::<u64>(), |bytes, pool| {
+             bytes
+                 .checked_add(pool.committed_bytes())
+                 .ok_or("graph pool charge overflows")
+@@ -404,8 +410,16 @@
+                 detail: "prepared target graph differs from admitted Seismic footprint".into(),
+             }));
+         }
+-        let target_graph =
+-            NativeGraphPool::new(domain.clone(), target_graphs.family(), graph_charge, &arena)?;
++        let peer_arenas=target_graphs.devices().iter().skip(1).enumerate().map(|(index,owner)|
++            owner.execution_arena(plan.peer_arena_bytes(index)).map_err(|error|AllocationError::Device(error.to_string())))
++            .collect::<Result<Vec<_>,_>>()?;
++        let mut target_graph=NativeGraphPool::new_with_boundary(domain.clone(),target_graphs.family(),graph_charge,&arena,target_graphs.boundary_input())?;
++        let peers=target_graphs.peer_families().iter().zip(plan.target_peer_graphs()).zip(&peer_arenas)
++            .map(|((family,&charge),arena)| {
++                if !admitted(family,charge) { return Err(AllocationError::Device("physical graph differs from admission".into())); }
++                NativeGraphPool::new_with_boundary(domain.clone(),family,charge,arena,target_graphs.boundary_input())
++            }).collect::<Result<Vec<_>,_>>()?;
++        target_graph.install_peers(peers)?;
+         let readout_charge = plan.target_readout_graph();
+         if !admitted(target_readout_graphs.family(), readout_charge) {
+             return Err(AllocationError::Plan(InvariantError {
+@@ -451,11 +465,16 @@
+                 detail: "prepared state graph differs from admitted Seismic footprint".into(),
+             }));
+         }
+-        let state_graph =
+-            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge, &arena)?;
++        let mut state_graph=NativeGraphPool::new(domain.clone(),state_graphs.family(),state_charge,&arena)?;
++        let peers=state_graphs.peer_families().zip(plan.state_peer_graphs()).zip(&peer_arenas).map(|((family,&charge),arena)| {
++            if !admitted(family,charge) { return Err(AllocationError::Device("physical state graph differs from admission".into())); }
++            NativeGraphPool::new(domain.clone(),family,charge,arena)
++        }).collect::<Result<Vec<_>,_>>()?;
++        state_graph.install_peers(peers)?;
+         let allocated = AllocatedResources {
+             domain: domain.clone(),
+             arena,
++            peer_arenas,
+             target_graph,
+             target_readout_graph,
+             head_graph,
+--- a/inference/engine/src/census.rs
++++ b/inference/engine/src/census.rs
+@@ -68,6 +68,15 @@
+         host_table_bytes: u64,
+         domain: MemoryDomain,
+     ) -> Result<Self, String> {
++        if !charge.physical.is_empty() {
++            let mut domains=charge.physical.iter().map(|physical|DomainAllocation {
++                domain:MemoryDomain::DeviceLocal { device:physical.device },model_bytes:physical.model,
++                context_bytes:physical.context,compute_bytes:physical.compute,auxiliary_bytes:physical.auxiliary,
++            }).collect::<Vec<_>>();
++            if host_table_bytes!=0 { domains.push(DomainAllocation { domain:MemoryDomain::HostRam,model_bytes:host_table_bytes,
++                context_bytes:0,compute_bytes:0,auxiliary_bytes:0 }); }
++            return Ok(Self { domains });
++        }
+         let overflow = || "census byte count overflow".to_owned();
+         let state = |census: magnitude_state::StateHoldingCensus| {
+             [census.live, census.retained, census.surplus, census.in_flight]
+--- a/inference/engine/src/execution.rs
++++ b/inference/engine/src/execution.rs
+@@ -63,6 +63,8 @@
+ pub(crate) struct PreparedPrograms {
+     pub draft: ExecutionPlanDraft,
+     pub opened: OpenedPlatform,
++    pub peers: Vec<OpenedPlatform>,
++    pub placement: Option<magnitude_executor::LayerPlacement>,
+     pub programs: AttestedPrograms,
+     pub backend: BackendName,
+     pub pool: MemoryPoolKind,
+@@ -118,15 +120,26 @@
+         })?;
+     // Refuse impossible state geometry before opening the device or tuning.
+     // Preview and load use the same selected physical capacity and layout.
+-    let state = ResourcePlanner::state_plan(
+-        &manifest.definition,
+-        draft.load(),
+-        draft.policy().method(),
+-        manifest.model.kv_codec,
+-        draft.policy().limits(),
+-        capacity,
+-    )
+-    .map_err(internal)?;
++    let mut selected_peers=Vec::new();
++    let mut budgets=vec![magnitude_executor::PhysicalStageBudget { device:selected.info.selector,capacity_bytes:selected.assessment_capacity_bytes,reserved_bytes:1<<30 }];
++    for request in &manifest.peer_devices {
++        if !matches!(request,platform::DeviceRequest::Selector(_)) { return Err(internal("peer devices must be explicit physical selectors")); }
++        let peer=platform::select_device(catalog,manifest.path,*request,&reserves).map_err(platform_error)?;
++        if backend!=BackendName::Cuda || peer.info.backend!=backend || peer.tensor_operations!=selected.tensor_operations {
++            return Err(internal("physical layer placement requires compatible CUDA devices"));
++        }
++        budgets.push(magnitude_executor::PhysicalStageBudget { device:peer.info.selector,capacity_bytes:peer.assessment_capacity_bytes,reserved_bytes:1<<30 });
++        selected_peers.push(peer);
++    }
++    let placement=if selected_peers.is_empty() { None } else { Some(magnitude_executor::LayerPlacement::derive(
++        &manifest.definition,draft.load(),draft.policy().method(),manifest.model.kv_codec,&budgets,
++        3+usize::from(draft.policy().limits().lookahead)).map_err(internal)?) };
++    let state=match &placement {
++        Some(placement)=>ResourcePlanner::state_plan_placed(&manifest.definition,draft.load(),draft.policy().method(),
++            manifest.model.kv_codec,draft.policy().limits(),placement,capacity.tensor_operations),
++        None=>ResourcePlanner::state_plan(&manifest.definition,draft.load(),draft.policy().method(),
++            manifest.model.kv_codec,draft.policy().limits(),capacity),
++    }.map_err(internal)?;
+     let kernel_cache = manifest
+         .kernel_cache
+         .clone()
+@@ -150,18 +163,31 @@
+     let preparing = Instant::now();
+     let error_classes = magnitude_executor::AdmittedErrorClasses::of(&manifest.model.error_classes)
+         .map_err(internal)?;
+-    let programs = AttestedPrograms::prepare_draft(
++    let mut programs = AttestedPrograms::prepare_draft(
+         &draft,
+         opened.device(),
+         TuningContext {
+             definition: &manifest.definition,
+             weights: package,
+-            observer: &TuningReport { progress },
++            observer: &TuningReport { progress:progress.clone() },
+             cache: kernel_cache.as_deref(),
+             error_classes: &error_classes,
+         },
+     )
+     .map_err(|error| LoadError::from(classify_catalog(error)))?;
++    let mut peers=Vec::new();
++    let mut peer_programs=Vec::new();
++    for peer in selected_peers {
++        let opened_peer=platform::open_selected(catalog,peer.info.selector,PlatformConfig { path:manifest.path,
++            artifacts:kernel_cache.clone().map(|cache|cache as Arc<dyn seismic::ArtifactStore>),reserves }).map_err(platform_error)?;
++        let peer_draft=crate::planning::plan_execution(manifest,&peer).map_err(|error|internal(error.to_string()))?;
++        let attested=AttestedPrograms::prepare_draft(&peer_draft,opened_peer.device(),TuningContext {
++            definition:&manifest.definition,weights:package,observer:&TuningReport { progress:progress.clone() },
++            cache:kernel_cache.as_deref(),error_classes:&error_classes,
++        }).map_err(|error|LoadError::from(classify_catalog(error)))?;
++        peer_programs.push(Rc::new(attested));peers.push(opened_peer);
++    }
++    if let Some(placement)=&placement { programs.install_layer_placement(placement,peer_programs).map_err(internal)?; }
+     let tuned = programs.tuned();
+     eprintln!(
+         "magnitude-engine: prepared programs in {:.2} s, {:.2} s of it tuning {} entries \
+@@ -198,6 +224,8 @@
+     Ok(PreparedPrograms {
+         draft,
+         opened,
++        peers,
++        placement,
+         programs,
+         backend,
+         pool,
+@@ -214,6 +242,8 @@
+     let PreparedPrograms {
+         draft,
+         opened,
++        peers,
++        placement,
+         mut programs,
+         backend,
+         pool,
+@@ -223,16 +253,12 @@
+     let limits = draft.policy().limits();
+     let head_enabled = draft.policy().selection().head;
+     let mut phase_started = Instant::now();
+-    let target_graphs = programs
+-        .prepare_target_graphs(
+-            opened.device(),
+-            draft.load(),
+-            &manifest.definition.decoder,
+-            &state,
+-            draft.programs().target(),
+-            limits,
+-        )
+-        .map_err(internal)?;
++    let physical_devices=std::iter::once(opened.device().clone()).chain(peers.iter().map(|peer|peer.device().clone())).collect::<Vec<_>>();
++    let target_graphs=match &placement {
++        Some(placement)=>programs.prepare_target_graphs_placed(&physical_devices,placement,draft.load(),&manifest.definition.decoder,
++            &state,draft.programs().target(),limits),
++        None=>programs.prepare_target_graphs(opened.device(),draft.load(),&manifest.definition.decoder,&state,draft.programs().target(),limits),
++    }.map_err(internal)?;
+     let target_readout_graphs = programs
+         .prepare_target_readout_graphs(
+             opened.device(),
+@@ -291,6 +317,7 @@
+     ))
+     .map_err(internal)?;
+     let device = Rc::new(opened.into_device());
++    let devices=std::iter::once(device.clone()).chain(peers.into_iter().map(|peer|Rc::new(peer.into_device()))).collect::<Vec<_>>();
+     let programs = Rc::new(programs);
+     let target_graphs = programs
+         .target_graphs()
+@@ -303,12 +330,12 @@
+         .state_graphs()
+         .ok_or_else(|| internal("qualified program set has no state graphs"))?;
+     let mut startup = StartupClaims {
+-        heap: DeviceHeap::open(catalog, reserves, device.clone())
++        heap: DeviceHeap::open_placed(catalog, reserves, &devices)
+             .map_err(|error| platform_error(PlatformError::Memory(error)))?,
+         allocation_domain: MemoryDomain::of(device_selector, pool),
+         held: None,
+     };
+-    startup.claim("graph scratch", plan.bytes().scratch, 0)?;
++    startup.claim_placed("graph scratch",&plan.scratch_by_owner(),0)?;
+     let resources = ResourceAllocator::allocate(
+         &execution_plan,
+         &device,
+@@ -321,13 +348,10 @@
+     )
+     .map_err(|error| internal(error.to_string()))?;
+     report_load_phase("resource allocation", &mut phase_started);
+-    let mut residency = ResidencyStore::new(
+-        device.clone(),
+-        programs.clone(),
+-        execution_plan.clone(),
+-        resource_identity.clone(),
+-    )
+-    .map_err(|error| internal(error.to_string()))?;
++    let mut residency=match &placement {
++        Some(placement)=>ResidencyStore::new_placed(&devices,programs.clone(),execution_plan.clone(),resource_identity.clone(),placement),
++        None=>ResidencyStore::new(device.clone(),programs.clone(),execution_plan.clone(),resource_identity.clone()),
++    }.map_err(|error|internal(error.to_string()))?;
+     let target_upload = execution_plan
+         .load()
+         .target_upload_peak_bytes()
+@@ -343,7 +367,11 @@
+             .host_table_bytes()
+             .map_err(|error| internal(error.to_string()))?,
+     )?;
+-    startup.claim("target import", target_peak, target_upload)?;
++    if let Some(placement)=&placement {
++        let costs=placement.stages().iter().map(|stage|stage.charge.weights.checked_add(target_upload).ok_or("target physical import overflows"))
++            .collect::<Result<Vec<_>,_>>().map_err(internal)?;
++        startup.claim_placed("target import",&costs,target_upload)?;
++    } else { startup.claim("target import", target_peak, target_upload)?; }
+     let import_progress = progress.clone();
+     let target = residency
+         .load_target(
+@@ -396,23 +424,15 @@
+         })
+         .transpose()
+         .map_err(|error| internal(error.to_string()))?;
+-    startup.claim(
+-        "initial target state",
+-        plan.target_state()
+-            .initial_committed_bytes()
+-            .map_err(internal)?,
+-        0,
+-    )?;
+-    let target_state = plan
+-        .allocate_target_state(device.clone())
+-        .map_err(internal)?;
++    startup.claim_placed("initial target state",&plan.target_state().startup_bytes_by_owner(devices.len()).map_err(internal)?,0)?;
++    let target_state=plan.target_state().allocate_on_devices(devices.clone()).map_err(internal)?;
+     let head_state = if let Some(state) = plan.head_state() {
+         startup.claim(
+             "initial head state",
+             state.initial_committed_bytes().map_err(internal)?,
+             0,
+         )?;
+-        Some(state.allocate(device.clone()).map_err(internal)?)
++        Some(state.allocate_on_devices(devices.clone()).map_err(internal)?)
+     } else {
+         None
+     };
+@@ -485,6 +505,14 @@
+             })?;
+         self.held = Some(claim);
+         Ok(())
++    }
++
++    fn claim_placed(&mut self,purpose:&str,costs:&[u64],staged:u64) -> Result<(),LoadError> {
++        if let Some(held)=self.held.take() { self.heap.release(held); }
++        let total=costs.iter().sum();
++        let claim=self.heap.claim_placed(costs,staged,HoldingClass::Model).map_err(|refusal|
++            self.refusal(purpose,refusal,|role|match role { DomainRole::Allocation=>total,DomainRole::Staging=>staged }))?;
++        self.held=Some(claim);Ok(())
+     }
+ 
+     /// Hold the model's host-resident tables (`bytes`) in the host-RAM
+--- a/inference/engine/src/options.rs
++++ b/inference/engine/src/options.rs
+@@ -233,6 +233,8 @@
+     pub service: ServiceLimits,
+     pub path: ExecutionPath,
+     pub device: DeviceRequest,
++    #[serde(default)]
++    pub peer_devices: Vec<DeviceRequest>,
+     /// The kernel cache directory the host names; `None` caches nothing.
+     pub kernel_cache: Option<PathBuf>,
+     /// The host's threshold policy: every engine claim keeps each domain's
+@@ -369,6 +371,7 @@
+             service,
+             path,
+             device,
++            peer_devices: Vec::new(),
+             kernel_cache,
+             reserves,
+         })
+--- a/inference/engine/state/src/advance.rs
++++ b/inference/engine/state/src/advance.rs
+@@ -182,7 +182,7 @@
+         destination: &SequenceState,
+     ) -> Result<(KvCodec, KvCodec, Vec<Vec<usize>>), Error> {
+         if Rc::ptr_eq(&source.store, &destination.store)
+-            || !Rc::ptr_eq(&source.store.device, &destination.store.device)
++            || !source.store.same_physical_placement(&destination.store)
+             || destination.position != 0
+             || destination.claims.iter().any(|claims| !claims.is_empty())
+             || destination.history_start != 0
+--- a/inference/engine/state/src/lib.rs
++++ b/inference/engine/state/src/lib.rs
+@@ -6,6 +6,8 @@
+ mod codec;
+ mod domain;
+ mod layout;
++mod physical;
++use physical::RecurrentSlabs;
+ pub mod placement;
+ 
+ pub use advance::{
+@@ -1094,7 +1096,7 @@
+ /// rows and banks are handed out.
+ struct StoreSlabs {
+     history: Vec<HistorySlabs>,
+-    recurrent: Option<SlabTensor>,
++    recurrent: Option<RecurrentSlabs>,
+     banks: usize,
+ }
+ 
+@@ -1311,7 +1313,9 @@
+ /// sealed into graphs. Backing slabs are added as demand grows and released
+ /// when empty, only through the store's [`StoreBindings`].
+ pub struct StateStore {
+-    device: Rc<Device>,
++    devices: Vec<Rc<Device>>,
++    history_owners: Vec<usize>,
++    component_owners: Vec<usize>,
+     context_capacity: usize,
+     domains: Vec<HistoryDomain>,
+     /// Layers of Shared domains and the stored layers they read.
+@@ -1462,12 +1466,30 @@
+         component_specs: Vec<ComponentSpec>,
+         bank_capacity: BankCapacity,
+     ) -> Result<(Rc<Self>, StoreBindings), Error> {
++        let stored_domains = domains.iter().filter(|domain| !matches!(domain.layout.kind(), HistoryDomainKind::Shared { .. })).count();
++        Self::new_placed(vec![device], context_capacity, max_advance,
++            domains, vec![0; stored_domains], vec![0; component_specs.len()], component_specs, bank_capacity)
++    }
++
++    /// One logical store with explicit physical owners. Bank IDs and transaction
++    /// publication remain common to every group; there are no independently
++    /// committed per-device sequences.
++    pub fn new_placed(
++        devices: Vec<Rc<Device>>, context_capacity: usize, max_advance: usize,
++        domains: Vec<HistoryDomainPlan>, history_owners: Vec<usize>,
++        component_owners: Vec<usize>, component_specs: Vec<ComponentSpec>,
++        bank_capacity: BankCapacity,
++    ) -> Result<(Rc<Self>, StoreBindings), Error> {
++        if devices.is_empty() { return Err(Error::Request("state needs physical devices".into())); }
+         if context_capacity == 0 {
+             return Err(Error::Request(
+                 "history capacity must fit a positive sequence context".into(),
+             ));
+         }
+         let (stored, shared) = domain::validate_domains(domains, context_capacity, max_advance)?;
++        if history_owners.len() != stored.len() || history_owners.iter().any(|&owner| owner >= devices.len()) {
++            return Err(Error::Request("history physical owners differ from the stored domains".into()));
++        }
+         let recurrent_bank_bytes = recurrent_bank_bytes(&component_specs)?;
+         let bank_slab_banks = if component_specs.is_empty() {
+             0
+@@ -1485,28 +1507,18 @@
+         let mut recurrent = if component_specs.is_empty() {
+             None
+         } else {
+-            Some(SlabTensor::new(
+-                &device,
+-                bank_slab_banks as u64,
+-                reserved_banks as u64,
+-                component_specs
+-                    .iter()
+-                    .map(|spec| SlabRegion {
+-                        element: element(spec.dtype),
+-                        row_shape: spec.shape.iter().map(|&size| size as u64).collect(),
+-                    })
+-                    .collect(),
+-            )?)
++            Some(RecurrentSlabs::new(&devices, &component_owners, &component_specs,
++                bank_slab_banks as u64, reserved_banks as u64)?)
+         };
+         if let Some(recurrent) = &mut recurrent {
+             recurrent.add_slab()?;
+         }
+         let mut history = Vec::with_capacity(stored.len());
+         let mut domains = Vec::with_capacity(stored.len());
+-        for domain in stored {
++        for (domain, owner) in stored.into_iter().zip(history_owners.iter().copied()) {
+             let geometry = domain.geometry;
+             let mut slabs = SlabTensor::new(
+-                &device,
++                &devices[owner],
+                 geometry.slab_rows as u64,
+                 domain.logical_rows as u64,
+                 domain
+@@ -1538,7 +1550,9 @@
+             });
+         }
+         let store = Rc::new(Self {
+-            device,
++            devices,
++            history_owners,
++            component_owners,
+             context_capacity,
+             domains,
+             shared,
+@@ -1566,6 +1580,12 @@
+             StoreBindings { store },
+         ))
+     }
++    fn same_physical_placement(&self, other: &Self) -> bool {
++        self.devices.len() == other.devices.len()
++            && self.devices.iter().zip(&other.devices).all(|(left,right)| Rc::ptr_eq(left,right))
++            && self.history_owners == other.history_owners
++            && self.component_owners == other.component_owners
++    }
+     pub fn component_specs(&self) -> &[ComponentSpec] {
+         &self.component_specs
+     }
+@@ -1619,7 +1639,19 @@
+             + backing
+                 .recurrent
+                 .as_ref()
+-                .map_or(0, SlabTensor::storage_bytes)
++                .map_or(0, RecurrentSlabs::storage_bytes)
++    }
++
++    /// Physical backing and pristine bank bytes, independently per owner.
++    pub fn backing_by_owner(&self) -> Vec<(u64,u64)> {
++        let mut bytes=vec![(0,0);self.devices.len()];
++        let backing=self.backing.borrow();
++        for (history,&owner) in backing.history.iter().zip(&self.history_owners) {
++            bytes[owner].0+=history.slabs.storage_bytes();
++        }
++        if let Some(recurrent)=&backing.recurrent { for (owner,n) in recurrent.storage_by_owner() { bytes[owner].0+=n; } }
++        for (spec,&owner) in self.component_specs.iter().zip(&self.component_owners) { bytes[owner].1+=spec.bytes().expect("validated component bytes") as u64; }
++        bytes
+     }
+ 
+     /// Whether a released slab might still be charged through an outside view.
+@@ -1643,7 +1675,7 @@
+                 backing
+                     .recurrent
+                     .iter()
+-                    .flat_map(SlabTensor::slab_storage_observers),
++                    .flat_map(RecurrentSlabs::slab_storage_observers),
+             )
+             .map(|storage| storage.identity())
+             .collect::<BTreeSet<_>>();
+@@ -1968,7 +2000,7 @@
+         let bank_bytes = backing
+             .recurrent
+             .as_ref()
+-            .map_or(0, SlabTensor::slab_bytes)
++            .map_or(0, RecurrentSlabs::slab_bytes)
+             .checked_mul(bank_slabs as u64)
+             .ok_or_else(|| Error::Request("bank slab claim overflows".into()))?;
+         history_bytes
+@@ -2103,7 +2135,7 @@
+         E: From<Error>,
+         F: FnMut(&SlabTensor, StoreCopy) -> Result<(), E>,
+     {
+-        let before = self.device.memory_usage().charged;
++        let before = self.devices.iter().map(|device| device.memory_usage().charged).sum::<u64>();
+         let backing = self.backing.borrow();
+         // Each stored domain plans against its own published arena.
+         let history_plans = self
+@@ -2221,10 +2253,9 @@
+                 .recurrent
+                 .as_ref()
+                 .expect("recurrent layout has slabs");
+-            copy(
+-                slabs,
+-                self.bank_copy_plan(slabs, &bank_moves).map_err(E::from)?,
+-            )?;
++            for physical in &slabs.groups {
++                copy(physical, self.bank_copy_plan(physical, &bank_moves).map_err(E::from)?)?;
++            }
+         }
+         drop(backing);
+ 
+@@ -2269,16 +2300,11 @@
+                 .filter(|index| !bank_keep.contains(index))
+                 .collect::<Vec<_>>();
+             for index in victims {
+-                if let Some(observer) = slabs
+-                    .free_slab(index)
+-                    .map_err(Error::from)
+-                    .map_err(E::from)?
+-                {
+-                    let start = index * self.bank_slab_banks;
+-                    let end = (start + self.bank_slab_banks).min(reserved);
+-                    self.banks.mark_slab_unavailable(start, end);
+-                    self.record_retired_storage(observer);
+-                }
++                let observers = slabs.free_slab(index).map_err(Error::from).map_err(E::from)?;
++                let start = index * self.bank_slab_banks;
++                let end = (start + self.bank_slab_banks).min(reserved);
++                self.banks.mark_slab_unavailable(start, end);
++                for observer in observers { self.record_retired_storage(observer); }
+             }
+             let extent = slabs
+                 .slabs()
+@@ -2299,7 +2325,7 @@
+                 banks: stats.banks + bank_moves.len(),
+             });
+         }
+-        Ok(before.saturating_sub(self.device.memory_usage().charged))
++        Ok(before.saturating_sub(self.devices.iter().map(|device| device.memory_usage().charged).sum::<u64>()))
+     }
+ 
+     #[cfg(test)]
+@@ -2550,7 +2576,7 @@
+         if !self.idle() {
+             return Ok(0);
+         }
+-        let before = self.device.memory_usage().charged;
++        let before = self.devices.iter().map(|device| device.memory_usage().charged).sum::<u64>();
+         let mut backing = self.backing.borrow_mut();
+         for (domain, history) in self.domains.iter().zip(&mut backing.history) {
+             self.history_views.borrow_mut().take();
+@@ -2570,7 +2596,7 @@
+                 Arena::new(0, domain.slab_rows, domain.page_rows);
+         }
+         drop(backing);
+-        usize::try_from(before.saturating_sub(self.device.memory_usage().charged))
++        usize::try_from(before.saturating_sub(self.devices.iter().map(|device| device.memory_usage().charged).sum::<u64>()))
+             .map_err(|_| Error::Request("reclaimable history bytes exceed host range".into()))
+     }
+     pub fn create(self: &Rc<Self>) -> Result<SequenceState, Error> {
+--- /dev/null
++++ b/inference/engine/state/src/physical.rs
+@@ -0,0 +1,82 @@
++//! One logical bank numbering backed by independently owned physical slabs.
++use crate::{ComponentSpec, Error};
++use seismic::{Device, Slab, SlabRegion, SlabTensor, Tensor, TensorStorageObserver};
++use std::rc::Rc;
++
++pub(crate) struct RecurrentSlabs {
++    pub groups: Vec<SlabTensor>,
++    components: Vec<(usize, usize)>,
++    owners: Vec<usize>,
++}
++impl RecurrentSlabs {
++    pub fn new(devices: &[Rc<Device>], owners: &[usize], specs: &[ComponentSpec],
++               slab_banks: u64, banks: u64) -> Result<Self, Error> {
++        if owners.len() != specs.len() { return Err(Error::Request("recurrent physical owners differ from the component topology".into())); }
++        let mut regions = vec![Vec::new(); devices.len()];
++        let mut addresses = Vec::with_capacity(specs.len());
++        for (&owner, spec) in owners.iter().zip(specs) {
++            let group = regions.get_mut(owner).ok_or_else(|| Error::Request("recurrent physical owner is absent".into()))?;
++            addresses.push((owner, group.len()));
++            group.push(SlabRegion { element: super::element(spec.dtype),
++                row_shape: spec.shape.iter().map(|&size| size as u64).collect() });
++        }
++        let mut groups = Vec::new();
++        let mut physical_owners=Vec::new();
++        let mut indices = vec![None; devices.len()];
++        for (owner, regions) in regions.into_iter().enumerate() {
++            if regions.is_empty() { continue; }
++            indices[owner] = Some(groups.len());
++            physical_owners.push(owner);
++            groups.push(SlabTensor::new(&devices[owner], slab_banks, banks, regions)?);
++        }
++        let components = addresses.into_iter().map(|(owner, region)|
++            (indices[owner].expect("a component has a physical group"), region)).collect();
++        Ok(Self { groups, components,owners:physical_owners })
++    }
++    pub fn logical_region(&self, index: usize) -> Result<Tensor, seismic::TensorError> {
++        let &(group, region) = self.components.get(index).ok_or_else(||
++            seismic::TensorError::SlabLayout("recurrent component is absent".into()))?;
++        self.groups[group].logical_region(region)
++    }
++    pub fn storage_by_owner(&self) -> impl Iterator<Item=(usize,u64)> + '_ { self.groups.iter().zip(&self.owners).map(|(group,&owner)|(owner,group.storage_bytes())) }
++    pub fn storage_bytes(&self) -> u64 { self.groups.iter().map(SlabTensor::storage_bytes).sum() }
++    pub fn slab_bytes(&self) -> u64 { self.groups.iter().map(SlabTensor::slab_bytes).sum() }
++    pub fn slab_storage_observers(&self) -> impl Iterator<Item=TensorStorageObserver> + '_ {
++        self.groups.iter().flat_map(SlabTensor::slab_storage_observers)
++    }
++    /// All groups publish exactly the same logical bank slabs.
++    pub fn slabs(&self) -> impl Iterator<Item=(usize, &Slab)> {
++        self.groups.first().expect("a recurrent layout has storage").slabs()
++    }
++    pub fn add_slab(&mut self) -> Result<usize, seismic::TensorError> {
++        let mut added: Vec<(usize, usize)> = Vec::new();
++        for group in 0..self.groups.len() {
++            match self.groups[group].add_slab() {
++                Ok(index) => {
++                    if let Some(&(_, first)) = added.first() { assert_eq!(index, first, "physical bank slab numbering diverged"); }
++                    added.push((group,index));
++                }
++                Err(error) => {
++                    for (previous,index) in added.into_iter().rev() {
++                        self.groups[previous].free_slab(index).unwrap_or_else(|rollback|
++                            panic!("physical bank growth failed ({error}); rollback failed ({rollback})"));
++                    }
++                    return Err(error);
++                }
++            }
++        }
++        Ok(added.first().expect("recurrent layout has physical groups").1)
++    }
++    pub fn free_slab(&mut self, index: usize) -> Result<Vec<TensorStorageObserver>, seismic::TensorError> {
++        let mut released = Vec::new();
++        for group in &mut self.groups {
++            match group.free_slab(index) {
++                Ok(Some(observer)) => released.push(observer),
++                Ok(None) => {},
++                Err(error) if released.is_empty() => return Err(error),
++                Err(error) => panic!("physical bank release failed after another group was released: {error}"),
++            }
++        }
++        Ok(released)
++    }
++}
+--- a/inference/seismic/api/src/lib.rs
++++ b/inference/seismic/api/src/lib.rs
+@@ -2274,6 +2274,7 @@
+ }
+ 
+ impl NativeGraphPlan {
++    pub fn device(&self) -> Device { Device { inner: self.inner.device().clone() } }
+     pub fn workspace_bytes(&self) -> u64 {
+         self.inner.workspace_bytes()
+     }
+@@ -2344,6 +2345,7 @@
+ }
+ 
+ impl NativeGraphFamily {
++    pub fn device(&self) -> Device { Device { inner: self.inner.device().clone() } }
+     pub fn new(plans: &[NativeGraphPlan]) -> Result<Self, WorkflowError> {
+         let members = plans
+             .iter()
+@@ -2665,6 +2667,7 @@
+ }
+ 
+ impl<E: Entry> NativeKernel<E> {
++    pub fn device(&self) -> Device { Device { inner:self.inner.device().clone() } }
+     /// Identity of the prepared storage shared by clones and by typed slots.
+     /// Intended for ownership accounting; it has no cross-process meaning.
+     #[doc(hidden)]
+--- a/inference/seismic/runtime/src/api.rs
++++ b/inference/seismic/runtime/src/api.rs
+@@ -1515,6 +1515,7 @@
+     }
+ 
+     impl NativePreparedAny {
++        pub fn device(&self) -> &Arc<DeviceInner> { self.inner.public_device() }
+         pub fn invocation_workspace_bytes(&self) -> u64 {
+             self.inner.invocation_workspace_bytes()
+         }
+--- a/inference/seismic/runtime/src/native/graph.rs
++++ b/inference/seismic/runtime/src/native/graph.rs
+@@ -1386,6 +1386,7 @@
+ }
+ 
+ impl NativeGraphPlan {
++    pub fn device(&self) -> &Arc<DeviceInner> { &self.device }
+     pub fn workspace_bytes(&self) -> u64 {
+         self.scratch_bytes
+     }
+@@ -1578,6 +1579,7 @@
+ }
+ 
+ impl NativeGraphFamily {
++    pub fn device(&self) -> &Arc<DeviceInner> { &self.device }
+     pub fn new(plans: &[Arc<NativeGraphPlan>]) -> Result<Self, WorkflowError> {
+         let first = plans.first().ok_or(WorkflowError::Empty)?;
+         if plans
+--- a/inference/seismic/runtime/src/native/mod.rs
++++ b/inference/seismic/runtime/src/native/mod.rs
+@@ -1022,6 +1022,7 @@
+     /// Device storage this prepared implementation holds for its calls:
+     /// the scalar-result slots, fixed at preparation, and the standalone
+     /// scratch arena, which grows to the largest standalone call's scratch.
++    pub(crate) fn public_device(&self) -> &Arc<DeviceInner> { &self.public_device }
+     pub(crate) fn invocation_workspace_bytes(&self) -> u64 {
+         self.scalar_bytes
+             + self

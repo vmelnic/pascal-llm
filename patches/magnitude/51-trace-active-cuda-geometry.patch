@@ -1,0 +1,22 @@
+--- a/inference/seismic/runtime/src/native/cuda.rs
++++ b/inference/seismic/runtime/src/native/cuda.rs
+@@ -176,6 +176,19 @@
+                 block: launch.threads,
+                 shared_bytes: launch.shared_bytes,
+             });
++            if std::env::var_os("MAGNITUDE_TRACE_CUDA_GEOMETRY").is_some()
++                && matches!(dispatch.kernel.name.as_str(),"gated_delta_step"|"attention_project"|"draft_rows") {
++                if let Some(launch)=&launch {
++                    static SEEN:std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>=std::sync::OnceLock::new();
++                    let dimensions=dispatch.kernel.logical.schema().dimensions().len();
++                    let mapped=buffers.iter().enumerate().filter_map(|(index,(allocation,offset))| {
++                        let buffer=typed_buffer::<Cuda,Executor>(allocation);
++                        buffer.mapped_host_pointer().map(|_|(index,buffer.len(),*offset))
++                    }).collect::<Vec<_>>();
++                    let line=format!("magnitude-cuda-geometry entry={} launch={function} dims={:?} grid={:?} block={:?} shared={} params={:?} mapped={mapped:?}",dispatch.kernel.name,&dispatch.words[..dimensions],launch.grid,launch.block,launch.shared_bytes,dispatch.kernel.specialization.launch_params());
++                    if SEEN.get_or_init(Default::default).lock().expect("CUDA geometry diagnostic lock poisoned").insert(line.clone()) {eprintln!("{line}");}
++                }
++            }
+             visit(&dispatch,function,&buffers,launch.as_ref())?;
+         }
+     }

@@ -1,0 +1,283 @@
+--- a/inference/engine/executor/src/native/tuning/mod.rs
++++ b/inference/engine/executor/src/native/tuning/mod.rs
+@@ -1389,6 +1389,11 @@
+         let defaults = implementation
+             .default_specialization(statics)
+             .map_err(|error| failure(error.to_string()))?;
++        // Preserve authored arithmetic while qualifying exact implementation
++        // changes. No model-specific path or stored tuning choice is involved.
++        if std::env::var_os("MAGNITUDE_NATIVE_REFERENCE").is_some_and(|value| value == "1") {
++            return Ok(defaults);
++        }
+         let shapes = self.shapes(case);
+         if shapes.is_empty() {
+             return Err(failure("the engine's bounds admit no tuning point".into()));
+--- a/inference/engine/kernels/kernels/attention.seismic
++++ b/inference/engine/kernels/kernels/attention.seismic
+@@ -324,9 +324,9 @@
+     static (D, Q, GR, K, V)
+     params (code arithmetic INT8 in [0, 1])
+     where D % 64 == 0
+-    scratch staged bytes (M * D * 2) when M > 1
++    scratch staged bytes (M * D * 2) when M > 0
+     scratch groups bytes (M * D / 4) when INT8 == 1 and M > 16 and M <= 64
+-    launch attention_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
++    launch attention_project_stage when M > 0 and (M <= 16 or M > 64 or INT8 == 0):
+         threadgroups (M, 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch attention_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+@@ -336,7 +336,6 @@
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes ((1 - min(1, M - 1)) * D * 2)
+     launch attention_project_gemv16 when M > 8 and M <= 16:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+--- a/inference/engine/kernels/kernels/cuda/attention_project.cu
++++ b/inference/engine/kernels/kernels/cuda/attention_project.cu
+@@ -1,8 +1,8 @@
+ // attention_project: RMS prologue over the F32 hidden rows, then one
+ // segmented projection query | gate | key | value, each segment with its own
+ // representation and result (a segment of zero rows has no blocks). GEMV for
+-// M <= 16 (`gemv` to 8 rows, `gemv16` beyond; at M = 1 the block forms the A
+-// row in shared memory, else `stage` forms the A rows first), GEMM otherwise:
++// M <= 16 (`gemv` to 8 rows, `gemv16` beyond; `stage` forms the A rows once,
++// including M = 1), GEMM otherwise:
+ // `gemm_small` to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged by
+ // `stage_s8`), `gemm` beyond (A rows).
+ #define KERNEL_W0 SEISMIC_QUERY_WEIGHT
+--- a/inference/engine/kernels/kernels/cuda/dense_expand.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_expand.cu
+@@ -1,8 +1,8 @@
+ // dense_expand: RMS prologue over the `out_rows` rows of the F32
+ // residual, paired gate/up projection, act(gate) * up epilogue (`activation`:
+ // SiLU or GELU-tanh). GEMV for
+-// O <= 16 (`gemv` to 8 rows, `gemv16` beyond; at O = 1 the block forms the A
+-// row in shared memory, else `stage` forms the A rows first), GEMM otherwise:
++// O <= 16 (`gemv` to 8 rows, `gemv16` beyond; `stage` forms the A rows once,
++// including O = 1), GEMM otherwise:
+ // `gemm_small` to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged
+ // by `stage_s8`), `gemm` beyond (A rows). The declaration launches one of
+ // them.
+--- a/inference/engine/kernels/kernels/cuda/dense_up.cu
++++ b/inference/engine/kernels/kernels/cuda/dense_up.cu
+@@ -1,8 +1,8 @@
+ // dense_up: RMS prologue over the `out_rows` rows of the F32 residual, the up
+ // projection, A(act(A(up))) (`activation`: ReLU²). `dense_expand`'s bands
+ // with one weight stream: GEMV for O <= 16 (`gemv` to 8 rows, `gemv16`
+-// beyond; at O = 1 the block forms the A row in shared memory, else `stage`
+-// forms the A rows first), GEMM otherwise (`gemm_small` to 64 rows with the
++// beyond; `stage` forms the A rows once, including O = 1), GEMM otherwise
++// (`gemm_small` to 64 rows with the
+ // INT8 candidate's q8_1 rows from `stage_s8`, `gemm` beyond).
+ #define KERNEL_W0 SEISMIC_UP_WEIGHT
+ #include "lib/projection/projection.cuh"
+--- a/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
++++ b/inference/engine/kernels/kernels/cuda/gated_delta_project.cu
+@@ -1,8 +1,8 @@
+ // gated_delta_project: RMS prologue over the F32 hidden rows, then one
+ // segmented projection qkv | z | alpha | beta into the columns of the A-typed
+ // result, each segment with its own representation. GEMV for M <= 16 (`gemv`
+-// to 8 rows, `gemv16` beyond; at M = 1 the block forms the A row in shared
+-// memory, else `stage` forms the A rows first), GEMM otherwise: `gemm_small`
++// to 8 rows, `gemv16` beyond; `stage` forms the A rows once, including M = 1),
++// GEMM otherwise: `gemm_small`
+ // to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged by
+ // `stage_s8`), `gemm` beyond (A rows).
+ #define KERNEL_W0 SEISMIC_QKV_WEIGHT
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -16,8 +16,8 @@
+ // so rows 1..GEMV_ROWS of one request match M = 1 bit for bit.
+ //
+ // Rows. A prologue that is not a plain read of A forms its rows with
+-// `form_row` (the staging launch into global scratch, or at M = 1 the GEMV
+-// block itself into its shared memory), so every path reads the same A rows.
++// `form_row` once into global staging, including M = 1, so every path reads
++// the same A rows without repeating normalization in every GEMV block.
+ //
+ // GEMV (M <= GEMV_ROWS = 16): swap-AB. The 16 weight rows of a tile are the A
+ // operand, the M activation rows the N = 8 columns of NB column blocks (NB 1
+@@ -1507,22 +1507,16 @@
+ }
+ 
+ // The GEMV activation source. A prologue read in place is its own source.
+-// Any other prologue's rows are the staging launch's A rows, except at M = 1,
+-// where the whole GEMV block forms its row into `row` (its dynamic shared
+-// memory, K A elements) instead of waiting for a staging launch. `make` is
+-// block-collective.
++// Every other prologue reads the staging launch's A rows, including M = 1.
++// This forms normalization once and leaves GEMV shared memory for reduction.
+ template <bool STAGED, class Pro> struct GemvSourceOf {
+     using type = Pro;
+     __device__ static __forceinline__ type make(const Pro &pro, u8 *, u32, u64, const u8 *) { return pro; }
+ };
+ template <class Pro> struct GemvSourceOf<true, Pro> {
+     using type = Plain<Act, AllRows>;
+-    __device__ static __forceinline__ type make(const Pro &pro, u8 *row, u32 M, u64 K, const u8 *staged) {
+-        if (M > 1)
+-            return type{staged, K, AllRows{}};
+-        form_row(pro, 0, K, row);
+-        __syncthreads();
+-        return type{row, K, AllRows{}};
++    __device__ static __forceinline__ type make(const Pro &, u8 *, u32, u64 K, const u8 *staged) {
++        return type{staged, K, AllRows{}};
+     }
+ };
+ template <class Pro> using GemvSource = GemvSourceOf<Pro::STAGED, Pro>;
+--- a/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/readout_head_rows.cu
+@@ -2,8 +2,8 @@
+ // vocabulary projection into F32 logits (a K1 projection), scaled by a present
+ // `weight_scale` (static WS = 1) and softcapped from the accumulator when
+ // `softcap` > 0. GEMV for O <= 16
+-// (`gemv` to 8 rows, `gemv16` beyond; at O = 1 the block forms the A row in
+-// shared memory, else `stage` forms the A rows first), GEMM otherwise over
++// (`gemv` to 8 rows, `gemv16` beyond; `stage` forms the A rows once, including
++// O = 1), GEMM otherwise over
+ // the A rows (`gemm_small` to 64 rows, `gemm` beyond; the 16-bit path: head
+ // GEMMs are rare, so the INT8 candidate is not offered).
+ #define KERNEL_W0 SEISMIC_WEIGHT
+--- a/inference/engine/kernels/kernels/cuda_dense.seismic
++++ b/inference/engine/kernels/kernels/cuda_dense.seismic
+@@ -23,15 +23,16 @@
+ # split up to 128 rows. Staging launches form the rows a launch does not read in
+ # place: `stage` a normalized input's A rows (at O = 1 the GEMV block forms
+ # its row in its shared memory instead), `stage_s8` the INT8 candidate's q8_1
+-# rows plus (d, d * sum q) groups.
++# rows plus (d, d * sum q) groups. All GEMV rows now use the staging launch,
++# including O = 1; the repeated shared-memory normalization is removed.
+ 
+ native dense_expand for cuda from "cuda/dense_expand.cu":
+     static (H, F, GS, US)
+     params (code arithmetic INT8 in [0, 1])
+     where H % 64 == 0 and GS <= 1 and US <= 1
+-    scratch staged bytes (O * H * 2) when O > 1
++    scratch staged bytes (O * H * 2) when O > 0
+     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16 and O <= 64
+-    launch dense_expand_stage when O > 1 and (O <= 16 or O > 64 or INT8 == 0):
++    launch dense_expand_stage when O > 0 and (O <= 16 or O > 64 or INT8 == 0):
+         threadgroups (O, 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_expand_stage_s8 when INT8 == 1 and O > 16 and O <= 64:
+@@ -41,7 +42,6 @@
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes ((1 - min(1, O - 1)) * H * 2)
+     launch dense_expand_gemv16 when O > 8 and O <= 16:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+@@ -63,9 +63,9 @@
+     static (H, F, US)
+     params (code arithmetic INT8 in [0, 1])
+     where H % 64 == 0 and US <= 1
+-    scratch staged bytes (O * H * 2) when O > 1
++    scratch staged bytes (O * H * 2) when O > 0
+     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16 and O <= 64
+-    launch dense_up_stage when O > 1 and (O <= 16 or O > 64 or INT8 == 0):
++    launch dense_up_stage when O > 0 and (O <= 16 or O > 64 or INT8 == 0):
+         threadgroups (O, 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch dense_up_stage_s8 when INT8 == 1 and O > 16 and O <= 64:
+@@ -75,7 +75,6 @@
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes ((1 - min(1, O - 1)) * H * 2)
+     launch dense_up_gemv16 when O > 8 and O <= 16:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
+@@ -98,9 +97,9 @@
+     static (H, CH, BS, CS, XS)
+     params (code arithmetic INT8 in [0, 1])
+     where H % 64 == 0 and BS <= 1 and CS <= 1 and XS <= 1
+-    scratch staged bytes (M * H * 2) when M > 1
++    scratch staged bytes (M * H * 2) when M > 0
+     scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16 and M <= 64
+-    launch short_conv_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
++    launch short_conv_project_stage when M > 0 and (M <= 16 or M > 64 or INT8 == 0):
+         threadgroups (M, 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch short_conv_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+@@ -110,7 +109,6 @@
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(2 * ceil_div(CH, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes ((1 - min(1, M - 1)) * H * 2)
+     launch short_conv_project_gemv16 when M > 8 and M <= 16:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(2 * ceil_div(CH, 16), 8 / KSPLIT), 1, 1)
+--- a/inference/engine/kernels/kernels/readout.seismic
++++ b/inference/engine/kernels/kernels/readout.seismic
+@@ -100,23 +100,22 @@
+         threadgroups (ceil_div(V, TILE_N), ceil_div(O, TILE_M), 1)
+         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+ 
+-# CUDA: the GEMV up to 16 rows (`gemv` to 8, `gemv16` beyond; at O = 1 the
+-# block forms its normalized row in shared memory, else `stage` forms the
+-# rows), the 16-bit GEMM beyond in the K1 row bands (`gemm_small` to 64 rows,
++# CUDA: the GEMV up to 16 rows (`gemv` to 8, `gemv16` beyond; stage forms
++# every normalized row once, including O = 1), the 16-bit GEMM beyond in
++# the K1 row bands (`gemm_small` to 64 rows,
+ # `gemm` beyond; see `cuda_dense.seismic`). (Metal: GEMV, batched GEMV, GEMM
+ # row classes.)
+ native readout_head_rows for cuda from "cuda/readout_head_rows.cu":
+     static (V, D, WS)
+     where D % 64 == 0 and WS <= 1
+-    scratch staged bytes (O * D * 2) when O > 1
+-    launch readout_head_rows_stage when O > 1:
++    scratch staged bytes (O * D * 2) when O > 0
++    launch readout_head_rows_stage when O > 0:
+         threadgroups (O, 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch readout_head_rows_gemv when O <= 8:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes ((1 - min(1, O - 1)) * D * 2)
+     launch readout_head_rows_gemv16 when O > 8 and O <= 16:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+@@ -592,4 +591,4 @@
+     launch readout_planes_rows_scan:
+         params (WARPS in [8, 4, 2], code ROWS in [2, 1, 4])
+         threadgroups (ceil_div(V, WARPS * ROWS), ceil_div(O, 8), 1)
+-        threads_per_threadgroup (WARPS * 32, 1, 1)
+\ No newline at end of file
++        threads_per_threadgroup (WARPS * 32, 1, 1)
+--- a/inference/engine/kernels/kernels/recurrent.seismic
++++ b/inference/engine/kernels/kernels/recurrent.seismic
+@@ -117,18 +117,18 @@
+             + ceil_div(NV * W, 32) + 2 * ceil_div(NV, 32), ceil_div(M, TALL_M), 1)
+         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
+ 
+-# CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond; at M = 1 the block
+-# forms its A row in shared memory), GEMM beyond in the K1 row bands
++# CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond; stage forms every row
++# once, including M = 1), GEMM beyond in the K1 row bands
+ # (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond; see
+-# `cuda_dense.seismic`); `stage` forms the A rows for M > 1, `stage_s8` the
++# `cuda_dense.seismic`); `stage` forms all A rows, `stage_s8` the
+ # q8_1 rows for the INT8 GEMM. (Metal: batched GEMV class, no INT8 path.)
+ native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
+     static (H, NK, NV, W)
+     params (code arithmetic INT8 in [0, 1])
+     where H % 64 == 0
+-    scratch staged bytes (M * H * 2) when M > 1
++    scratch staged bytes (M * H * 2) when M > 0
+     scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16 and M <= 64
+-    launch gated_delta_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
++    launch gated_delta_project_stage when M > 0 and (M <= 16 or M > 64 or INT8 == 0):
+         threadgroups (M, 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+     launch gated_delta_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+@@ -139,7 +139,6 @@
+         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)
+             + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
+         threads_per_threadgroup (256, 1, 1)
+-        shared_bytes ((1 - min(1, M - 1)) * H * 2)
+     launch gated_delta_project_gemv16 when M > 8 and M <= 16:
+         params (code arithmetic KSPLIT in [4, 2, 8])
+         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16)

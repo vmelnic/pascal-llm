@@ -1,0 +1,293 @@
+diff --git a/design/icn/calibration-model-assessment.md b/design/icn/calibration-model-assessment.md
+--- a/design/icn/calibration-model-assessment.md
++++ b/design/icn/calibration-model-assessment.md
+@@ -60,6 +60,11 @@
+ - the process memory limits that bound stable fit capacity;
+ - the reserve policy (`MemoryReserves`) and the engine serving configuration.
+ 
++An explicitly selected history codec and speculative proposal width are immutable inputs to
++the serving policy. Assessment and load resolution receive that same policy; artifact method
++selection changes only the method. Numerical-policy changes invalidate the assessment environment
++and cannot reuse configurations resolved under another policy.
++
+ Any change is new work. Old results are unreachable by identity; there is no migration.
+ 
+ ## Model assessment
+diff --git a/design/icn/lifecycle.md b/design/icn/lifecycle.md
+--- a/design/icn/lifecycle.md
++++ b/design/icn/lifecycle.md
+@@ -208,7 +208,8 @@
+ 
+ The launch configuration contains only process-lifetime facts: binary resolution policy, loopback
+ binding, model-store and cache roots, optional read-only import/source roots, startup and shutdown
+-deadlines, output bounds, authentication/instance identity, and compatible API/build identity.
++deadlines, output bounds, authentication/instance identity, compatible API/build identity, and an immutable engine
++numerical policy used consistently by assessment and loading.
+ It must be validated before spawning.
+ 
+ The model store and disposable cache are separate roots. In the managed product layout, authoritative
+diff --git a/inference/service/server/examples/catalog_assessment.rs b/inference/service/server/examples/catalog_assessment.rs
+--- a/inference/service/server/examples/catalog_assessment.rs
++++ b/inference/service/server/examples/catalog_assessment.rs
+@@ -98,6 +98,7 @@
+     let services = managed_model_services(resolver.clone(), downloads, Arc::new(NoCatalogEffects), Arc::new(NoCatalogEffects))?;
+     let environment = Arc::new(AssessmentEnvironment::establish(
+         &seismic::DeviceCatalog::discover()?,
++        magnitude_engine::options::ModelPolicy::default(),
+     )?);
+     let environment_established = started.elapsed();
+     let assessor = Arc::new(ModelAssessor::new(inventory, resolver, release, environment));
+diff --git a/inference/service/server/examples/residency_lifecycle.rs b/inference/service/server/examples/residency_lifecycle.rs
+--- a/inference/service/server/examples/residency_lifecycle.rs
++++ b/inference/service/server/examples/residency_lifecycle.rs
+@@ -109,6 +109,7 @@
+         inventory.clone(),
+         inventory.derived_cache().kernel_directory(),
+         reserves,
++        magnitude_engine::options::ModelPolicy::default(),
+     ));
+     let harness = |idle_timeout: Duration, namespace: &str| {
+         let instances = ModelInstances::start(ResidencyEnvironment {
+diff --git a/inference/service/server/src/assessment/catalog_kernels_tests.rs b/inference/service/server/src/assessment/catalog_kernels_tests.rs
+--- a/inference/service/server/src/assessment/catalog_kernels_tests.rs
++++ b/inference/service/server/src/assessment/catalog_kernels_tests.rs
+@@ -9,9 +9,8 @@
+ //! `MAGNITUDE_REQUIRE_KERNEL_FORMATION=1` (set by CI) makes either a failure.
+ 
+ use super::assessor::engine_material;
+-use super::environment::serving_policy;
+ use magnitude_engine::assessment::{KernelInventory, kernel_inventory};
+-use magnitude_engine::options::standard_service_limits;
++use magnitude_engine::options::{ModelPolicy, standard_service_limits};
+ use magnitude_service_contracts::models::CatalogSupport;
+ use magnitude_service_models::{load_release_catalog, servable_model_bundle_key_for_bundle};
+ use seismic::coverage::{CoverageError, RequestFormer};
+@@ -52,7 +51,7 @@
+         let package = engine_material(&resolved).expect("a catalog bundle has engine material");
+         let inventory = kernel_inventory(
+             &package,
+-            &serving_policy(),
++            &ModelPolicy::default(),
+             &standard_service_limits(),
+             backend,
+         )
+diff --git a/inference/service/server/src/assessment/environment.rs b/inference/service/server/src/assessment/environment.rs
+--- a/inference/service/server/src/assessment/environment.rs
++++ b/inference/service/server/src/assessment/environment.rs
+@@ -12,11 +12,6 @@
+ use serde_json::json;
+ use sha2::{Digest, Sha256};
+ 
+-/// The engine configuration the service loads and assesses every model with.
+-pub fn serving_policy() -> ModelPolicy {
+-    ModelPolicy::default()
+-}
+-
+ pub struct AssessmentEnvironment {
+     pub id: AssessmentEnvironmentId,
+     pub setup: AssessmentSetup,
+@@ -25,12 +20,12 @@
+ impl AssessmentEnvironment {
+     /// Select the device a native load selects, resolve its bandwidth, observe the host and
+     /// derive the environment's identity. Opens no device.
+-    pub fn establish(catalog: &DeviceCatalog) -> Result<Self, ModelAssessmentError> {
++    pub fn establish(catalog: &DeviceCatalog, policy: ModelPolicy) -> Result<Self, ModelAssessmentError> {
+         let setup = AssessmentSetup::discover(
+             catalog,
+             DeviceRequest::Automatic,
+             MemoryReserves::standard(),
+-            serving_policy(),
++            policy,
+             standard_service_limits(),
+         )?;
+         let bandwidth = setup.bandwidth;
+diff --git a/inference/service/server/src/configurations.rs b/inference/service/server/src/configurations.rs
+--- a/inference/service/server/src/configurations.rs
++++ b/inference/service/server/src/configurations.rs
+@@ -27,7 +27,6 @@
+ };
+ 
+ use crate::assessment::assessor::engine_material;
+-use crate::assessment::environment::serving_policy;
+ 
+ /// Resolved configurations kept for reuse. A resolution holds the model's tokenizer and
+ /// templates, so only the few most recently used models are kept.
+@@ -53,6 +52,8 @@
+     models: Arc<ManagedModelStore>,
+     kernel_directory: PathBuf,
+     reserves: MemoryReserves,
++    /// Immutable for this cache lifetime; assessment receives the same policy.
++    policy: ModelPolicy,
+     entries: Mutex<VecDeque<(ServableModelBundleKey, Entry)>>,
+ }
+ 
+@@ -61,11 +62,13 @@
+         models: Arc<ManagedModelStore>,
+         kernel_directory: PathBuf,
+         reserves: MemoryReserves,
++        policy: ModelPolicy,
+     ) -> Self {
+         Self {
+             models,
+             kernel_directory,
+             reserves,
++            policy,
+             entries: Mutex::new(VecDeque::new()),
+         }
+     }
+@@ -138,6 +141,7 @@
+             engine_material(&material)?,
+             self.kernel_directory.clone(),
+             self.reserves,
++            &self.policy,
+         );
+         let resolved = crate::spawn_blocking_traced(move || configuration.resolve())
+             .await
+@@ -160,6 +164,7 @@
+     package: ModelPackagePaths,
+     kernel_directory: PathBuf,
+     reserves: MemoryReserves,
++    policy: &ModelPolicy,
+ ) -> EngineConfiguration {
+     EngineConfiguration {
+         package: PackageOptions {
+@@ -172,7 +177,7 @@
+         },
+         model: ModelPolicy {
+             method: package.method,
+-            ..serving_policy()
++            ..policy.clone()
+         },
+         context_tokens: None,
+         service: standard_service_limits(),
+@@ -257,6 +262,29 @@
+         }
+     }
+ 
++    #[test]
++    fn explicit_history_policy_survives_package_resolution() {
++        let policy = ModelPolicy {
++            kv_codec: magnitude_engine::options::KvCodec::DenseF16,
++            mtp_proposals: Some(10),
++            ..ModelPolicy::default()
++        };
++        let configuration = engine_configuration(
++            ModelPackagePaths {
++                target: PathBuf::from("target.gguf"),
++                projector: None,
++                draft: None,
++                method: ModelMethod::Mtp,
++            },
++            PathBuf::from("kernels"),
++            MemoryReserves::standard(),
++            &policy,
++        );
++        assert_eq!(configuration.model.kv_codec, policy.kv_codec);
++        assert_eq!(configuration.model.mtp_proposals, Some(10));
++        assert_eq!(configuration.model.method, ModelMethod::Mtp);
++    }
++
+     /// A speculative bundle serves its declared separate draft; a declared
+     /// method the draft does not implement refuses the bundle instead of
+     /// serving its target plain.
+@@ -268,6 +296,7 @@
+             material(ModelMethod::DSpark),
+             kernels.clone(),
+             MemoryReserves::standard(),
++            &ModelPolicy::default(),
+         )
+         .resolve()
+         .unwrap();
+@@ -281,7 +310,7 @@
+ 
+         for method in [ModelMethod::DFlash, ModelMethod::DFlash2] {
+             let Err(error) =
+-                engine_configuration(material(method), kernels.clone(), MemoryReserves::standard())
++                engine_configuration(material(method), kernels.clone(), MemoryReserves::standard(), &ModelPolicy::default())
+                     .resolve()
+             else {
+                 panic!("{method:?} resolved over a DSpark draft")
+diff --git a/inference/service/server/src/main.rs b/inference/service/server/src/main.rs
+--- a/inference/service/server/src/main.rs
++++ b/inference/service/server/src/main.rs
+@@ -5,6 +5,7 @@
+ use anyhow::Context;
+ use clap::{Parser, Subcommand};
+ use magnitude_executor::platform::MemoryReserves;
++use magnitude_engine::options::{KvCodec, ModelPolicy};
+ use magnitude_service_api::{AppState, ServerIdentity, app};
+ use magnitude_service_contracts::bootstrap_protocol::{IcnStartupRecord, IcnStartupRecordType};
+ use magnitude_service_models::{
+@@ -67,6 +68,12 @@
+         /// Additional read-only Hugging Face hub cache roots.
+         #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
+         hf_caches: Vec<PathBuf>,
++        /// Explicit history codec, independently of activation precision.
++        #[arg(long, default_value = "affine-k8v4")]
++        kv_codec: KvCodec,
++        /// Explicit speculative proposal width; resolved against each model.
++        #[arg(long)]
++        mtp_proposals: Option<u8>,
+         /// Verified release or prepared development installation.
+         #[arg(long)]
+         installation: PathBuf,
+@@ -121,6 +128,8 @@
+             model_store,
+             cache_root,
+             hf_caches,
++            kv_codec,
++            mtp_proposals,
+             installation,
+         } => {
+             let installation = installation::Installation::load(&installation)
+@@ -128,6 +137,7 @@
+             let release_catalog = Arc::new(open_installation_catalog(&installation)?);
+             let worker_launcher = WorkerLauncher::current()?;
+             let reserves = MemoryReserves::standard();
++            let model_policy = ModelPolicy { kv_codec, mtp_proposals, ..ModelPolicy::default() };
+             let catalog = Arc::new(
+                 tokio::task::spawn_blocking(seismic::DeviceCatalog::discover)
+                     .await
+@@ -138,8 +148,9 @@
+             // discovered devices: selection, host memory and bandwidth.
+             let assessment_environment = {
+                 let catalog = Arc::clone(&catalog);
++                let policy = model_policy.clone();
+                 Arc::new(
+-                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog))
++                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog, policy))
+                         .await
+                         .context("assessment environment task failed")?
+                         .context("failed to establish the assessment environment")?,
+@@ -186,6 +197,7 @@
+                     inventory.clone(),
+                     kernel_directory,
+                     reserves,
++                    model_policy,
+                 )),
+                 host_memory: Arc::new(SeismicHostMemory::new(catalog.clone())),
+                 catalog: catalog.clone(),
+@@ -302,6 +314,23 @@
+     use super::*;
+ 
+     #[test]
++    fn explicit_numerical_policy_parses_without_starting_a_service() {
++        let command = Cli::try_parse_from([
++            "magnitude-inference", "serve", "--installation", "/tmp/installation.json",
++            "--kv-codec", "dense-f16", "--mtp-proposals", "10",
++        ]).unwrap().command;
++        let Command::Serve { kv_codec, mtp_proposals, .. } = command else {
++            panic!("expected serve command");
++        };
++        assert_eq!(kv_codec, KvCodec::DenseF16);
++        assert_eq!(mtp_proposals, Some(10));
++        assert!(Cli::try_parse_from([
++            "magnitude-inference", "serve", "--installation", "/tmp/installation.json",
++            "--kv-codec", "unknown-codec",
++        ]).is_err());
++    }
++
++    #[test]
+     fn inventory_flag_aliases_parse() {
+         let aliases = Cli::try_parse_from([
+             env!("CARGO_BIN_NAME"),

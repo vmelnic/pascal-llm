@@ -1,0 +1,27 @@
+diff --git a/design/inference/engine/execution-plan.md b/design/inference/engine/execution-plan.md
+--- a/design/inference/engine/execution-plan.md
++++ b/design/inference/engine/execution-plan.md
+@@ -335,7 +335,10 @@
+ leading draft-vocabulary rows: its drafting classes up to the certified bound run the certified
+ levels over them and the rest the full pass; a certified class serves every drafting row whatever
+ its shaping, since only verification decides what is emitted. MTP verification rows select
+-through the target's certified classes like any other step.
++through the target's certified classes like any other step. Draft-head transactions
++may chain up to 16 proposals, with every admitted width sealed at preparation.
++The selected width determines the recurrent tape and verifier resources; an
++explicit width does not change the stored head depth or target verification.
+ A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
+ tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
+ (the exit tap is the last block's output) into that tap's column block of a draft-input buffer
+diff --git a/inference/engine/executor/src/planning/capabilities.rs b/inference/engine/executor/src/planning/capabilities.rs
+--- a/inference/engine/executor/src/planning/capabilities.rs
++++ b/inference/engine/executor/src/planning/capabilities.rs
+@@ -6,7 +6,7 @@
+ 
+ /// The most proposals one draft-head transaction chains. Every width up to
+ /// the planned maximum has sealed head graphs, so this bounds load work.
+-pub const MAX_DRAFT_PROPOSALS: u8 = 8;
++pub const MAX_DRAFT_PROPOSALS: u8 = 16;
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum PlannedMethod {

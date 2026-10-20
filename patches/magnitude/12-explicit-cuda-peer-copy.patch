@@ -1,0 +1,179 @@
+--- a/design/inference/engine/memory.md
++++ b/design/inference/engine/memory.md
+@@ -26,6 +26,12 @@
+ charge ledger. They remain separate execution devices, but hardware inventory counts their
+ capacity once and presents both backends under that GPU, regardless of model name, device count,
+ or enumeration order. Distinct UUIDs retain distinct domains even when their names match.
++
++A device boundary is an explicit exact-byte transfer between two independently owned and
++charged allocations. The source-read and destination-write rights remain held through physical
++completion, with a stable acquisition order. Native graphs still bind only their own device
++tensors; a transfer never turns remote capacity into local capacity. Unsupported direct links
++are refused rather than silently staged through host memory or converted to another dtype.
+ 
+ ## Who guarantees what
+ 
+--- a/inference/seismic/api/src/lib.rs
++++ b/inference/seismic/api/src/lib.rs
+@@ -758,6 +758,12 @@
+     /// On error the tensor is only partly initialized and must not be used.
+     pub fn write_from_reader(&mut self, reader: &mut dyn std::io::Read) -> Result<(), TensorError> {
+         self.inner.write_from_reader(reader)
++    }
++    /// Copy exact physical bytes from another CUDA device, waiting for all
++    /// conflicting producers/consumers. Both allocations retain their physical
++    /// memory domain; there is no host fallback, dtype conversion or allocation.
++    pub fn copy_from_peer(&mut self, source: &Tensor) -> Result<(), TensorError> {
++        self.inner.copy_from_peer(&source.inner)
+     }
+     pub fn device(&self) -> Device {
+         Device {
+--- a/inference/seismic/backends/cuda/src/driver.rs
++++ b/inference/seismic/backends/cuda/src/driver.rs
+@@ -121,6 +121,9 @@
+     launch_cooperative: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchCooperativeKernel",
+     error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString";
+     optional {
++        device_can_access_peer: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode => "cuDeviceCanAccessPeer",
++        context_enable_peer_access: unsafe extern "system" fn(Handle, c_uint) -> ResultCode => "cuCtxEnablePeerAccess",
++        memcpy_peer_async: unsafe extern "system" fn(u64, Handle, u64, Handle, usize, Handle) -> ResultCode => "cuMemcpyPeerAsync",
+         // Driver API 11.4+: identifies the exposed device, including a MIG
+         // partition, rather than its parent GPU.
+         device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
+@@ -293,6 +296,40 @@
+             driver: &self.driver,
+             previous,
+         })
++    }
++}
++
++/// An explicit synchronous copy between separate physical contexts. The caller
++/// holds source-read and destination-write allocation permits through completion.
++/// The transfer stream is separate from either device's native execution queue.
++pub(crate) fn copy_peer(
++    source: &Context, destination: &Context,
++    source_pointer: u64, destination_pointer: u64, bytes: usize,
++) -> Result<(), DriverError> {
++    let driver = &destination.driver;
++    let missing = |operation| DriverError {
++        operation, code: -1, description: "driver has no peer-copy capability".into(),
++    };
++    let can_access = driver.device_can_access_peer.ok_or_else(|| missing("peer access query"))?;
++    let enable = driver.context_enable_peer_access.ok_or_else(|| missing("peer access enable"))?;
++    let copy = driver.memcpy_peer_async.ok_or_else(|| missing("peer copy"))?;
++    let _current = destination.enter()?;
++    let mut accessible = 0;
++    unsafe {
++        driver.check(can_access(&mut accessible, destination.ordinal, source.ordinal), "peer access query")?;
++        if accessible == 0 {
++            return Err(DriverError {
++                operation: "peer copy", code: -1,
++                description: "the physical devices do not support direct peer access".into(),
++            });
++        }
++        // Recheck the current contexts on every copy. A retained primary
++        // context may have been recreated since an earlier engine lifetime.
++        let result = enable(source.raw, 0);
++        if result != 704 { driver.check(result, "peer access enable")?; }
++        driver.check(copy(destination_pointer, destination.raw, source_pointer,
++                          source.raw, bytes, destination.transfer), "peer copy")?;
++        driver.check((driver.stream_synchronize)(destination.transfer), "peer copy completion")
+     }
+ }
+ 
+--- a/inference/seismic/backends/cuda/src/executor.rs
++++ b/inference/seismic/backends/cuda/src/executor.rs
+@@ -70,6 +70,27 @@
+ 
+     pub(crate) fn stream(&self) -> &Arc<Stream> {
+         &self.stream
++    }
++
++    /// Copy exact bytes between physical CUDA devices. No host staging or
++    /// allocation occurs. Runtime allocation permits order all producers and
++    /// consumers before this synchronous boundary is entered.
++    pub fn copy_from_peer(
++        &self, source: &Device, source_buffer: &Buffer, source_offset: u64,
++        destination_buffer: &Buffer, destination_offset: u64, bytes: u64,
++    ) -> Result<(), ExecutionError> {
++        if self.ordinal() == source.ordinal() {
++            return Err(ExecutionError::SubmissionFailed("peer copy requires distinct physical devices".into()));
++        }
++        let in_bounds = |offset: u64, length: u64| offset.checked_add(bytes).is_some_and(|end| end <= length);
++        if !in_bounds(source_offset, source_buffer.len()) || !in_bounds(destination_offset, destination_buffer.len()) {
++            return Err(ExecutionError::SubmissionFailed("peer copy exceeds its tensor backing".into()));
++        }
++        let bytes = usize::try_from(bytes).map_err(|_| ExecutionError::SubmissionFailed("peer copy exceeds host address range".into()))?;
++        if bytes == 0 { return Ok(()); }
++        crate::driver::copy_peer(&source.context, &self.context,
++            source_buffer.pointer() + source_offset,
++            destination_buffer.pointer() + destination_offset, bytes).map_err(submission_error)
+     }
+ 
+     /// Pinned host memory mapped into the device address space, for inputs
+--- a/inference/seismic/runtime/src/api.rs
++++ b/inference/seismic/runtime/src/api.rs
+@@ -214,6 +214,7 @@
+ /// carry a schema parameter id and therefore are not invocation failures.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum TensorError {
++    DeviceTransfer(String),
+     SlabLayout(String),
+     UnsupportedRepresentation {
+         backend: BackendName,
+@@ -268,6 +269,7 @@
+ impl fmt::Display for TensorError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
++            Self::DeviceTransfer(reason) => write!(f, "device transfer: {reason}"),
+             Self::SlabLayout(reason) => write!(f, "slab layout: {reason}"),
+             Self::UnsupportedRepresentation {
+                 backend,
+@@ -1231,6 +1233,47 @@
+             }
+             Ok(())
+         }
++        /// Exact byte transfer into this canonical, fully backed destination.
++        /// Both allocations keep their physical owner and charge. Foreign tensors
++        /// are never admitted as native graph bindings on the receiving device.
++        pub fn copy_from_peer(&self, source: &Self) -> Result<(), TensorError> {
++            let invalid = |reason: &str| TensorError::DeviceTransfer(reason.into());
++            if self.slabs.is_some() || source.slabs.is_some() {
++                return Err(invalid("peer copy requires contiguous tensor views"));
++            }
++            self.backed()?; source.backed()?;
++            if self.allocation.storage().read_only() {
++                return Err(invalid("destination storage is read-only"));
++            }
++            if self.representation != source.representation || self.extents != source.extents {
++                return Err(invalid("source and destination representation and shape must match"));
++            }
++            let canonical = crate::layout::canonical(self.representation, &self.extents)?;
++            if self.strides != canonical.strides || source.strides != canonical.strides
++                || self.byte_len != canonical.byte_len || source.byte_len != canonical.byte_len {
++                return Err(invalid("peer copy requires canonical contiguous layouts"));
++            }
++            let (crate::backends::OpenedKind::Cuda(source_device), crate::backends::OpenedKind::Cuda(destination_device))
++                = (&source.device.kind, &self.device.kind) else {
++                return Err(invalid("direct peer copy requires two CUDA devices"));
++            };
++            if self.allocation.access_identity() == source.allocation.access_identity() {
++                return Err(invalid("source and destination alias the same access group"));
++            }
++            // Stable lock order prevents opposite-direction transfers from
++            // deadlocking. Host permits wait for all conflicting device fences.
++            let (_first, _second) = if source.allocation.access_identity() < self.allocation.access_identity() {
++                (source.allocation.acquire(false), self.allocation.acquire(true))
++            } else {
++                (self.allocation.acquire(true), source.allocation.acquire(false))
++            };
++            let from = crate::driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(&source.allocation);
++            let to = crate::driver::typed_buffer::<seismic_cuda::Cuda, seismic_cuda::Executor>(&self.allocation);
++            destination_device.service().copy_from_peer(source_device.service(), from,
++                source.byte_offset, to, self.byte_offset, self.byte_len)?;
++            Ok(())
++        }
++
+         pub fn device(&self) -> &Arc<DeviceInner> {
+             &self.device
+         }

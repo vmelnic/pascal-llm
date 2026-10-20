@@ -1,0 +1,41 @@
+--- a/inference/engine/executor/src/native/qualification/helpers.rs
++++ b/inference/engine/executor/src/native/qualification/helpers.rs
+@@ -142,7 +142,11 @@
+                 .value
+         }};
+     }
+-    let activation = binding.activation;
++    let history = if binding.history == magnitude_state::KvCodec::DenseF16 {
++        Element::f16()
++    } else {
++        binding.activation
++    };
+     let mixed = match &kernels.history {
+         AttentionHistoryKernels::Dense {
+             decode, prefill, ..
+@@ -150,12 +154,12 @@
+             (
+                 "attention_decode",
+                 mix!(decode, attention_decode,
+-                    history_key: activation, width, history_value: activation, width),
++                    history_key: history, width, history_value: history, width),
+             ),
+             (
+                 "attention_prefill",
+                 mix!(prefill, attention_prefill,
+-                    history_key: activation, width, history_value: activation, width),
++                    history_key: history, width, history_value: history, width),
+             ),
+         ],
+         AttentionHistoryKernels::AffineK8V4 {
+--- a/inference/engine/executor/src/programs/native_target_graph.rs
++++ b/inference/engine/executor/src/programs/native_target_graph.rs
+@@ -552,7 +552,7 @@
+             peer_families: families,
+             devices: devices.to_vec(),
+             block_owners: owners.to_vec(),
+-            boundary_input: (devices.len()>1).then_some((activation(geometry),[largest_rows,geometry.hidden])),
++            boundary_input: (devices.len()>1).then_some((Element::f32(),[largest_rows,geometry.hidden])),
+             max_output_bytes,
+             blocks: handles.blocks.len(),
+             tap_buffer: tap_width.map(|width| (activation(geometry), [largest_rows, width])),

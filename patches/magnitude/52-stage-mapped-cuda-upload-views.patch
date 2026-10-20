@@ -1,0 +1,136 @@
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -11,7 +11,7 @@
+ pub(super) struct Spec {pub weight_ports:Vec<usize>,pub inputs:Vec<(usize,u64)>,pub constants:Vec<View>,pub outputs:Vec<Output>}
+ fn invalid(message:&str)->CallError {CallError::Execution(ExecutionError::ConstructionContradiction(message.into()))}
+ fn product(xs:&[u64])->Result<u64,CallError> {xs.iter().try_fold(1u64,|a,&b|a.checked_mul(b).ok_or_else(||invalid("projection extent product overflows")))}
+-fn view(dispatch:&Dispatch<'_>,buffer:usize,extents:&[u64],strides:&[u64])->Result<View,CallError> {
++pub(super) fn view(dispatch:&Dispatch<'_>,buffer:usize,extents:&[u64],strides:&[u64])->Result<View,CallError> {
+     let name=dispatch.representations.get(buffer).ok_or_else(||invalid("projection ABI representation is absent"))?;
+     let representation=seismic_lang::registry::representation(name).ok_or_else(||invalid("projection representation is unregistered"))?;
+     let layout=crate::layout::canonical(representation,extents).map_err(|e|CallError::Execution(ExecutionError::ConstructionContradiction(e.to_string())))?;
+@@ -105,7 +105,7 @@
+ }
+ /// One arena per source queue and peer. Graph fork/join plus source-stream
+ /// order serializes frame reuse; different source queues never share a frame.
+-fn scratch(source:&Arc<DeviceInner>,peer:&Arc<DeviceInner>,bytes:u64,builder:&mut DirectGraphBuilder)->Result<Arc<Allocation>,CallError> {
++pub(super) fn scratch(source:&Arc<DeviceInner>,peer:&Arc<DeviceInner>,bytes:u64,builder:&mut DirectGraphBuilder)->Result<Arc<Allocation>,CallError> {
+     let key=source.kind.identity().0;
+     let mut arenas=peer.projection_scratch.lock().expect("projection scratch cache lock poisoned");
+     if let Some(arena)=arenas.get(&key).filter(|arena|arena.bytes()>=bytes) {
+@@ -195,7 +195,7 @@
+         let device=cuda(peer)?;device.enable_peer_reader(source_cuda).map_err(CallError::Execution)?;
+         let module=launch.module.projection_module(device,owner as u64,peers.len() as u64).map_err(CallError::Execution)?;
+         builder.retain(module.clone());
+-        let mut pointers=buffers.iter().map(|(allocation,offset)|typed_buffer::<Cuda,Executor>(allocation).pointer()+offset).collect::<Vec<_>>();
++        let mut pointers=launch.pointer_overrides.map(|p|p.to_vec()).unwrap_or_else(||buffers.iter().map(|(allocation,offset)|typed_buffer::<Cuda,Executor>(allocation).pointer()+offset).collect::<Vec<_>>());
+         let mut copied=Vec::<Arc<Allocation>>::new();let mut input_nodes=Vec::<GraphNode>::new();
+         let remote=peer.info.id!=source.info.id;
+         for view in &spec.constants {
+--- /dev/null
++++ b/inference/seismic/runtime/src/native/cuda/mapped_inputs.rs
+@@ -0,0 +1,80 @@
++//! Exact device-local snapshots of the replay's mutable mapped upload views.
++use super::super::{CallError,DispatchList};
++use crate::driver::{Allocation,typed_buffer};
++use seismic_cuda::{Cuda,Executor};
++use seismic_cuda::direct::{DirectGraphBuilder,DirectLaunch};
++use seismic_lang::entry::ParameterKind;
++use seismic_compiler::errors::ExecutionError;
++
++#[derive(Default)]
++pub(super) struct Inputs {regions:Vec<(u64,u64,u64,u64)>}
++fn invalid(s:&str)->CallError {CallError::Execution(ExecutionError::ConstructionContradiction(s.into()))}
++struct Region<'a> {allocation:&'a Allocation,begin:u64,end:u64}
++impl Inputs {
++    pub(super) fn capture(builder:&mut DirectGraphBuilder,list:&impl DispatchList)->Result<Self,CallError> {
++        if std::env::var("MAGNITUDE_STAGE_CUDA_UPLOADS").ok().as_deref()!=Some("1") {return Ok(Self::default());}
++        let mut source=None;let mut regions=Vec::new();let mut buffers=Vec::new();
++        for index in 0..list.count() {
++            buffers.clear();let dispatch=list.dispatch(index,&mut buffers);
++            source.get_or_insert_with(||dispatch.kernel.public_device.clone());
++            let schema=dispatch.kernel.logical.schema();let mut word=schema.dimensions().len();let mut buffer_index=0;
++            for parameter in schema.parameters() {
++                match &parameter.kind {
++                    ParameterKind::Tensor {axes,..}=>{
++                        let rank=axes.len();let view=super::projection::view(&dispatch,buffer_index,&dispatch.words[word..word+rank],&dispatch.words[word+rank..word+2*rank])?;
++                        word+=2*rank;let (allocation,offset)=buffers[buffer_index];buffer_index+=1;
++                        let buffer=typed_buffer::<Cuda,Executor>(allocation);
++                        if buffer.mapped_host_pointer().is_none() || allocation.storage().read_only() || view.element_bytes==0 || view.extents.contains(&0) {continue;}
++                        let elements=view.extents.iter().zip(&view.strides).try_fold(1u64,|n,(&extent,&stride)| {
++                            (extent-1).checked_mul(stride).and_then(|d|n.checked_add(d)).ok_or_else(||invalid("mapped upload span overflows"))
++                        })?;
++                        let bytes=elements.checked_mul(view.element_bytes).ok_or_else(||invalid("mapped upload bytes overflow"))?;
++                        let end=offset.checked_add(bytes).ok_or_else(||invalid("mapped upload offset overflows"))?;
++                        if end>buffer.len() {return Err(invalid("mapped upload view exceeds backing"));}
++                        regions.push(Region {allocation,begin:offset,end});
++                    }
++                    ParameterKind::Range {..}=>word+=2,
++                    _=>word+=1,
++                }
++            }
++        }
++        let Some(source)=source else {return Ok(Self::default());};
++        regions.sort_by_key(|r|(r.allocation.identity(),r.begin,r.end));
++        let mut merged=Vec::<Region<'_>>::new();
++        for region in regions {
++            if let Some(previous)=merged.last_mut().filter(|p|p.allocation.identity()==region.allocation.identity() && region.begin<=p.end) {previous.end=previous.end.max(region.end);}
++            else {merged.push(region);}
++        }
++        if merged.is_empty() {return Ok(Self::default());}
++        let mut frame_bytes=0u64;let mut offsets=Vec::new();
++        for region in &merged {
++            offsets.push(frame_bytes);
++            let bytes=(region.end-region.begin).checked_add(15).ok_or_else(||invalid("mapped upload alignment overflows"))? & !15;
++            frame_bytes=frame_bytes.checked_add(bytes).ok_or_else(||invalid("mapped upload frame overflows"))?;
++        }
++        let arena=super::projection::scratch(&source,&source,frame_bytes,builder)?;
++        let base=typed_buffer::<Cuda,Executor>(&arena).pointer();
++        let device=match &source.kind {crate::backends::OpenedKind::Cuda(opened)=>opened.service(),_=>return Err(invalid("mapped upload source is not CUDA"))};
++        let dependencies=builder.dependencies();let mut copies=Vec::new();let mut result=Self::default();
++        for (region,frame_offset) in merged.into_iter().zip(offsets) {
++            let buffer=typed_buffer::<Cuda,Executor>(region.allocation);
++            let host=buffer.mapped_host_pointer().ok_or_else(||invalid("mapped upload lost its host pointer"))?+region.begin;
++            let bytes=region.end-region.begin;let destination=base+frame_offset;
++            copies.push(builder.copy_after(device,buffer.pointer()+region.begin,Some(host),destination,bytes,1,bytes,bytes,&dependencies).map_err(CallError::Execution)?);
++            result.regions.push((region.allocation.identity(),region.begin,region.end,destination));
++        }
++        builder.join(copies);
++        if std::env::var_os("MAGNITUDE_TRACE_CUDA_GEOMETRY").is_some() {eprintln!("magnitude-cuda-upload-frame source={} regions={} frame_bytes={frame_bytes}",source.info.id,result.regions.len());}
++        Ok(result)
++    }
++    pub(super) fn pointers(&self,buffers:&[(&Allocation,u64)])->Vec<u64> {
++        buffers.iter().map(|(allocation,offset)| {
++            self.regions.iter().find(|(id,begin,end,_)|*id==allocation.identity() && begin<=offset && offset<end)
++                .map(|(_,begin,_,pointer)|pointer+offset-begin)
++                .unwrap_or_else(||typed_buffer::<Cuda,Executor>(allocation).pointer()+offset)
++        }).collect()
++    }
++    pub(super) fn launch<'a>(&self,original:&'a DirectLaunch<'a>,pointers:&'a [u64])->DirectLaunch<'a> {
++        DirectLaunch {module:original.module,function:original.function,buffers:original.buffers,pointer_overrides:Some(pointers),words:original.words,scalar_results:original.scalar_results,grid:original.grid,block:original.block,shared_bytes:original.shared_bytes}
++    }
++}
+--- a/inference/seismic/runtime/src/native/cuda.rs
++++ b/inference/seismic/runtime/src/native/cuda.rs
+@@ -14,6 +14,7 @@
+ //! one), are launched individually.
+ 
+ mod projection;
++mod mapped_inputs;
+ use super::graph_replays::Replays;
+ use super::{Dispatch,DispatchList, NativeRoute, RouteSubmission};
+ use crate::api::CallError;
+@@ -70,8 +71,12 @@
+                     let constructing=std::time::Instant::now();
+                     let mut builder =
+                         DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
++                    let uploaded=mapped_inputs::Inputs::capture(&mut builder,list)?;
+                     each_launch(list, |dispatch,ordinal,buffers,launch| {
+-                        if let Some(launch)=launch {
++                        if let Some(original)=launch {
++                            let pointers=uploaded.pointers(buffers);
++                            let staged=uploaded.launch(original,&pointers);
++                            let launch=&staged;
+                             let span=if production_profile {Some(builder.profile_begin(format!("entry={} launch={ordinal}",dispatch.kernel.name)).map_err(CallError::Execution)?)} else {None};
+                             if !projection::capture(&mut builder,dispatch,ordinal,buffers,launch)? {
+                                 builder.launch(launch).map_err(CallError::Execution)?;

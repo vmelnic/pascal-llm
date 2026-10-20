@@ -1,0 +1,106 @@
+--- a/inference/engine/kernels/kernels/cuda/draft_rows.cu
++++ b/inference/engine/kernels/kernels/cuda/draft_rows.cu
+@@ -1,6 +1,6 @@
+ // draft_rows: the draft head's input row; the CUDA form of
+ // `metal/draft_rows.metal`. Block (x, row) owns outputs 32x..32x+31 of
+-// one row: it decodes the successor token's embedding row (mma16 lane chunks
++// one row after a source-side preparation decodes the successor embedding (mma16 lane chunks
+ // or a dense table) and reads the conditioning row, RMS-normalizes both into
+ // the joined [2D] input rounded to A (F32 in shared memory), then each warp
+ // reduces four combine rows over the joined input.
+@@ -32,7 +32,8 @@
+ 
+ } // namespace
+ 
+-extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
++#ifdef SEISMIC_FORMING_DRAFT_ROWS_JOIN
++extern "C" __global__ void draft_rows_join(SEISMIC_KERNEL_PARAMS) {
+     using Conditioning = ELEMENT_OF(SEISMIC_CONDITIONING);
+     using EmbeddingNorm = ELEMENT_OF(SEISMIC_EMBEDDING_NORM);
+     using HiddenNorm = ELEMENT_OF(SEISMIC_HIDDEN_NORM);
+@@ -40,12 +41,6 @@
+     __shared__ float partials[DRAFT_WARPS];
+     const u64 D = SEISMIC_DIM_D;
+     const u64 row = blockIdx.y;
+-    const u64 owners=seismic_projection_shard_count;
+-    if (owners!=0) {
+-        const u64 groups=(D+127)/128,owner=seismic_projection_shard_index;
+-        const u64 first=(u64)blockIdx.x*DRAFT_WARPS*DRAFT_ROWS_PER_WARP;
+-        if (first<128*(groups*owner/owners) || first>=128*(groups*(owner+1)/owners) || first>=D) return;
+-    }
+     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
+     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
+     // Column 0 of a (token, status) selection row; a failed selection is -1.
+@@ -103,6 +98,28 @@
+     }
+     __syncthreads();
+ 
++    float *staged=reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED));
++    for (u64 column=threadIdx.x;column<2*D;column+=blockDim.x)
++        staged[row*2*D+column]=joined[column];
++}
++#endif
++
++#ifdef SEISMIC_FORMING_DRAFT_ROWS
++extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
++    extern __shared__ float joined[];
++    const u64 D=SEISMIC_DIM_D;
++    const u64 row=blockIdx.y;
++    const u64 owners=seismic_projection_shard_count;
++    if (owners!=0) {
++        const u64 groups=(D+127)/128,owner=seismic_projection_shard_index;
++        const u64 first=(u64)blockIdx.x*DRAFT_WARPS*DRAFT_ROWS_PER_WARP;
++        if (first<128*(groups*owner/owners) || first>=128*(groups*(owner+1)/owners) || first>=D) return;
++    }
++    const float *staged=reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED));
++    for (u64 column=threadIdx.x;column<2*D;column+=blockDim.x)
++        joined[column]=staged[row*2*D+column];
++    __syncthreads();
++
+     // Four combine rows per warp over the 2D joined inputs.
+     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+     float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+@@ -141,3 +158,5 @@
+             result[row * SEISMIC_RESULT_0_STRIDE_0 + output * SEISMIC_RESULT_0_STRIDE_1] = sum;
+     }
+ }
++
++#endif
+--- a/inference/engine/kernels/kernels/draft.seismic
++++ b/inference/engine/kernels/kernels/draft.seismic
+@@ -48,6 +48,11 @@
+ # k-quant row is a multiple of 256 columns); the joined row is F32 in shared
+ # memory. (Metal holds it in A.)
+ native draft_rows for cuda from "cuda/draft_rows.cu":
++    scratch joined bytes (M * D * 8)
++    launch draft_rows_join:
++        threadgroups (1, M, 1)
++        threads_per_threadgroup (256, 1, 1)
++        shared_bytes (8 * D)
+     launch draft_rows:
+         threadgroups (ceil_div(D, 32), M, 1)
+         threads_per_threadgroup (256, 1, 1)
+--- a/inference/seismic/runtime/src/native/cuda/projection.rs
++++ b/inference/seismic/runtime/src/native/cuda/projection.rs
+@@ -57,10 +57,8 @@
+             inputs.push((input.1.buffer,input.1.bytes));
+         }
+         if kind==7 {
+-            for name in ["conditioning","tokens"] {
+-                let input=parameters.iter().find(|(n,_)|n==name).ok_or_else(||invalid("draft projection input is absent"))?;
+-                inputs.push((input.1.buffer,input.1.bytes));
+-            }
++            let joined=*scratch.get("joined").ok_or_else(||invalid("draft projection has no joined input"))?;
++            inputs.push((joined,rows.checked_mul(width).and_then(|n|n.checked_mul(4)).ok_or_else(||invalid("draft joined input size overflows"))?));
+         }
+         if kind!=1 && kind!=3 && kind!=6 && kind!=7 {
+             let staged=*scratch.get("staged").ok_or_else(||invalid("normalized projection has no staged input"))?;
+@@ -68,7 +66,7 @@
+         }
+         // Residuals, row selectors and scalar scales remain distinct input
+         // views; immutable weights are cached locally by allocation identity.
+-        let constants=parameters.into_iter().map(|(_,v)|v).collect::<Vec<_>>();let mut outputs=Vec::new();
++        let constants=parameters.into_iter().filter(|(name,_)|kind!=7 || name=="combine").map(|(_,v)|v).collect::<Vec<_>>();let mut outputs=Vec::new();
+         if kind==2 {
+             if results.len()!=4 {return Err(invalid("segmented attention output ABI differs"));}
+             for (result,weight) in results.iter().zip(&weights) {outputs.push(Output {buffer:result.buffer,first:0,columns:weight.extents[0],pitch:result.strides[0]*result.element_bytes,rows,element_bytes:result.element_bytes});}

@@ -1,0 +1,11 @@
+--- a/inference/seismic/runtime/src/native/cuda/mapped_inputs.rs
++++ b/inference/seismic/runtime/src/native/cuda/mapped_inputs.rs
+@@ -64,7 +64,7 @@
+             result.regions.push((region.allocation.identity(),region.begin,region.end,destination));
+         }
+         builder.join(copies);
+-        if std::env::var_os("MAGNITUDE_TRACE_CUDA_GEOMETRY").is_some() {eprintln!("magnitude-cuda-upload-frame source={} regions={} frame_bytes={frame_bytes}",source.info.id,result.regions.len());}
++        if std::env::var_os("MAGNITUDE_TRACE_CUDA_GEOMETRY").is_some() {eprintln!("magnitude-cuda-upload-frame source={:?} regions={} frame_bytes={frame_bytes}",source.info.id,result.regions.len());}
+         Ok(result)
+     }
+     pub(super) fn pointers(&self,buffers:&[(&Allocation,u64)])->Vec<u64> {

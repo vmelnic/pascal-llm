@@ -1,0 +1,205 @@
+--- a/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
++++ b/inference/engine/kernels/kernels/cuda/lib/projection/projection.cuh
+@@ -618,6 +618,50 @@
+     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+     if (tile0 >= tiles)
+         return;
++    if constexpr(!WA::DENSE && (!PAIR || !WB::DENSE)) {
++        if((kblocks&3)==0 && M==2) {
++#pragma unroll 1
++            for(u64 superblock=begin;superblock<end;++superblock) {
++                typename WA::Block block_a[TPW];typename WB::Block block_b[TPW];
++#pragma unroll
++                for(int i=0;i<TPW;++i) {
++                    const u64 tile=tile0+i;if(tile>=tiles)continue;
++                    block_a[i]=wa.block(tile,superblock,lane);
++                    if constexpr(PAIR)block_b[i]=wb.block(tile,superblock,lane);
++                }
++#pragma unroll
++                for(int q=0;q<4;++q) {
++                    const u64 kb=superblock*4+q;
++
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto raw_a = wa.fetch(tile, kb, lane);
++            Coefficients<WA::GROUPS> ca;wa.coefficients(block_a[i],q,ca);
++            if constexpr (PAIR) {
++                const auto raw_b = wb.fetch(tile, kb, lane);
++                Coefficients<WB::GROUPS> cb;wb.coefficients(block_b[i],q,cb);
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            }
++        }
++    
++                }
++            }
++        } else {
+     if constexpr(PAIR && !WA::DENSE && !WB::DENSE && WA::GROUP==WB::GROUP) {
+         if(M==2) {
+     const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
+@@ -758,6 +802,151 @@
+                 gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
+             }
+         }
++    }
++    }
++        }
++    } else {
++    if constexpr(PAIR && !WA::DENSE && !WB::DENSE && WA::GROUP==WB::GROUP) {
++        if(M==2) {
++    const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
++    struct NativeStage {
++        typename WA::Raw raw_a[TPW];typename WB::Raw raw_b[TPW];
++        Coefficients<WA::GROUPS> ca[TPW];Coefficients<WB::GROUPS> cb[TPW];
++    };
++    auto load_native=[&](NativeStage &stage,u64 kb) {
++#pragma unroll
++        for(int i=0;i<TPW;++i) {
++            const u64 tile=tile0+i;if(tile>=tiles)continue;
++            stage.raw_a[i]=wa.fetch(tile,kb,lane);
++#pragma unroll
++            for(int r=0;r<2;++r)
++#pragma unroll
++                for(int group=0;group<WA::GROUPS;++group)
++                    wa.coefficient(tile*16+g+8*r,kb,group,stage.ca[i].scale[r][group],stage.ca[i].bias[r][group]);
++            if constexpr(PAIR) {
++                stage.raw_b[i]=wb.fetch(tile,kb,lane);
++#pragma unroll
++                for(int r=0;r<2;++r)
++#pragma unroll
++                    for(int group=0;group<WB::GROUPS;++group)
++                        wb.coefficient(tile*16+g+8*r,kb,group,stage.cb[i].scale[r][group],stage.cb[i].bias[r][group]);
++            }
++        }
++    };
++    NativeStage current;
++    if(4*begin<last)load_native(current,4*begin);
++#pragma unroll 1
++    for(u64 kb=4*begin;kb<last;++kb) {
++        NativeStage next;
++        if(kb+1<last)load_native(next,kb+1);
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto &raw_a=current.raw_a[i];
++            const auto &ca=current.ca[i];
++            if constexpr (PAIR) {
++                const auto &raw_b=current.raw_b[i];
++                const auto &cb=current.cb[i];
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            }
++        }
++        if(kb+1<last)current=next;
++    }
++        } else {
++    const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
++#pragma unroll 1
++    for (u64 kb = 4 * begin; kb < last; ++kb) {
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto raw_a = wa.fetch(tile, kb, lane);
++            Coefficients<WA::GROUPS> ca;
++#pragma unroll
++            for (int r = 0; r < 2; ++r)
++#pragma unroll
++                for (int group = 0; group < WA::GROUPS; ++group)
++                    wa.coefficient(tile * 16 + g + 8 * r, kb, group, ca.scale[r][group], ca.bias[r][group]);
++            if constexpr (PAIR) {
++                const auto raw_b = wb.fetch(tile, kb, lane);
++                Coefficients<WB::GROUPS> cb;
++#pragma unroll
++                for (int r = 0; r < 2; ++r)
++#pragma unroll
++                    for (int group = 0; group < WB::GROUPS; ++group)
++                        wb.coefficient(tile * 16 + g + 8 * r, kb, group, cb.scale[r][group], cb.bias[r][group]);
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            }
++        }
++    }
++        }
++    } else {
++    const u64 last = 4 * end < kblocks ? 4 * end : kblocks;
++#pragma unroll 1
++    for (u64 kb = 4 * begin; kb < last; ++kb) {
++#pragma unroll
++        for (int i = 0; i < TPW; ++i) {
++            const u64 tile = tile0 + i;
++            if (tile >= tiles)
++                continue;
++            const auto raw_a = wa.fetch(tile, kb, lane);
++            Coefficients<WA::GROUPS> ca;
++#pragma unroll
++            for (int r = 0; r < 2; ++r)
++#pragma unroll
++                for (int group = 0; group < WA::GROUPS; ++group)
++                    wa.coefficient(tile * 16 + g + 8 * r, kb, group, ca.scale[r][group], ca.bias[r][group]);
++            if constexpr (PAIR) {
++                const auto raw_b = wb.fetch(tile, kb, lane);
++                Coefficients<WB::GROUPS> cb;
++#pragma unroll
++                for (int r = 0; r < 2; ++r)
++#pragma unroll
++                    for (int group = 0; group < WB::GROUPS; ++group)
++                        wb.coefficient(tile * 16 + g + 8 * r, kb, group, cb.scale[r][group], cb.bias[r][group]);
++                if constexpr (WA::GROUP == WB::GROUP) {
++                    if (M == 1)
++                        gemv_accumulate_simt_pair<NB, 1>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else if (M == 2)
++                        gemv_accumulate_simt_pair<NB, 2>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                    else
++                        gemv_accumulate_simt_pair<NB, 0>(acc[0][i], acc[1][i], raw_a, raw_b, wa, wb, ca, cb, M, 64 * kb, pro);
++                } else {
++                    gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++                    gemv_accumulate_simt<NB>(acc[1][i], raw_b, wb, cb, M, 64 * kb, pro);
++                }
++            } else {
++                gemv_accumulate_simt<NB>(acc[0][i], raw_a, wa, ca, M, 64 * kb, pro);
++            }
++        }
++    }
+     }
+     }
+ #else

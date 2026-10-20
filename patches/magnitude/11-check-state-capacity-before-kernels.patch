@@ -1,0 +1,82 @@
+--- a/design/inference/engine/execution-plan.md
++++ b/design/inference/engine/execution-plan.md
+@@ -31,6 +31,10 @@
+ Speed assessment runs nothing on the device: each model's decode speed at each requested depth is
+ computed from its header-derived byte, history and launch demand over the device's memory
+ bandwidth (see [performance estimation](../../icn/performance-estimation.md)).
++The native composition root derives the complete state plan from the selected physical
++capacity before opening its device or preparing kernels. An impossible context is refused
++at this stage, using the same state-layout authority as preview; the admitted state plan
++is carried into graph construction without a second derivation or a capacity override.
+ The composition root prepares complete Seismic workflows for the admitted model geometry and
+ finite launch classes, imports the target component, allocates the storage reported by those
+ workflows, and publishes readiness only after those steps succeed. The engine does not maintain a
+--- a/inference/engine/src/execution.rs
++++ b/inference/engine/src/execution.rs
+@@ -16,7 +16,7 @@
+     platform::{self, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
+     AttestedPrograms, ExecutionPlanDraft, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
+     Operation, RequestId, ReservedResources, ResidencyStore, ResourceAllocator, ResourceCapacity,
+-    ResourceDomainId, ResourcePlan, ResourcePlanner, StateBindings, TokenId, TuningContext,
++    ResourceDomainId, ResourcePlan, ResourcePlanner, StateResourcePlan, StateBindings, TokenId, TuningContext,
+     TuningEvent,
+     TuningObserver, TuningOrigin, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
+ };
+@@ -66,7 +66,7 @@
+     pub programs: AttestedPrograms,
+     pub backend: BackendName,
+     pub pool: MemoryPoolKind,
+-    pub capacity: ResourceCapacity,
++    pub state: StateResourcePlan,
+ }
+ 
+ /// Select and open the manifest's device, plan the model on it and prepare
+@@ -116,6 +116,17 @@
+             }
+             error => internal(error.to_string()),
+         })?;
++    // Refuse impossible state geometry before opening the device or tuning.
++    // Preview and load use the same selected physical capacity and layout.
++    let state = ResourcePlanner::state_plan(
++        &manifest.definition,
++        draft.load(),
++        draft.policy().method(),
++        manifest.model.kv_codec,
++        draft.policy().limits(),
++        capacity,
++    )
++    .map_err(internal)?;
+     let kernel_cache = manifest
+         .kernel_cache
+         .clone()
+@@ -190,7 +201,7 @@
+         programs,
+         backend,
+         pool,
+-        capacity,
++        state,
+     })
+ }
+ 
+@@ -206,20 +217,11 @@
+         mut programs,
+         backend,
+         pool,
+-        capacity,
++        state,
+     } = prepare(&catalog, manifest, &package, progress.clone())?;
+     let reserves = manifest.reserves;
+     let limits = draft.policy().limits();
+     let head_enabled = draft.policy().selection().head;
+-    let state = ResourcePlanner::state_plan(
+-        &manifest.definition,
+-        draft.load(),
+-        draft.policy().method(),
+-        manifest.model.kv_codec,
+-        limits,
+-        capacity,
+-    )
+-    .map_err(internal)?;
+     let mut phase_started = Instant::now();
+     let target_graphs = programs
+         .prepare_target_graphs(

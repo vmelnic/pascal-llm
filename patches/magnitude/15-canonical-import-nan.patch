@@ -1,0 +1,54 @@
+--- a/inference/engine/kernels/kernels/cuda/repack_weight.cu
++++ b/inference/engine/kernels/kernels/cuda/repack_weight.cu
+@@ -725,7 +725,11 @@
+     local = iq_u32(in + 66 + 4*group) >> 28;
+     factor = 0.25f;
+ #endif
+-    return __fmul_rn(__fmul_rn(seismic_f16_to_f32((unsigned short)base), (float)(2u*local + 1u)), factor);
++    const float result = __fmul_rn(__fmul_rn(seismic_f16_to_f32((unsigned short)base), (float)(2u*local + 1u)), factor);
++    // Registry floating recipes canonicalize NaNs; CUDA arithmetic uses a
++    // different payload. Preserve every finite/Inf/signed-zero result bit.
++    return (__float_as_uint(result) & 0x7fffffffu) > 0x7f800000u
++        ? __uint_as_float(0x7fc00000u) : result;
+ }
+ #endif
+ 
+--- a/inference/engine/kernels/tests/iq_import.rs
++++ b/inference/engine/kernels/tests/iq_import.rs
+@@ -39,3 +39,36 @@
+     }
+     assert!(count >= 315, "every affected tensor must be represented");
+ }
++
++
++#[test]
++#[ignore = "requires the explicit original-model CUDA device"]
++fn startup_repack_bytes_match_registry_on_cuda() {
++    assert_eq!(std::env::var("SEISMIC_TEST_BACKEND").unwrap(), "cuda");
++    let device = DeviceCatalog::discover().unwrap().open_backend(BackendName::Cuda).unwrap();
++    for (source_name, resident_name) in [
++        ("gguf_iq1_s", "iq1g32"), ("gguf_iq1_m", "iq1g16"),
++        ("gguf_iq2_xxs", "iq2g32"), ("gguf_iq2_xs", "iq2g16"),
++        ("gguf_iq2_s", "iq2g16"), ("gguf_iq3_xxs", "iq3g32"),
++        ("gguf_q2_k", "q2k4"),
++    ] {
++        let element = Element::named(source_name).unwrap();
++        let resident = Element::stored(resident_name, Layout::Mma16).unwrap();
++        let shape = [1, 17, 2 * element.logical_group().unwrap()];
++        let length = element.canonical_byte_len(&shape).unwrap();
++        let bytes = (0..length).map(|index| (index as u8).wrapping_mul(37).wrapping_add(11)).collect::<Vec<_>>();
++        let source = Tensor::from_host(&device, element, &shape, &bytes).unwrap();
++        let output = repack_weight::native_for_device_with(&device,
++            repack_weight::Elements { E: element, U: resident }, &NativeSpecialization::new())
++            .unwrap().call(repack_weight::Args { source: &source }).unwrap().value.read_to_host().unwrap();
++        let expected = resident.repack_host(element, &shape, &bytes).unwrap();
++        let differences = output.iter().zip(&expected).enumerate().filter(|(_, (a,b))| a != b).map(|(i,_)|i).collect::<Vec<_>>();
++        let words = differences.iter().take(12).map(|&i| {
++            let start = i / 4 * 4;
++            (start, format!("{:08x}",u32::from_le_bytes(output[start..start+4].try_into().unwrap())),
++                format!("{:08x}",u32::from_le_bytes(expected[start..start+4].try_into().unwrap())))
++        }).collect::<Vec<_>>();
++        println!("{source_name} differences={} first_words={words:?}", differences.len());
++        assert_eq!(output, expected, "{source_name} startup repack bytes");
++    }
++}

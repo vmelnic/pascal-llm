@@ -1,7 +1,134 @@
 # Measurement ledger
 
-Status: through 2026-09-14. Component gates and service results are kept
+Status: through 2026-10-08. Component gates and service results are kept
 separate.
+
+## Swift Heretic follow-up throughput (2026-10-08)
+
+The selected production profile now uses maximum MTP depth two. The original
+Heretic GGUF, full target vocabulary, pinned 65,801-token draft subset,
+F16 target/draft KV, 262,144-position shared pool, four slots and P100
+0/1/2 placement remain. P40 is unallocated. Admission/cache experiments
+were deferred at the user's request and removed from the active runtime.
+
+Native diagnostic: identical 2,917-token prompt, greedy seed 42, 512 output
+tokens, cache disabled and diagnostic-only `ignore_eos=true`. This isolates
+configuration comparisons, not end-to-end production performance.
+
+| Configuration | Decode tok/s | Decision |
+|---|---:|---|
+| MTP 3, default NCCL | 37.53 | Baseline |
+| MTP 2, default NCCL | 42.54 | Selected; +13.34% in this diagnostic |
+| MTP 4 | 40.64 | Not selected |
+| MTP 6 | 34.11 | Not selected |
+| MTP 3, internal AllReduce | 39.58 | Not selected |
+| Same internal AllReduce with opt-in SM60 graphs | 39.68 | 0.24% difference; source patch reverted |
+| MTP 4, 8/16 CPU threads | 40.62 | No observed gain |
+| MTP 2, NCCL min/max CTAs = 1 | 39.01 | Slower; reverted |
+| MTP 2, exact MTP-only artifact on GPU 0 | 42.85 | 0.74% difference; higher GPU-0 residency; inactive |
+
+Different speculative depths/reduction paths yielded different diagnostic
+output hashes and acceptance counts. Consequently, this table does not
+prove a pure communication-kernel speedup or identical greedy output across
+all configurations. Graph and CPU-thread paired comparisons were identical,
+as was the MTP-only placement comparison. No weight or KV quantization was
+changed. Telemetry showed no hardware thermal throttling during native runs.
+
+The selected MTP-two configuration passed real Pi with xhigh, actual
+AGENTS.md, the qualification skill and read/write/bash tools. Single-session
+decode was 989 / 24.39178 = **40.55 tok/s weighted**, with turns at
+35.05-45.99 tok/s. The prior MTP-three Pi result was 39.88 tok/s; the small
+cross-run difference does not establish the native diagnostic's 13.34%
+gain in production. Two independent simultaneous Pi sessions passed the
+same gate at **19.34-26.49 tok/s each during overlap**, followed by a
+33.78 tok/s final turn after overlap. Pi and independent verification each
+passed all five unchanged tests in every session.
+
+Evidence: `out/heretic-speed-tuning/summary.json`, per-variant JSON, Pi
+session events, server logs and independent test outputs. Sustained
+50 tok/s and throughput at 262,144 actually populated tokens remain
+unqualified. The historical MTP-three result below is superseded only
+as the selected profile, not as a measurement.
+
+## Swift Heretic i1-Q4_K_M: transferred optimization (2026-10-08)
+
+The user-selected artifact remains
+`Swift-1.5-Qwen3.8-27b-heretic.i1-Q4_K_M.gguf`, SHA-256
+`fc3b8413d6b1a707c40cb1df43d247a3de64237be7da15e3f04e345557cb3054`.
+GSQ was stopped and `config/models/swift-heretic.env` selected: the same
+MTP-three / SHA-pinned 65,801-token draft head, three-P100 tensor split,
+262K shared context, four slots and exact F16 target/draft KV. Compatibility
+was verified directly for token strings, merges, token types and EOS.
+
+A direct fixed greedy 256-token diagnostic measured 39.20 tok/s. The real
+Pi gate used xhigh, actual repository AGENTS.md, an enabled qualification
+skill and normal tools. Pi read the supplied tests, implemented the queue,
+and executed all five tests successfully without modifying them.
+
+| Pi turn | Generated tokens | Generation ms | Server tok/s |
+|---|---:|---:|---:|
+| Read skill and tests | 117 | 2,638.46 | 43.97 |
+| Write implementation | 1,043 | 25,502.00 | 40.86 |
+| Run tests | 110 | 2,721.48 | 40.05 |
+| Report result | 219 | 6,477.61 | 33.65 |
+
+Weighted decode is 1,489 / 37.33955 = **39.88 tok/s**. These are real
+ordinary-context Pi model turns, including generated reasoning and tool
+calls, rather than an end-to-end rate including prefill and tool execution.
+Artifacts are retained in `out/heretic-speed/`; the service remains on this
+profile after qualification. Maximum-population 262K throughput is not
+qualified by this run. There is no measured MTP-ten Heretic baseline and no
+speedup factor is inferred from another model's baseline.
+
+Two simultaneous independent Pi sessions passed the same skill/tool and
+five-test gate. Server timing recorded 18.98-25.76 tok/s per overlapping
+turn, with 31.13 tok/s for the last turn after overlap. Both sessions made
+bounded progress and wrote only their own assigned directories; their
+instructions/skill injection and unchanged tests were verified from client
+events. Four server slots were idle and the Heretic alias active after the
+tests. Concurrent events and timing lines are in `out/heretic-speed/pi-a/`,
+`pi-b/`, `pi-concurrent-server.log` and `pi-concurrent-results.json`.
+
+## Swift GSQ-RCO IQ2_S: requested Pi speed gate (2026-10-08)
+
+Same selected GGUF, SHA-256
+`6ce61b532e45d7113e2b48b8dff9c104ff521230fa119eb0c3e75a44fb9f1cbf`,
+the pinned existing llama.cpp runtime and P100 devices 0,1,2 only.
+Profile: `config/models/swift-gsq.env`, embedded MTP maximum three proposals,
+SHA-pinned 65,801-token draft head. Token strings, merges, token types and
+EOS were verified against the subset's source vocabulary. The target keeps
+its full vocabulary; weights, F16 KV, 262K shared pool and four slots remain.
+
+| Gate | Before (MTP 10, full draft head) | After (MTP 3, reduced draft head) |
+|---|---:|---:|
+| Fixed greedy 256-token diagnostic | 10.37 tok/s | 46.39 tok/s |
+| Real Pi coding and tools, five model turns | observed prior user turn: 7.26 tok/s | 37.56-51.21 tok/s |
+| Real Pi weighted generation, 1,500 tokens | no comparable complete baseline | 46.37 tok/s |
+
+The fixed greedy outputs are byte-identical, SHA-256
+`94519f43564b57c1d89a718121aaab0a60687c8c8ac5d98e5b5b54cd7884de04`.
+This is a correctness diagnostic, not the production gate. Production ran
+`ops/pi.sh swift-gsq` with xhigh, actual repository AGENTS.md, skills and
+normal tools enabled. Pi read the qualification skill and independently
+supplied queue tests, implemented the requested module, executed the suite
+and passed all five behavior tests without modifying them. Prompt population
+was 3,264-5,267 tokens. Client events and server timing lines are retained in
+`out/swift-speed/pi-single/`, `pi-server.log` and `pi-results.json`.
+
+Two independent concurrent Pi sessions also completed tools and all tests,
+writing only their assigned directories. Rates during overlap were about
+19-31 tok/s per response; their final turns after overlap reported
+33.49 and 36.71 tok/s. Both sessions progressed without a server crash.
+This gate establishes short-context 30-50 tok/s for one active Pi session,
+not 30 tok/s for every simultaneous session or populated 262K context.
+
+Sustained native generation at 250 W / 1,328 MHz produced two 2,048-token
+runs at 48.56 and 48.54 tok/s before the hottest GPU approached the thermal
+ceiling. A separate 125 W / 1,189 MHz run produced 12,288 tokens at 44.98
+tok/s, but the hottest GPU was still warming and reached 77 C; this is not
+a steady-state thermal qualification. Thermal work was deferred by the user;
+its temporary load generator was stopped and the passing Pi clock/power
+policy restored.
 
 ## Native ComfyUI functional gate
 

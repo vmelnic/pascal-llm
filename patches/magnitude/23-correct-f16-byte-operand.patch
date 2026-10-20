@@ -1,0 +1,11 @@
+--- a/inference/seismic/lang/native-library/cuda/packets.cuh
++++ b/inference/seismic/lang/native-library/cuda/packets.cuh
+@@ -118,7 +118,7 @@
+         // 1024 + (code + 128) in each half, then subtract 1152.
+         const u32 pair =
+             prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 8));
+-        const u32 biased = prmt(pair, 0x64646464u, 0x4140u);
++        const u32 biased = prmt(pair, 0x64646464u, 0x4240u);
+         u32 value;
+         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(biased), "r"(0x3C003C00u), "r"(0xE480E480u));
+         return value;

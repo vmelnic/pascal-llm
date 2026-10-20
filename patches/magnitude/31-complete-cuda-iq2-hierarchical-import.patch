@@ -1,0 +1,82 @@
+--- a/inference/engine/kernels/kernels/cuda/repack_weight.cu
++++ b/inference/engine/kernels/kernels/cuda/repack_weight.cu
+@@ -21,15 +21,18 @@
+ #define REPACK_IQ1_M 1
+ #define REPACK_CODE_BITS 4u
+ #define REPACK_IQ_PALETTE 1
+-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2G32)
++#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && \
++    (defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2G32) || defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2H32))
+ #define REPACK_IQ2_XXS 1
+ #define REPACK_CODE_BITS 4u
+ #define REPACK_IQ_PALETTE 1
+-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2G16)
++#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XS) && \
++    (defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2G16) || defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2H16))
+ #define REPACK_IQ2_XS 1
+ #define REPACK_CODE_BITS 4u
+ #define REPACK_IQ_PALETTE 1
+-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_S) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2G16)
++#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_S) && \
++    (defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2G16) || defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2H16))
+ #define REPACK_IQ2_S 1
+ #define REPACK_CODE_BITS 4u
+ #define REPACK_IQ_PALETTE 1
+@@ -99,6 +102,10 @@
+ #define REPACK_CODE_BITS 4u
+ #else
+ #error "repack_weight binding is not a registered GGUF-to-resident conversion"
++#endif
++
++#if defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2H32) || defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2H16)
++#define REPACK_IQ_HIERARCHICAL 1
+ #endif
+ 
+ typedef unsigned char u8;
+@@ -888,8 +895,23 @@
+ }
+ #endif
+ 
++#if defined(REPACK_IQ_HIERARCHICAL)
++__device__ __forceinline__ u32 iq_source_odd(const u8 *in, u32 group) {
++#if defined(REPACK_IQ2_XXS)
++    const u32 local = iq_u32(in + 6 + 8 * group) >> 28;
++#elif defined(REPACK_IQ2_XS)
++    const u32 local = ((u32)in[66 + group / 2] >> (4 * (group % 2))) & 15u;
++#else
++    const u32 local = ((u32)in[74 + group / 2] >> (4 * (group % 2))) & 15u;
++#endif
++    return 2u * local + 1u;
++}
++#endif
++
+ __device__ __forceinline__ void write_scales(const u8 *in, u8 *out) {
+-#if defined(REPACK_Q2_K)
++#if defined(REPACK_IQ_HIERARCHICAL)
++    for (u32 j = 0; j < 256u / IQ_SOURCE_SCALE_GROUP; ++j) out[j] = (u8)iq_source_odd(in, j);
++#elif defined(REPACK_Q2_K)
+     for (u32 j = 0; j < 16; ++j) out[j] = in[j];
+ #elif defined(REPACK_KQUANT)
+     for (u32 w = 0; w < 3; ++w) reinterpret_cast<u32 *>(out)[w] = kquant_locals_word(in, w);
+@@ -911,7 +933,11 @@
+ }
+ 
+ __device__ __forceinline__ void write_supers(const u8 *in, u8 *out) {
+-#if defined(REPACK_IQ_PALETTE)
++#if defined(REPACK_IQ_HIERARCHICAL)
++    const float factor = __fmul_rn(seismic_f16_to_f32((unsigned short)iq_u16(in)), 0.125f);
++    reinterpret_cast<u32 *>(out)[0] = (__float_as_uint(factor) & 0x7fffffffu) > 0x7f800000u
++        ? 0x7fc00000u : __float_as_uint(factor);
++#elif defined(REPACK_IQ_PALETTE)
+     for (u32 j = 0; j < 256u / IQ_SOURCE_SCALE_GROUP; ++j)
+         reinterpret_cast<float *>(out)[j] = iq_source_scale(in, j);
+ #elif defined(REPACK_Q2_K)
+@@ -1023,7 +1049,7 @@
+     const u64 n = row0 + lane;
+     const u8 *in = source_packet(source, seismic_words_value, b, n, packet);
+     u8 *out = destination_packet(destination, seismic_words_value, b, n, packet);
+-#if defined(REPACK_KQUANT) || defined(REPACK_Q6K) || defined(REPACK_Q3K) || defined(REPACK_IQ3S) || defined(REPACK_Q2_K)
++#if defined(REPACK_KQUANT) || defined(REPACK_Q6K) || defined(REPACK_Q3K) || defined(REPACK_IQ3S) || defined(REPACK_Q2_K) || defined(REPACK_IQ_HIERARCHICAL)
+     write_scales(in, out + SEISMIC_ELEMENT_U_PLANE_1_OFFSET);
+     write_supers(in, out + SEISMIC_ELEMENT_U_PLANE_2_OFFSET);
+ #else
