@@ -1,6 +1,6 @@
 # Decision ledger
 
-Status: 2026-09-17.
+Status: 2026-10-21.
 
 ## Accepted
 
@@ -35,6 +35,15 @@ Status: 2026-09-17.
 - Keep one unified 262K F16 KV pool shared dynamically by four server slots.
   This enables concurrent users but does not promise 262K to every slot at the
   same time.
+- Deploy the pinned Strata checkout under `work/strata` with Swift 1.5 IQ3_S as
+  the first service artifact. IQ3_S keeps all 512 experts and is the highest
+  fidelity Strata tier offered for this release; it is still mixed-bit
+  quantized GSQ/RCO and is not BF16-equivalent. Run it in upstream `resident`
+  mode on P100 devices 0/1/2 only, with exact FP16 KV, 32,768 context and two
+  request slots. Keep P40 device 3 outside this gate.
+- Permit the Q2_0 MTP draft pack because every speculative token is verified by
+  the target model; the draft changes proposal efficiency, not accepted target
+  tokens. Keep it reported separately from the IQ3_S target weights.
 - Start the model service manually. It is deliberately disabled at boot.
 - Use upstream `stable-diffusion.cpp` instead of implementing an image API or
   diffusion runtime. RealVisXL, Juggernaut and Animagine share one
@@ -91,6 +100,14 @@ They may be reopened only through the explicit complete-latency gate in
   over PCIe.
 - Quality-changing KV quantization, sparsification or reduced model semantics
   without explicit user approval and a quality gate.
+- Treating the functional 32K IQ3_S deployment as the project's populated-262K
+  or BF16-quality gate. Exact per-device activation/intermediate telemetry and
+  local quality comparison remain open even though API, concurrent Pi tool
+  loops and cancellation/recovery passed.
+- Adding the P40 to this Strata service. The accepted engine contains only
+  SM60 cubins, the three-P100 service already reserves 15.4-15.7 GiB per P100,
+  and a four-device split would add another PCIe boundary without establishing
+  a fidelity or concurrency benefit.
 - CUDA backend sampling for the current Qwen tensor-split path. A real Pi turn
   bounded all CPU sampler work at 0.165 ms per generated token, already below
   the approved 1 ms/token prerequisite. Removing the tensor-split safety guard

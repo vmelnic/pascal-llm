@@ -1,3 +1,194 @@
+## Strata Swift 1.5 IQ3_S deployment gate (2026-10-21)
+
+The selected artifact is the full-expert Swift 1.5 IQ3_S release, not IQ2_XS
+and not the expert-pruned Coder release. IQ2_XS is a materially more aggressive
+2-bit quality trade-off. IQ3_S is still a quantized artifact and is not
+bit-identical to BF16, but Strata records it as the tier that matches the full
+model on the published aggregate benchmarks. Swift 1.5 is itself a fine-tune
+whose advertised advantage is shorter reasoning. These are bounded upstream
+claims, not a local quality result; real Romanian coding and tool use through
+Pi remain the quality gate.
+
+The source is pinned to Hugging Face revision
+`99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d`. Its two required GGUF shards are:
+
+| File | Exact bytes | SHA-256 |
+|---|---:|---|
+| `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf` | 44,900,816,736 | `46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b` |
+| `Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf` | 38,842,920,384 | `70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608` |
+
+The exact base download is therefore `83,743,737,120 B = 77.9924328625 GiB`.
+Preparation produced the following separate artifacts; none is hidden inside
+the base-download total:
+
+| Artifact | Exact bytes | Meaning |
+|---|---:|---|
+| native dense pack | 1,538,035,200 | non-routed target tensors converted for Strata |
+| native expert pack | 50,292,326,400 | canonical target expert arena |
+| 31 fetched BF16 MTP tensors | 5,214,301,696 | original speculative draft layer |
+| Q2_0 MTP GGUF | 889,017,216 | derived draft pack |
+| MTP runtime dense binary | 116,099,072 | draft non-expert runtime payload |
+| MTP runtime expert binary | 707,788,800 | draft expert runtime payload |
+| MTP runtime vocabulary | 425,196 | draft vocabulary map |
+
+The complete prepared target directory, including tokenizer and manifests, is
+51,840,341,389 B. The model filesystem had 679,207,936,000 B free before the
+download and 535,900,266,496 B free after preparation and startup.
+
+The model has 48 trunk layers, 36 GDN and 12 QSA, width 2,560, 512 routed
+experts, top-10 routing and one width-640 shared expert per layer. One target
+pass therefore invokes 48 * (10 + 1) expert MLPs. Counting each gate, up and
+down matrix multiply-add as two operations gives the exact expert-matrix work
+
+`F_expert = 48 * 11 * 3 * 640 * 2,560 * 2 = 5,190,451,200 FLOP/token`.
+
+This deliberately excludes the dense GDN/QSA, gated-residual, PLE, embedding,
+head and MTP-draft work instead of disguising an expert-only count as whole
+model FLOPs. MTP adds one draft-layer pass for each proposal, while a verifier
+pass checks a window of rows; accepted proposals must be measured before an
+amortized FLOP/token number is reported.
+
+The production candidate uses context `T = 32,768`, two isolated request slots,
+and exact IEEE binary16 KV. Strata's exact allocator charge is 2,112 bytes per
+token per QSA/draft layer: 2,048 bytes for two 256-wide K/V heads and 64 bytes
+of index state. Across the 12 target QSA layers plus one MTP draft layer:
+
+`KV(T,S) = 13 * 2,112 * T * S`.
+
+That is 899,678,208 B per populated 32K session and 1,799,356,416 B for two
+fully populated sessions. At 262,144 it is 7,197,425,664 B per session. The
+32K service gate does not qualify the project's eventual populated-262K gate.
+The 36 persistent GDN recurrent plus convolution states are separately
+
+`R_gdn(S) = 36 * (128*48*128 + 10,240*(4-1)) * 4 * S`
+`= 117,669,888 * S B`.
+
+PLE history is another `9 * (4*2,560) * 4 = 368,640 B` per allocated stage
+session. RoPE tables, page tables, QSA scratch, prompt buffers, verify windows,
+expert cache, CUDA workspace and allocator/startup reserve remain separate
+charges and must come from the engine's startup plan rather than an estimate.
+
+The upstream full-RAM estimate for IQ3_S is approximately 62 GiB, while the
+host exposes exactly 65,162,358,784 B = 60.6871757507 GiB. A whole expert arena
+in RAM is therefore rejected for the two-slot service. The selected upstream
+`--low-ram resident` layer-split mode writes the canonical expert pack, keeps
+the hottest non-overlapping layer experts in the three P100 caches and copies
+only the remainder into RAM once. If `E` is the exact expert-pack payload and
+`C_i` the distinct expert payload resident on P100 `i`, its host charge is
+
+`E_host = E - (C_0 + C_1 + C_2)`.
+
+The realized expert arena is `E = 50,292,326,400 B`. Startup logged a cache fill
+of 5,850 experts and 10.31 GiB of VRAM, but did not expose distinct `C_i`
+payload counters. After the concurrent Pi gate, the process RSS was
+33,362,508 KiB = 34,163,208,192 B. This is process residency, not an expert-only
+counter, so it cannot be substituted for `E_host` without mislabeling dense,
+MTP, allocator and server charges.
+
+For P100 `i`, admission is the independently checked inequality
+
+`D_i + C_i + KV_i(T,S) + R_i(S) + A_i(B,S) + I_i(B,S) + P_i + M_i + U_i`
+`<= 17,179,869,184 B`,
+
+where `D_i` is that stage's dense weights, `A_i` live activations, `I_i`
+intermediates, `P_i` prompt/verify buffers, `M_i` the MTP/head charge on its
+owner and `U_i` CUDA/workspace/startup reserve. No term may be paid from the
+P40 or from another device's free memory. Device selection is exactly CUDA
+indices `0,1,2`; index `3` is excluded.
+
+For a layer-split verifier window of `R` rows, one boundary transfers
+`(4*2,560 + 2,560 + 4) * 4 * R = 51,216*R B`: four residual streams, the block
+output and four inject scalars, all FP32. Three stages have two boundaries, so
+the useful forward hand-off traffic is exactly `102,432*R B` per full target
+window, before protocol flags and any implementation staging. Expert traffic
+is recorded without averaging: for routed expert `(l,e)` with packed byte size
+`B_l,e` and residency indicator `h_l,e`, the nonresident payload is
+`X_expert = sum B_l,e * (1-h_l,e)` over the actual route. Startup and request
+telemetry must distinguish GPU cache hits, CPU expert work, pinned-host PCIe
+reads and SSD reads; none is called unified memory.
+
+Both shards passed the upstream hash check and the independent wrapper check.
+The production executable is 78,041,128 B, reports Strata `0.1.46.3`, has
+SHA-256 `a3f2673ab6a9974130189085cf2e1e4ceed8400cbd90877b89e56ade34b8acea`,
+has resolved dynamic libraries and contains 67 `sm_60` CUDA images with no
+SM61 image. No installed driver, CUDA toolkit or system package changed.
+
+The loaded device-memory snapshot after concurrent Pi turns was, separately,
+15,995 MiB on P100 0, 15,813 MiB on P100 1, 16,041 MiB on P100 2 and 0 MiB on
+P40 3. These are whole-process CUDA allocations: Strata does not break them
+into dense weights, expert cache, FP16 KV, activations, intermediates and
+workspace. The exact FP16 KV allocator charge remains the equation above;
+activations and intermediates therefore remain bounded by successful admission
+but are not yet independently measured. This missing decomposition blocks a
+full capacity proof, not the active functional deployment gate.
+
+The service passed these active-path checks:
+
+- `/health` reported loaded model `swift-flash-next-iq3-s`, service `strata` and
+  maximum context 32,768; `/v1/models` reported the same model and context.
+- A direct OpenAI request completed at 56.8 prompt tok/s and 36.6 generated
+  tok/s. Its deliberately tiny 32-token cap ended inside reasoning, so this is
+  transport evidence only, not a response-quality result.
+- A real Pi turn received the repository `AGENTS.md`, used its `read` tool and
+  returned the requested exact host value. Pi kept normal context-file and
+  skill discovery enabled.
+- Two independent real Pi processes started together, each performed a
+  distinct `read` tool loop and returned the correct file evidence in 25.60 s
+  and 27.51 s wall time. The server log shows both requests making interleaved
+  progress; neither corrupted or indefinitely blocked the other.
+- Interrupting a separate Pi tool loop produced server telemetry
+  `cancel=True` at 5,445 prompt tokens. A new Pi `read` loop immediately
+  returned `RECOVERY_OK` in 5.93 s, establishing slot recovery after client
+  cancellation.
+
+This qualifies the requested 32K, two-session Pi service. It does not qualify
+the project's 262,144 actually populated-token target, independently measured
+activation/intermediate capacity, or BF16-equivalent/local coding quality.
+
+## Strata SM60 build-only gate (2026-10-21)
+
+The active request authorizes source acquisition, configuration and compilation
+only. It does not select or download a Strata model, stop the production Qwen
+service, start a second inference service, or alter the installed NVIDIA driver
+and CUDA toolkit. The build gate is therefore limited to a pinned source
+identity, an SM60-only CUDA artifact, resolved runtime dependencies and no
+regression in the active service.
+
+Strata commit `9de04cd44e927a9a3df6bbc0e94fc1be8b844ba4` was cloned into
+`work/strata` and built by `ops/install-strata.sh`. The successful configuration
+uses CUDA 12.4.131, GCC/G++ 13.4.0, `STRATA_ENABLE_CUDA=ON`,
+`STRATA_EXPERIMENTAL_SM60=ON`, `CMAKE_CUDA_ARCHITECTURES=60` and
+`STRATA_BUILD_TESTS=OFF`. The host default GCC 15 configuration compiled all
+objects but failed at the final link because CUDA 12.4 added the GCC 13 runtime
+search path and GCC 13's `libstdc++` does not export GCC 15's
+`__cxa_call_terminate`. Pinning both C and C++ to the already-installed GCC 13
+toolchain made CUDA host compilation and the final link use one ABI.
+
+The resulting `build-sm60-gcc13/strata` reports version `0.1.46.3`, is
+78,041,128 bytes and has SHA-256
+`0f7628e2c33441f08fe3c764806abfd61d596ef63b600cebb68281d1e4c11463`.
+`ldd` reports no missing library, and all 67 embedded CUDA images reported by
+`cuobjdump --list-elf` are `sm_60`; no SM61 image was built. The executable
+reports only the upstream `qwen4exp` and `qwen35moe` families. The production
+`llama-server` remained active on devices 0/1/2 at its prior approximately
+11 GiB per-device residency, its health endpoint remained `ok`, and device 3
+remained at zero allocated MiB. No GPU kernel or model inference was run by this
+gate.
+
+This compilation charges no model weights, KV, recurrent state, activations or
+intermediates because none was loaded. It is not evidence that a Strata model
+fits or that its scheduler meets the production contract. Before any inference
+gate, select and hash the exact supported artifact and populate, separately for
+each P100 `i`,
+`W_i + KV_i(T,S) + recurrent_i(S) + activations_i(B,S) + intermediates_i(B,S)
++ workspace_i + startup_i <= 17,179,869,184 B`, where `T` is the actually
+populated context, `S` the independent session count and `B` the active batch.
+Every pipeline transfer must then be counted at its actual device boundary.
+The current Qwen3.8-27B artifact is outside the two families reported by this
+binary, so it cannot supply those measurements. A selected supported model,
+exact-F16 KV, three-P100 load, populated context and concurrent real Pi tool
+loops remain separate prerequisites.
+
 ## Magnitude Swift integration gate (2026-10-10)
 
 The active request authorizes completing Swift execution in Magnitude on CUDA

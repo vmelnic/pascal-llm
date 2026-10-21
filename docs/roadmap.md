@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: dependency order, 2026-09-17.
+Status: dependency order, 2026-10-21.
 
 1. Completed: the custom runtime feasibility program was stopped after MLP
    plus populated-262K attention reached 87.298 ms/token before the rest of the
@@ -83,3 +83,18 @@ Status: dependency order, 2026-09-17.
     selection. Open WebUI discovers it whenever that profile is resident.
     Real coding/tool quality remains open and the official Qwen profile stays
     the default.
+20. Completed for build only: clone pinned Strata `0.1.46.3` through
+    `ops/install-strata.sh` and compile its engine on X99E with the installed
+    CUDA 12.4/GCC 13 toolchain for SM60 only. The binary contains only SM60
+    cubins and has resolved runtime dependencies; the running Qwen service and
+    P40 placement remained unchanged. No Strata model was selected or loaded.
+    Before inference, select a supported artifact, add its exact per-device
+    capacity/traffic equations to `feasibility.md`, and then qualify model load,
+    exact-F16 KV and concurrent real Pi independently.
+21. Completed for the active 32K service gate: select and independently hash
+    full-expert Swift 1.5 IQ3_S, prepare its resident expert and MTP artifacts,
+    and deploy the SM60-only Strata service on P100 devices 0/1/2 with FP16 KV
+    and two slots. OpenAI health, a real Pi tool loop, two concurrent independent
+    Pi tool loops, cancellation and post-cancellation recovery passed. P40
+    stayed at zero allocated MiB. The populated-262K, per-device
+    activation/intermediate decomposition and local quality gates remain open.

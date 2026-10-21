@@ -25,6 +25,7 @@ set +a
 
 profiles_dir="${repo_root}/config/models"
 model_id="${PASCAL_MODEL_ID:-}"
+pi_provider="${PASCAL_PI_PROVIDER:-pascal-llm}"
 
 if [[ -n "${1:-}" && -f "${profiles_dir}/${1}.env" ]]; then
   profile_name="$1"
@@ -46,7 +47,7 @@ command -v pi >/dev/null 2>&1 || {
 
 exec pi \
   --approve \
-  --provider pascal-llm \
+  --provider "${pi_provider}" \
   --model "${model_id}" \
   --thinking xhigh \
   "$@"

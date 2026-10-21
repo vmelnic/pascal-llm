@@ -1,6 +1,6 @@
 # Hardware baseline
 
-Status: measured through 2026-09-14.
+Status: measured through 2026-10-21.
 
 ## Host
 
@@ -69,9 +69,10 @@ Secrets and the WireGuard profile are intentionally outside this repository.
 
 ## Active serving placement
 
-The deployed Qwen process exposes only CUDA devices 0-2. The three P100s form
-the tensor-parallel compute domain and each holds approximately 11 GiB after
-initialization. The P40 is visible to the host but idle for this service.
+The original Qwen profile exposes only CUDA devices 0-2. When selected, its
+three P100s form the tensor-parallel compute domain and each holds approximately
+11 GiB after initialization. That profile is currently inactive while the
+mutually exclusive Strata service below owns the same P100 domain.
 
 Placement is declared directly by each model profile. North Mini Code,
 GPT-OSS-20B and Granite H-Small were also initialized at a configured 65,536
@@ -89,3 +90,39 @@ Native ComfyUI is the Open WebUI image backend and uses the same P40 and model
 payloads. Its PyTorch cu126 install passed direct FP32 CUDA execution on SM61.
 ComfyUI and the OpenAI-compatible `stable-diffusion.cpp` service are mutually
 exclusive; neither may claim device 3 while the other is active.
+
+## Strata deployment
+
+The pinned Strata `0.1.46.3` source at commit
+`9de04cd44e927a9a3df6bbc0e94fc1be8b844ba4` is cloned under
+`work/strata`. `ops/install-strata.sh` configures its engine with the installed
+CUDA 12.4.131 compiler, the installed GCC/G++ 13.4.0 host toolchain,
+`STRATA_EXPERIMENTAL_SM60=ON` and `CMAKE_CUDA_ARCHITECTURES=60`. GCC 13 is
+explicit because the host's default GCC 15 objects cannot link against the GCC
+13 C++ runtime path selected by CUDA 12.4.
+
+The setup-produced service binary is `work/strata/engine-cuda12/strata`. It is
+78,041,128 B, has SHA-256
+`a3f2673ab6a9974130189085cf2e1e4ceed8400cbd90877b89e56ade34b8acea`,
+resolved dynamic dependencies and 67 embedded SM60 CUDA images. It has no SM61
+image. The earlier `build-sm60-gcc13` binary remains a build-gate artifact; it
+is not the executable used by the service.
+
+`pascal-strata.service` runs Swift 1.5 IQ3_S with layer split across CUDA
+devices 0/1/2, resident experts, exact FP16 KV, 32,768 context and two request
+slots. `pascal-llm.service` is inactive and conflicts with it. A post-concurrency
+snapshot reported 15,995 MiB, 15,813 MiB and 16,041 MiB allocated on P100
+devices 0, 1 and 2 respectively; P40 device 3 remained at 0 MiB. The Strata
+process RSS was 34,163,208,192 B and the host still reported 27,238,043,648 B
+available RAM. No driver, CUDA toolkit or system package was installed, removed
+or changed.
+
+Operate this deployment only through `ops/strata.sh`: `start`, `stop`,
+`restart`, `status`, `logs` and `models` manage or inspect the remote service;
+`pi-config` registers `swift-flash-next-iq3-s` under the existing `pascal-llm`
+provider in `~/.pi/agent/models.json` and adds
+`pascal-llm/swift-flash-next-iq3-s:xhigh` to the `enabledModels` list in
+`~/.pi/agent/settings.json`. It preserves Pi's current default provider/model
+and creates one-time `*.before-strata` backups. `pi` launches the normal
+repository-aware Pi harness against Strata. The service is deliberately not
+enabled at boot.
