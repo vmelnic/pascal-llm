@@ -12,7 +12,9 @@ import tempfile
 
 MODEL_ID = "swift-flash-next-iq3-s"
 EXPECTED_GPUS = [0, 1, 2]
-EXPECTED_CONTEXT = "32768"
+EXPECTED_CONTEXT = "262144"
+EXPECTED_KV_RESIDENT = "32768"
+EXPECTED_VRAM_RESERVE_LATER_MIB = "1115"
 
 
 def option_value(args: list[str], option: str) -> str | None:
@@ -51,6 +53,8 @@ def normalize(config: dict) -> dict:
 
     set_option(args, "--max-context", EXPECTED_CONTEXT)
     set_option(args, "--kv", "fp16")
+    set_option(args, "--kv-resident", EXPECTED_KV_RESIDENT)
+    set_option(args, "--vram-reserve-later-mib", EXPECTED_VRAM_RESERVE_LATER_MIB)
     config["args"] = args
     config["gpu"] = EXPECTED_GPUS
     config["gpus_asked"] = True
@@ -75,6 +79,9 @@ def validate(config: dict) -> None:
         "cuda": config.get("cuda") == 12,
         "context": option_value(args, "--max-context") == EXPECTED_CONTEXT,
         "kv": option_value(args, "--kv") == "fp16",
+        "KV resident window": option_value(args, "--kv-resident") == EXPECTED_KV_RESIDENT,
+        "late VRAM reserve": option_value(args, "--vram-reserve-later-mib")
+        == EXPECTED_VRAM_RESERVE_LATER_MIB,
         "resident experts": "--resident-experts" in args and "--mmap-experts" not in args,
         "P40 exclusion": 3 not in config.get("gpu", []),
     }
@@ -113,7 +120,10 @@ def main() -> int:
         config = normalize(config)
         atomic_write(args.config, config)
     validate(config)
-    print(f"Strata config valid: {args.config} ({MODEL_ID}, GPUs 0,1,2, FP16 KV, parallel=2)")
+    print(
+        f"Strata config valid: {args.config} "
+        f"({MODEL_ID}, GPUs 0,1,2, context={EXPECTED_CONTEXT}, FP16 KV, parallel=2)"
+    )
     return 0
 
 

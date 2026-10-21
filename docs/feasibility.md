@@ -48,16 +48,22 @@ model FLOPs. MTP adds one draft-layer pass for each proposal, while a verifier
 pass checks a window of rows; accepted proposals must be measured before an
 amortized FLOP/token number is reported.
 
-The production candidate uses context `T = 32,768`, two isolated request slots,
+The model metadata declares native context 262,144. The pinned upstream setup
+accepts the `256k` tier and the engine implements `--max-context 262144`
+without RoPE scaling at that native boundary. The production configuration
+therefore uses maximum context `T_max = 262,144`, two isolated request slots
 and exact IEEE binary16 KV. Strata's exact allocator charge is 2,112 bytes per
 token per QSA/draft layer: 2,048 bytes for two 256-wide K/V heads and 64 bytes
 of index state. Across the 12 target QSA layers plus one MTP draft layer:
 
 `KV(T,S) = 13 * 2,112 * T * S`.
 
-That is 899,678,208 B per populated 32K session and 1,799,356,416 B for two
-fully populated sessions. At 262,144 it is 7,197,425,664 B per session. The
-32K service gate does not qualify the project's eventual populated-262K gate.
+That is 899,678,208 B per populated 32K session. At 262,144 it is
+7,197,425,664 B per session and 14,394,851,328 B for two fully populated
+sessions. `--kv-resident 32768` keeps only a 32K cell window per QSA layer on
+its owning GPU; the remaining exact FP16 values cross the explicit host/device
+boundary from pinned RAM. A configured and allocated maximum does not qualify
+the project's actually populated-262K gate.
 The 36 persistent GDN recurrent plus convolution states are separately
 
 `R_gdn(S) = 36 * (128*48*128 + 10,240*(4-1)) * 4 * S`
@@ -78,12 +84,18 @@ only the remainder into RAM once. If `E` is the exact expert-pack payload and
 
 `E_host = E - (C_0 + C_1 + C_2)`.
 
-The realized expert arena is `E = 50,292,326,400 B`. Startup logged a cache fill
-of 5,850 experts and 10.31 GiB of VRAM, but did not expose distinct `C_i`
-payload counters. After the concurrent Pi gate, the process RSS was
-33,362,508 KiB = 34,163,208,192 B. This is process residency, not an expert-only
-counter, so it cannot be substituted for `E_host` without mislabeling dense,
-MTP, allocator and server charges.
+The realized expert arena is `E = 50,292,326,400 B`. The 262K three-P100 probe
+selected layer cuts 17 and 33. Its split search projected 16,460 cached
+profile pairs, approximately 98.9% of routed mass; the final caches contained
+14,676 resident expert slots. It explicitly reported a 32,768 of 262,144 cell
+GPU KV window. Without a late-capture reserve it reached `READY` but left only
+477/571/353 MiB free and directed the configuration to add
+`--vram-reserve-later-mib 1115`. The production configuration includes that
+reserve. After graph capture and real Pi requests, the service cgroup used
+58,680,033,280 B and the host exposed 2,402,856,960 B as available after the
+concurrent requests. These are whole-service observations, not expert-only
+counters, so neither can be substituted for `E_host` without mislabeling
+dense, KV, MTP, allocator and server charges.
 
 For P100 `i`, admission is the independently checked inequality
 
@@ -113,9 +125,10 @@ SHA-256 `a3f2673ab6a9974130189085cf2e1e4ceed8400cbd90877b89e56ade34b8acea`,
 has resolved dynamic libraries and contains 67 `sm_60` CUDA images with no
 SM61 image. No installed driver, CUDA toolkit or system package changed.
 
-The loaded device-memory snapshot after concurrent Pi turns was, separately,
-15,995 MiB on P100 0, 15,813 MiB on P100 1, 16,041 MiB on P100 2 and 0 MiB on
-P40 3. These are whole-process CUDA allocations: Strata does not break them
+The loaded device-memory snapshot after graph capture and concurrent Pi
+requests was, separately, 16,003 MiB on P100 0, 15,405 MiB on P100 1,
+15,629 MiB on P100 2 and 0 MiB on P40 3. These are whole-process CUDA
+allocations: Strata does not break them
 into dense weights, expert cache, FP16 KV, activations, intermediates and
 workspace. The exact FP16 KV allocator charge remains the equation above;
 activations and intermediates therefore remain bounded by successful admission
@@ -125,25 +138,25 @@ full capacity proof, not the active functional deployment gate.
 The service passed these active-path checks:
 
 - `/health` reported loaded model `swift-flash-next-iq3-s`, service `strata` and
-  maximum context 32,768; `/v1/models` reported the same model and context.
-- A direct OpenAI request completed at 56.8 prompt tok/s and 36.6 generated
-  tok/s. Its deliberately tiny 32-token cap ended inside reasoning, so this is
-  transport evidence only, not a response-quality result.
-- A real Pi turn received the repository `AGENTS.md`, used its `read` tool and
-  returned the requested exact host value. Pi kept normal context-file and
-  skill discovery enabled.
-- Two independent real Pi processes started together, each performed a
-  distinct `read` tool loop and returned the correct file evidence in 25.60 s
-  and 27.51 s wall time. The server log shows both requests making interleaved
-  progress; neither corrupted or indefinitely blocked the other.
-- Interrupting a separate Pi tool loop produced server telemetry
-  `cancel=True` at 5,445 prompt tokens. A new Pi `read` loop immediately
-  returned `RECOVERY_OK` in 5.93 s, establishing slot recovery after client
-  cancellation.
+  maximum context 262,144; `/v1/models` reported the same model and context.
+- A first post-start OpenAI request captured the runtime graphs and completed
+  with 62 prompt plus 42 completion tokens at 39.3 generated tok/s. The
+  service remained healthy after the request.
+- Pi declares `contextWindow: 262144`, keeps a separate 32,768-token maximum
+  response allowance, selects the Strata model first and uses it as the default.
+  A new real Pi request returned the exact requested marker.
+- Two new independent real Pi processes ran concurrently and returned their
+  distinct exact markers in 2.77 s and 2.74 s. This checks admission and
+  isolation at the configured limit, not high-population performance.
+- The earlier 32K deployment separately passed repository-instruction tool use,
+  two concurrent independent tool loops, cancellation and immediate recovery.
+  Those results remain transport evidence but were not relabelled as 262K
+  populated-context evidence.
 
-This qualifies the requested 32K, two-session Pi service. It does not qualify
-the project's 262,144 actually populated-token target, independently measured
-activation/intermediate capacity, or BF16-equivalent/local coding quality.
+This qualifies the requested 262K-configured, two-session Pi service. It does
+not qualify the project's 262,144 actually populated-token target,
+independently measured activation/intermediate capacity, or
+BF16-equivalent/local coding quality.
 
 ## Strata SM60 build-only gate (2026-10-21)
 

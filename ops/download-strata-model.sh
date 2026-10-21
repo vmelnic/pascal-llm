@@ -57,11 +57,16 @@ export CUDAHOSTCXX=/usr/bin/g++-13
 export STRATA_NVCC=/usr/bin/nvcc
 export STRATA_EXPERIMENTAL_SM60=1
 
+# Upstream setup requires a packed-KV selector when generating a long-context
+# config. The repository normalizer below replaces it with the required FP16
+# runtime KV and retains only the upstream-generated streaming support.
 ./setup.sh \
   --setup \
   --family swift \
   --model IQ3_S \
-  --context 32768 \
+  --context 262144 \
+  --kv int8 \
+  --kv-streaming on \
   --vision no \
   --gpus 0,1,2 \
   --cuda 12 \

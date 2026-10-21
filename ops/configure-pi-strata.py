@@ -16,7 +16,7 @@ MODEL = {
     "name": "Swift 1.5 Flash-Next IQ3_S · X99E Strata",
     "reasoning": True,
     "input": ["text"],
-    "contextWindow": 32768,
+    "contextWindow": 262144,
     "maxTokens": 32768,
     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
     "thinkingLevelMap": {
@@ -67,23 +67,25 @@ def main() -> int:
     if not isinstance(models, list):
         raise SystemExit(f"Pi provider has no model catalog: {args.provider}")
 
-    provider["models"] = [model for model in models if model.get("id") != MODEL_ID] + [MODEL]
+    provider["models"] = [MODEL] + [model for model in models if model.get("id") != MODEL_ID]
 
     settings = json.loads(args.settings.read_text(encoding="utf-8"))
     enabled_models = settings.get("enabledModels")
     if not isinstance(enabled_models, list) or not all(isinstance(item, str) for item in enabled_models):
         raise SystemExit(f"Pi settings have no enabledModels string list: {args.settings}")
     model_ref = f"{args.provider}/{MODEL_ID}"
-    settings["enabledModels"] = [
+    settings["enabledModels"] = [f"{model_ref}:xhigh"] + [
         item for item in enabled_models if item.split(":", maxsplit=1)[0] != model_ref
-    ] + [f"{model_ref}:xhigh"]
+    ]
+    settings["defaultProvider"] = args.provider
+    settings["defaultModel"] = MODEL_ID
 
     config_backup = backup_once(args.config)
     settings_backup = backup_once(args.settings)
     atomic_write(args.config, data)
     atomic_write(args.settings, settings)
     print(f"Pi model configured: {model_ref}")
-    print(f"Pi model enabled: {model_ref}:xhigh")
+    print(f"Pi default model enabled first: {model_ref}:xhigh")
     print(f"Original model configuration backup: {config_backup}")
     print(f"Original settings backup: {settings_backup}")
     return 0

@@ -39,8 +39,10 @@ Status: 2026-10-21.
   the first service artifact. IQ3_S keeps all 512 experts and is the highest
   fidelity Strata tier offered for this release; it is still mixed-bit
   quantized GSQ/RCO and is not BF16-equivalent. Run it in upstream `resident`
-  mode on P100 devices 0/1/2 only, with exact FP16 KV, 32,768 context and two
-  request slots. Keep P40 device 3 outside this gate.
+  mode on P100 devices 0/1/2 only, with exact FP16 KV, 262,144 maximum context,
+  a 32,768-cell GPU-resident KV window and two request slots. Keep P40 device 3
+  outside this gate. Reserve 1,115 MiB for late graph capture as directed by
+  the engine's three-P100 startup probe.
 - Permit the Q2_0 MTP draft pack because every speculative token is verified by
   the target model; the draft changes proposal efficiency, not accepted target
   tokens. Keep it reported separately from the IQ3_S target weights.
@@ -100,12 +102,13 @@ They may be reopened only through the explicit complete-latency gate in
   over PCIe.
 - Quality-changing KV quantization, sparsification or reduced model semantics
   without explicit user approval and a quality gate.
-- Treating the functional 32K IQ3_S deployment as the project's populated-262K
-  or BF16-quality gate. Exact per-device activation/intermediate telemetry and
-  local quality comparison remain open even though API, concurrent Pi tool
-  loops and cancellation/recovery passed.
+- Treating the functional 262K-configured IQ3_S deployment as the project's
+  populated-262K or BF16-quality gate. Exact per-device
+  activation/intermediate telemetry and local quality comparison remain open
+  even though API and concurrent Pi transport passed at the new configured
+  limit and the earlier tool/cancellation gates passed at 32K.
 - Adding the P40 to this Strata service. The accepted engine contains only
-  SM60 cubins, the three-P100 service already reserves 15.4-15.7 GiB per P100,
+  SM60 cubins, the three-P100 service already reserves 15.0-15.6 GiB per P100,
   and a four-device split would add another PCIe boundary without establishing
   a fidelity or concurrency benefit.
 - CUDA backend sampling for the current Qwen tensor-split path. A real Pi turn

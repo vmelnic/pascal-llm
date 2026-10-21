@@ -91,10 +91,12 @@ Status: dependency order, 2026-10-21.
     Before inference, select a supported artifact, add its exact per-device
     capacity/traffic equations to `feasibility.md`, and then qualify model load,
     exact-F16 KV and concurrent real Pi independently.
-21. Completed for the active 32K service gate: select and independently hash
-    full-expert Swift 1.5 IQ3_S, prepare its resident expert and MTP artifacts,
-    and deploy the SM60-only Strata service on P100 devices 0/1/2 with FP16 KV
-    and two slots. OpenAI health, a real Pi tool loop, two concurrent independent
-    Pi tool loops, cancellation and post-cancellation recovery passed. P40
-    stayed at zero allocated MiB. The populated-262K, per-device
+21. Completed for the active 262K-configured service gate: select and
+    independently hash full-expert Swift 1.5 IQ3_S, prepare its resident expert
+    and MTP artifacts, and deploy the SM60-only Strata service on P100 devices
+    0/1/2 with FP16 KV, host KV streaming and two slots. Source inspection,
+    three-P100 startup, OpenAI inference, one real Pi request and two concurrent
+    independent Pi requests passed at the configured limit; P40 stayed at zero
+    allocated MiB. The earlier 32K tool, cancellation and recovery gates remain
+    valid transport evidence. Actually populated 262K, per-device
     activation/intermediate decomposition and local quality gates remain open.

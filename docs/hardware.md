@@ -109,20 +109,24 @@ image. The earlier `build-sm60-gcc13` binary remains a build-gate artifact; it
 is not the executable used by the service.
 
 `pascal-strata.service` runs Swift 1.5 IQ3_S with layer split across CUDA
-devices 0/1/2, resident experts, exact FP16 KV, 32,768 context and two request
-slots. `pascal-llm.service` is inactive and conflicts with it. A post-concurrency
-snapshot reported 15,995 MiB, 15,813 MiB and 16,041 MiB allocated on P100
-devices 0, 1 and 2 respectively; P40 device 3 remained at 0 MiB. The Strata
-process RSS was 34,163,208,192 B and the host still reported 27,238,043,648 B
-available RAM. No driver, CUDA toolkit or system package was installed, removed
-or changed.
+devices 0/1/2, resident experts, exact FP16 KV, a 262,144-token maximum context
+and two request slots. KV outside a 32,768-cell-per-QSA-layer GPU window is
+kept in pinned host RAM; no device boundary is described as unified memory.
+The configuration reserves 1,115 MiB for late CUDA graph capture instead of
+giving that space to expert caches. `pascal-llm.service` is inactive and
+conflicts with it. After graph capture and concurrent real Pi requests, a
+snapshot reported 16,003 MiB, 15,405 MiB and 15,629 MiB allocated on P100
+devices 0, 1 and 2; P40 device 3 remained at 0 MiB. The service cgroup used
+58,680,033,280 B and the host reported 2,402,856,960 B available RAM. No
+driver, CUDA toolkit or system package was installed, removed or changed.
 
 Operate this deployment only through `ops/strata.sh`: `start`, `stop`,
 `restart`, `status`, `logs` and `models` manage or inspect the remote service;
 `pi-config` registers `swift-flash-next-iq3-s` under the existing `pascal-llm`
-provider in `~/.pi/agent/models.json` and adds
-`pascal-llm/swift-flash-next-iq3-s:xhigh` to the `enabledModels` list in
-`~/.pi/agent/settings.json`. It preserves Pi's current default provider/model
-and creates one-time `*.before-strata` backups. `pi` launches the normal
-repository-aware Pi harness against Strata. The service is deliberately not
-enabled at boot.
+provider as its first model in `~/.pi/agent/models.json`, places
+`pascal-llm/swift-flash-next-iq3-s:xhigh` first in the `enabledModels` list in
+`~/.pi/agent/settings.json`, declares `contextWindow: 262144`, and selects it as
+Pi's default model. The separate maximum response allowance remains 32,768
+tokens. The configurator creates one-time `*.before-strata` backups. `pi`
+launches the normal repository-aware Pi harness against Strata. The service is
+deliberately not enabled at boot.
