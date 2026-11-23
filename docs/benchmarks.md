@@ -1,3 +1,11 @@
+## Swift decode profile on 3 x P100 (2026-11-23)
+
+Full method and data: `benchmarks/2026-11-23-swift-decode-profile/`. Layer
+split under nvprof: each P100 idle 65-75%, exactly one GPU busy 78% of the
+decode, none 19%; routed experts 18.5% + 6.4% host fetch of GPU time, dense
+projections 38.8%. Overlap/P2P hand-off +1.6%; PLE I/O and host sampling no
+effect. TP through `strata-split` does not fit this host's VRAM or RAM.
+
 ## Thinking effort in Pi: Inkling vs Swift (2026-11-23)
 
 Full method, table and evaluation: `benchmarks/2026-11-23-thinking-effort/`.

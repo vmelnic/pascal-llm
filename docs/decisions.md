@@ -172,6 +172,14 @@ They may be reopened only through the explicit complete-latency gate in
   then 230.3 us after one corrective patch; rejected after the second failure.
   Even before global visits, loop controllers and the head it implies
   ~11.1 ms/token (~90 tok/s), so it cannot reach 100 tok/s.
+- Swift 1.5 Flash-Next faster decode on 3 x P100 (2026-11-23). The layer split
+  runs one GPU at a time (one busy 78%, none 19%). Tensor parallel through
+  Strata's `strata-split` builds for sm_60 but needs every expert in VRAM
+  (51.8 > 51.5 GB) or a pinned host copy of all experts plus the embedding
+  table (~80 > 60 GiB RAM). In the layer split, overlap/P2P hand-off (+1.6%),
+  PLE I/O and host sampling (no effect) were ruled out; the remaining
+  between-window gaps bound the gain at ~10%. Rejected: `docs/swift-tp3-plan.md`,
+  `benchmarks/2026-11-23-swift-decode-profile/`.
 - Inkling 2 Mini SQ-15 pack for speed (2026-11-23). Lossy (96.68% top-1
   upstream), and its expert codecs are not uniform SF4/MX8, so the TP3 row
   split cannot load it; on the layer split it decodes at 20.5 tok/s against
