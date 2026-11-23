@@ -6,3 +6,9 @@ build/
 out/
 work/
 ops/__pycache__
+# benchmark data stays local (out/benchmarks/<name>/); benchmarks/ keeps README and scripts
+benchmarks/*/raw/
+benchmarks/*/samples*
+benchmarks/*/results*.jsonl
+benchmarks/*/PHASE
+benchmarks/*/STOP

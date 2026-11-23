@@ -17,11 +17,13 @@ throughout and was not touched.
   for the prefill fix.
 - `sample.sh`: GPU, host RAM, service and `/health` every 60 s
   (`samples.csv`), plus server progress lines (`samples-engine.log`).
-- Artifacts:
-  - `raw/` holds Pi JSONL, server logs, bench outputs and metrics;
-  - `results.jsonl` holds the runs after the fixes;
-  - `results-before-fix.jsonl` and `raw/before-fix/` hold the runs before the
-    prefix-reuse and broadcast fixes.
+- Data is not versioned. The scripts write to `out/benchmarks/<this folder>/`
+  on the workstation:
+  - `raw/`: Pi JSONL, server logs, bench outputs and metrics;
+  - `results.jsonl`: the runs after the fixes;
+  - `results-before-fix.jsonl` and `raw/before-fix/`: the runs before the
+    prefix-reuse and broadcast fixes;
+  - `samples.csv` and `samples-engine.log`: the 60 s samples.
 
 ## Defects found and fixed (all in the pascal-llm patch)
 
@@ -121,7 +123,7 @@ two, and each answer arrives sooner.
 ## Decision: back to one slot
 
 The service runs `--parallel 1 --tail-role-token 200001`. Measured after the
-restart (`raw/parallel1/`):
+restart (data: `raw/parallel1/`):
 
 - one 262,144-token slot, global KV fully in VRAM on all three ranks (no host
   offload);

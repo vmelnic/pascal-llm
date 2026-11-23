@@ -23,8 +23,13 @@ touched.
    its data. The Swift pair (30 s) fell between two samples; its memory comes
    from the snapshot after start.
 
-Artifacts: `raw/` (bench outputs, Pi JSONL/stderr, server logs, memory
-snapshots, `/health` after each pair), `results.jsonl` (one line per session).
+Data is not versioned. The scripts write to `out/benchmarks/<this folder>/` on
+the workstation:
+
+- `raw/`: bench outputs, Pi JSONL/stderr, server logs, memory snapshots and
+  `/health` after each pair;
+- `results.jsonl`: one line per session;
+- `samples.csv` and `samples-engine.log`: the 60 s samples.
 
 ## Results
 

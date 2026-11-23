@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # 60 s sampler for the two-session benchmark. Every row is appended immediately, so an interrupted run keeps
-# everything measured so far. Stop with: touch STOP (in this folder) or kill the process.
+# everything measured so far. Stop with: touch STOP (in the data folder) or kill the process.
 set -uo pipefail
-dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Data stays out of git: out/benchmarks/<this folder>/ (control files PHASE and STOP live there too).
+dir="$(cd "${here}/../.." && pwd)/out/benchmarks/$(basename "${here}")"
+mkdir -p "${dir}"
 host="${PASCAL_HOST:-vm@10.10.88.7}"
 interval="${PASCAL_SAMPLE_INTERVAL:-60}"
 csv="$dir/samples.csv"

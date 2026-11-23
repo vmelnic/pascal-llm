@@ -6,6 +6,9 @@
 set -uo pipefail
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${dir}/../.." && pwd)"
+# Data stays out of git: out/benchmarks/<this folder>/.
+dir="${repo}/out/benchmarks/$(basename "${dir}")"
+mkdir -p "${dir}"
 host="${PASCAL_HOST:-vm@10.10.88.7}"
 mode="${1:?usage: $0 <solo-a|solo-b|solo-c|pair|pair-ab>}"
 clone="${PASCAL_AGENT_CLONE:-${TMPDIR:-/tmp}/pascal-llm-agent-clone}"
