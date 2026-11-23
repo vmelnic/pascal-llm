@@ -31,7 +31,7 @@ case "${model}" in
     ;;
   inkling)
     # Inkling 2 Mini SQ-20 with the pascal-llm tensor-parallel decode
-    # (patches/strata-next/, `--tp 3` over P100 0,1,2).
+    # (patches/strata-next/, `--tp 3` over P100 0,1,2), two isolated 262,144-token slots.
     model_path="${PASCAL_INKLING_MODEL:-${repo_root}/work/models/inkling-2-mini-strata-sq20/Inkling-2-Mini-SQ-20.strata}"
     config_path="${source_dir}/strata-inkling-mini-sq20.json"
     log_dir="${repo_root}/out/inkling-mini-strata"
@@ -50,13 +50,13 @@ path, src, model, logs, port = sys.argv[1:6]
 json.dump({
     "exe": f"{src}/build-sm60/src/inkling2/strata-inkling",
     "arch": "inkling2_loop",
-    "args": ["--native", model, "--max-context", "262144", "--kv", "fp16", "--draft", "off", "--tp", "3"],
+    "args": ["--native", model, "--max-context", "262144", "--kv", "fp16", "--draft", "off", "--tp", "3", "--parallel", "2"],
     "cwd": src,
     "tokenizer": model.rsplit("/", 1)[0],
     "model_name": "inkling-2-mini-sq20",
     "log": f"{logs}/engine.log",
     "port": int(port), "cuda": 12, "gpu": [0, 1, 2], "gpus_asked": True, "layer_split": "auto",
-    "host": "0.0.0.0", "api_key": "local", "open_browser": False, "parallel": 1,
+    "host": "0.0.0.0", "api_key": "local", "open_browser": False, "parallel": 2,
 }, open(path, "w"), indent=1)
 EOF
     ;;

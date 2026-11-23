@@ -1,3 +1,23 @@
+## Two simultaneous Pi sessions, 262,144 tokens per slot (2026-11-23)
+
+Full method, artifacts and table: `benchmarks/2026-11-23-two-sessions/`. Two
+real Pi processes (project `AGENTS.md`, skills, tools) started together with
+distinct markers against `pascal-strata` on 8081; Gemma on P40 untouched.
+
+| | Inkling 2 Mini SQ-20 TP3, `--parallel 2` | Swift 1.5 Flash-Next IQ3_S, `parallel=2` |
+|---|---|---|
+| VRAM P100 0/1/2 (MiB) | 13,811 / 14,115 / 13,811 | 15,439 / 14,929 / 14,929 |
+| Host RAM available | 37.3 GiB | 1.4 GiB (swap full) |
+| Engine bench, 2 slots | 88.3 tok/s total, tokens identical to 1 slot | - |
+| Pi prompt per session | 7,013 + 7,013 (no prefix reuse) | 5,677; B reused 5,655 cached |
+| Decode while both generate | ~36-37 tok/s each | ~24-28 tok/s each |
+| Pi wall (pair) | 36.5 s | 29.9 s |
+| Markers / isolation / health | correct / no leak / ok | correct / no leak / ok |
+
+Inkling keeps the second slot's global KV beyond 161,536 tokens in mapped host
+RAM (exact F16) on two ranks, and one session's prefill starves the other's
+decode (14 tokens in 16 s). Neither run populated 262K.
+
 ## One real Pi `hi` per pascal* model (2026-11-23)
 
 `pi --no-session --mode json -p hi` from this repository (project `AGENTS.md`,

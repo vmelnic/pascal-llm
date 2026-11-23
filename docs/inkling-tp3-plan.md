@@ -161,3 +161,38 @@ Phase 4 results:
 | 4.2 fused rel-bias + split-K + merge (on-the-fly bias) | 60.9 tok/s, rejected |
 | 4.2 correction: per-split bias in shared memory | 61.9 tok/s, rejected (second failure), reverted |
 
+
+## Phase 5 - go/no-go: one persistent kernel per P100 (2026-11-23)
+
+Gate: one fused M=1 SWA visit per rank <= 200 us (engine TP3 path: 15.4 ms /
+48 visits ~ 320 us), else stop. PoW: `tools/poc/inkling-tp3-megakernel-visit.cu`,
+one cooperative launch per token and P100 (112 CTAs x 256 threads) running 48
+SWA visits with the engine's per-rank shapes and bytes: depth mix + RMSNorm,
+q|r|gate|k|v|sinks BF16 rows 1/3 (8,600 rows), post-QKV/ShortConv4/FP16 KV
+store/rel table, SWA-1024 split-K flash, merge * sigmoid(gate), `wo` rows 1/3,
+FP32 router + top-8, SF4 gate/up 384-feature shards + SITU, SF4 down, rank-order
+all-reduce. 5 grid barriers and 3 in-kernel P2P LL exchanges per visit; random
+weights (a timing gate), and all ranks end with a bit-identical residual.
+
+| Run | us/visit | ms/token (48 SWA visits) |
+|---|---:|---:|
+| first version | 230.8 | 11.08 |
+| correction: exact bit-built E4M3, 14 attention splits (one round), rel table in halves, two expert rows in flight per warp | 230.3 | 11.05 |
+
+Rank-0 CTA-0 phase times (us, corrected run): qkv gemv 32.8, flash 16.4,
+`wo` 11.3, gate/up 39.9, down 24.6, and waits for other ranks / barriers
+~60 (barrier after post-QKV 13.3, after gate/up 13.3, all-reduce 29.7). SF4
+gate/up reaches ~200 GB/s, limited by software E2M1/E4M3 decode on SM60, and
+cross-rank skew is paid at every exchange. Result: gate failed twice; rejected.
+The full model would add 8 global visits, 36 loop-controller passes and the
+head, so a fused path is bounded near ~80-90 tok/s on 3 x P100.
+
+## Two slots on TP3 (2026-11-23)
+
+`--parallel 2 --tp 3` needs no engine change: batched decode (`mode 1`) uses the
+same row-split projections, owner attention + broadcast per slot and expert
+shards. Startup auto-places the second slot's global KV: 161,536 tokens in VRAM
+and 100,608 mapped host tokens (2,358 MiB) on the two ranks that own 3 global
+visits. `--bench --parallel 2` (same prompt per slot, `STRATA_BENCH_SAME_PROMPT`)
+emits the 1-slot greedy tokens in both slots; 88.3 tok/s total (44.2 per slot).
+Two concurrent Pi sessions: `benchmarks/2026-11-23-two-sessions/`.

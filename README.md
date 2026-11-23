@@ -41,7 +41,7 @@ with normal project instructions and skill discovery, and no tool round trip:
 | Swift 1.5 Qwen3.8 Heretic | i1 Q4_K_M with embedded MTP, 15.66 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 40.55 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | Swift 1.5 Flash-Next via Strata 0.1.46.3 | full-expert IQ3_S, 77.99 GiB source | 3 x P100 layer split | 262,144 maximum, F16 K/V, 32K GPU-resident window | 56.5 tok/s short prompt | 39.3-42.9 tok/s | OpenAI, real Pi and two concurrent Pi transports passed; populated 262K unqualified |
 | Swift 1.5 Flash-Next via Strata 0.2.20 (selectable) | same prepared IQ3_S pack | 3 x P100 layer split, MTP | same | 246.5 tok/s, 5,666-token Pi `hi` | 38.1 tok/s, 164 tokens | one real Pi `hi` passed in 27.9 s; MTP accepted 91/165 |
-| Inkling 2 Mini via Strata 0.2.20 + pascal-llm TP3 (active) | SQ-20 native SF4+MX8, 19.35 GB | 3 x P100 tensor parallel (`--tp 3`, patches/strata-next) | 262,144 allocated, F16 K/V, global KV split 3/3/2 | ~440 tok/s, 7,001-token Pi `hi` | 58.9 tok/s, 75 tokens | real Pi `hi` through the `pascal-strata` service on 8081 passed in 18.2 s; KLD 0.0013 vs unmodified engine (its own noise 0.0012) |
+| Inkling 2 Mini via Strata 0.2.20 + pascal-llm TP3 (active) | SQ-20 native SF4+MX8, 19.35 GB | 3 x P100 tensor parallel (`--tp 3`, patches/strata-next) | 2 slots x 262,144, F16 K/V, global KV split 3/3/2 (second slot's tail in mapped host RAM) | ~440 tok/s, 7,001-token Pi `hi` | 58.9 tok/s, 75 tokens; two concurrent sessions ~36-37 tok/s each | real Pi `hi` through the `pascal-strata` service on 8081 passed in 18.2 s; two concurrent Pi sessions passed (`benchmarks/2026-11-23-two-sessions/`); KLD 0.0013 vs unmodified engine (its own noise 0.0012) |
 | Inkling 2 Mini via unmodified Strata 0.2.20 | same | 3 x P100 layer split; DSpark disabled by the engine in layer split | same | ~229 tok/s | 38.6 tok/s | superseded |
 | Gemma 4 26B A4B | official QAT Q4_0, 13.45 GiB | 1 x P40, native SM61 build | 262,144 configured, F16 K/V | 756.13 tok/s, 5,358 tokens | 55.09 tok/s, 105 tokens | one real Pi `hi` passed in 10.67 s; tools and populated maximum unqualified |
 | North Mini Code 1.0 | Q4_K_M, 17.46 GiB | 3 x P100 tensor / 1 x P40 | 65,536 shared, F16 K/V | 200.63 / 47.67 tok/s | 45.11 / 30.42 tok/s | direct and minimal Pi transport passed |
@@ -137,8 +137,8 @@ it (stored on X99E in `~/.config/pascal-llm/active-strata-model`; default
 models under the `pascal-strata` provider.
 
 Inkling runs with the pascal-llm tensor-parallel decode
-(`patches/strata-next/01-inkling-tp-decode.patch`, `--tp 3`), 262,144 context and
-F16 K/V; `ops/run-strata-server.sh` writes its run configuration. Its SQ-20 pack
+(`patches/strata-next/01-inkling-tp-decode.patch`, `--tp 3`), two request slots of
+262,144 tokens each and F16 K/V; `ops/run-strata-server.sh` writes its run configuration. Its SQ-20 pack
 is downloaded with
 `PASCAL_MODEL_PROFILE_DIR=config/strata ./ops/download-model.sh inkling-mini-sq20`
 on X99E. See `docs/inkling-tp3-plan.md` and `docs/feasibility.md` for the

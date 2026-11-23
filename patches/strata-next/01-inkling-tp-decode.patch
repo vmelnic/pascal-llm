@@ -1678,10 +1678,28 @@ index e8b05e78..d07bc9fa 100644
  #elif defined(INKLING_ENABLE_EP_CUDA)
          return make_ep_cuda_backend();
 diff --git a/engine/src/inkling2/ink_main.cpp b/engine/src/inkling2/ink_main.cpp
-index e9ab31b8..570d3441 100644
+index e9ab31b8..0ec45df5 100644
 --- a/engine/src/inkling2/ink_main.cpp
 +++ b/engine/src/inkling2/ink_main.cpp
-@@ -192,7 +192,10 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -166,6 +166,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+     std::vector<int32_t> next_tok(P, 100);
+     std::vector<float> logits(static_cast<size_t>(P) * V);
+     StepBatch batch;
++    // STRATA_BENCH_SAME_PROMPT: every slot gets slot 0's prompt (pascal-llm: per-slot tokens comparable to P=1).
++    const int slot_mul = std::getenv("STRATA_BENCH_SAME_PROMPT") ? 0 : 31;
+     double t_pf0 = now_s();
+     for (int p0 = 0; p0 < prompt_len; p0 += bo.chunk) {
+         int len = std::min(bo.chunk, prompt_len - p0);
+@@ -174,7 +176,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+         for (int s = 0; s < P; ++s) {
+             for (int k = 0; k < len; ++k) {
+                 bool is_last = (p0 + k == prompt_len - 1);
+-                batch.push(s, p0 + k, 100 + ((s * 31 + p0 + k) % 1000), is_last);
++                batch.push(s, p0 + k, 100 + ((s * slot_mul + p0 + k) % 1000), is_last);
+             }
+         }
+         if (!backend->forward_batch(batch, (p0 + len == prompt_len) ? logits.data() : nullptr, nullptr, err)) {
+@@ -192,7 +194,10 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
  
      double t_dec0 = now_s();
      int total_gen = 0;
@@ -1692,7 +1710,7 @@ index e9ab31b8..570d3441 100644
          int cur_pos = prompt_len;
          while (total_gen < gen_len && cur_pos < eff_ctx) {
              const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
-@@ -203,6 +206,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -203,6 +208,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                      0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
                  if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
                  if (n_emit > 0) {
@@ -1701,7 +1719,7 @@ index e9ab31b8..570d3441 100644
                      next_tok[0] = emitted[n_emit - 1];
                      cur_pos += n_emit;
                      total_gen += n_emit;
-@@ -219,10 +224,14 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -219,10 +226,17 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
              int32_t best = 0;
              for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
              next_tok[0] = best;
@@ -1711,20 +1729,27 @@ index e9ab31b8..570d3441 100644
 +        if (spec_steps > 0) std::fprintf(stderr, "\n[bench] spec steps=%d tokens/step=%.2f\n", spec_steps, (double)total_gen / spec_steps);
      } else {
 +        const bool print_tokens = std::getenv("STRATA_BENCH_TOKENS") != nullptr;
++        std::vector<std::string> slot_toks(P);
          for (int step = 0; step < gen_len; ++step) {
 +            if (print_tokens && P == 1) std::fprintf(stderr, "%s%d", step ? "," : "[bench] tokens=", next_tok[0]);
++            if (print_tokens && P > 1)
++                for (int s = 0; s < P; ++s) slot_toks[s] += (step ? "," : "") + std::to_string(next_tok[s]);
              batch.clear();
              batch.capture_taps = use_dspark;
              for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
-@@ -240,6 +249,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -238,8 +252,11 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+                 ++total_gen;
+             }
          }
++        for (int s = 0; s < P && print_tokens && P > 1; ++s)
++            std::fprintf(stderr, "[bench] slot %d tokens=%s\n", s, slot_toks[s].c_str());
      }
      double dec_s = now_s() - t_dec0;
 +    if (std::getenv("STRATA_BENCH_TOKENS") != nullptr) std::fprintf(stderr, "\n");
      double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
      double tps_agg = total_gen / std::max(dec_s, 1e-9);
      printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
-@@ -282,10 +292,22 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
+@@ -282,10 +299,22 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
  
      std::vector<float> got_lg(static_cast<size_t>(n_tok) * V);
      StepBatch batch;
@@ -1751,7 +1776,7 @@ index e9ab31b8..570d3441 100644
      }
  
      double kld_sum = 0.0, nll_sum = 0.0;
-@@ -462,6 +484,8 @@ int main(int argc, char** argv) {
+@@ -462,6 +491,8 @@ int main(int argc, char** argv) {
                  cfg.bopts.gpu_ids.clear();
                  cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
              }

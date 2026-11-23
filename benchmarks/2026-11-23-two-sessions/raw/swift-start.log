@@ -1,0 +1,3 @@
+Placement admitted: pascal-strata, physical CUDA [0, 1, 2], port 8081
+Strata config valid: /home/vm/pascal-llm/work/strata-next/strata-swift-iq3_s.json (swift-flash-next-iq3-s, GPUs 0,1,2, context=262144, FP16 KV, parallel=2)
+Strata is ready at http://10.10.88.7:8081.

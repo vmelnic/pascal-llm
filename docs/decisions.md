@@ -166,6 +166,12 @@ They may be reopened only through the explicit complete-latency gate in
   >100 tok/s results are RTX 3090/A6000; the kernels use `mma.sync`,
   `ldmatrix` and `cp.async`, and the build skips `maya-ik2` below sm_80
   (`CMakeLists.txt` line 899). NInfer accepts only sm_70+.
+- One persistent TP3 kernel per P100 for Inkling 2 Mini decode (2026-11-23).
+  Go/no-go gate: one fused SWA visit <= 200 us (engine TP3 path ~320 us).
+  The PoW (`tools/poc/inkling-tp3-megakernel-visit.cu`) measured 230.8 us,
+  then 230.3 us after one corrective patch; rejected after the second failure.
+  Even before global visits, loop controllers and the head it implies
+  ~11.1 ms/token (~90 tok/s), so it cannot reach 100 tok/s.
 
 ## Open decision
 
