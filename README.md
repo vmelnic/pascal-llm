@@ -40,8 +40,8 @@ with normal project instructions and skill discovery, and no tool round trip:
 | Swift 1.5 Qwen3.8 GSQ-RCO | IQ2_S with embedded MTP, 8.95 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 46.37 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | Swift 1.5 Qwen3.8 Heretic | i1 Q4_K_M with embedded MTP, 15.66 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 40.55 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | Swift 1.5 Flash-Next via Strata 0.1.46.3 | full-expert IQ3_S, 77.99 GiB source | 3 x P100 layer split | 262,144 maximum, F16 K/V, 32K GPU-resident window | 56.5 tok/s short prompt | 39.3-42.9 tok/s | OpenAI, real Pi and two concurrent Pi transports passed; populated 262K unqualified |
-| Swift 1.5 Flash-Next via Strata 0.2.20 (selectable) | same prepared IQ3_S pack | 3 x P100 layer split, MTP | same | 246.5 tok/s, 5,666-token Pi `hi` | 38.1 tok/s, 164 tokens | one real Pi `hi` passed in 27.9 s; MTP accepted 91/165 |
-| Inkling 2 Mini via Strata 0.2.20 + pascal-llm TP3 (active) | SQ-20 native SF4+MX8, 19.35 GB | 3 x P100 tensor parallel (`--tp 3`, patches/strata-next) | 1 slot x 262,144, F16 K/V in VRAM, global KV split 3/3/2 | ~440 tok/s, 7,001-token Pi `hi` | 58.9 tok/s, 75 tokens (57.5 tok/s after the multi-turn fixes); two agents at once were measured no faster than one after the other | real Pi `hi` through the `pascal-strata` service on 8081 passed in 18.2 s; two concurrent Pi sessions passed (`benchmarks/2026-11-23-two-sessions/`); real multi-turn agents reuse 96% of prompt tokens after the prefill, prefix and TP3-deadlock fixes (`benchmarks/2026-11-23-two-agents-real/`), Inkling itself loops on some tool tasks; KLD 0.0013 vs unmodified engine (its own noise 0.0012) |
+| Swift 1.5 Flash-Next via Strata 0.2.20 (active) | same prepared IQ3_S pack | 3 x P100 layer split, MTP, 2 slots | same | 246.5 tok/s, 5,666-token Pi `hi` | 46-50 tok/s per agent in real Pi tasks (38.1 tok/s in the first `hi`) | one real Pi `hi` passed in 27.9 s; real Pi agents at `--thinking medium` answer correctly (`benchmarks/2026-11-23-thinking-effort/`); two agents at once finish 31% sooner than one after the other (`benchmarks/2026-11-24-swift-two-agents/`); no faster single-stream path fits this host (`docs/swift-tp3-plan.md`) |
+| Inkling 2 Mini via Strata 0.2.20 + pascal-llm TP3 (rejected for agent work) | SQ-20 native SF4+MX8, 19.35 GB | 3 x P100 tensor parallel (`--tp 3`, patches/strata-next) | 1 slot x 262,144, F16 K/V in VRAM, global KV split 3/3/2 | ~440 tok/s, 7,001-token Pi `hi` | 58.9 tok/s, 75 tokens (57.5 tok/s after the multi-turn fixes); two agents at once were measured no faster than one after the other | real Pi `hi` through the `pascal-strata` service on 8081 passed in 18.2 s; two concurrent Pi sessions passed (`benchmarks/2026-11-23-two-sessions/`); real multi-turn agents reuse 96% of prompt tokens after the prefill, prefix and TP3-deadlock fixes (`benchmarks/2026-11-23-two-agents-real/`), Inkling itself loops on long tool sessions (~600 repeated `bash` calls at ~106K context instead of the `edit` its thinking named; a clean `edit` turn works); KLD 0.0013 vs unmodified engine (its own noise 0.0012) |
 | Inkling 2 Mini via unmodified Strata 0.2.20 | same | 3 x P100 layer split; DSpark disabled by the engine in layer split | same | ~229 tok/s | 38.6 tok/s | superseded |
 | Gemma 4 26B A4B | official QAT Q4_0, 13.45 GiB | 1 x P40, native SM61 build | 262,144 configured, F16 K/V | 756.13 tok/s, 5,358 tokens | 55.09 tok/s, 105 tokens | one real Pi `hi` passed in 10.67 s; tools and populated maximum unqualified |
 | North Mini Code 1.0 | Q4_K_M, 17.46 GiB | 3 x P100 tensor / 1 x P40 | 65,536 shared, F16 K/V | 200.63 / 47.67 tok/s | 45.11 / 30.42 tok/s | direct and minimal Pi transport passed |
@@ -126,8 +126,8 @@ only as the rollback runtime and as the Swift preparation path used by
 
 | Model | OpenAI model ID | Physical GPUs | Pi provider | Launch |
 |---|---|---|---|---|
-| Swift 1.5 Flash-Next, full-expert IQ3_S | `swift-flash-next-iq3-s` | P100 `0,1,2` | `pascal-strata` | `pascal-strata` service, port 8081 |
-| Inkling 2 Mini SQ-20 (TP3, active) | `inkling-2-mini-sq20` | P100 `0,1,2` | `pascal-strata` | `pascal-strata` service, port 8081 |
+| Swift 1.5 Flash-Next, full-expert IQ3_S (active) | `swift-flash-next-iq3-s` | P100 `0,1,2` | `pascal-strata` | `pascal-strata` service, port 8081 |
+| Inkling 2 Mini SQ-20 (TP3, not for agent work) | `inkling-2-mini-sq20` | P100 `0,1,2` | `pascal-strata` | `pascal-strata` service, port 8081 |
 
 Both models share the one `pascal-strata` service, its P100s and port 8081;
 exactly one is loaded. `./ops/strata.sh start inkling` or `start swift` selects
@@ -143,7 +143,10 @@ Inkling runs with the pascal-llm tensor-parallel decode
 is downloaded with
 `PASCAL_MODEL_PROFILE_DIR=config/strata ./ops/download-model.sh inkling-mini-sq20`
 on X99E. See `docs/inkling-tp3-plan.md` and `docs/feasibility.md` for the
-measurements and why it does not reach 100 tok/s on this host.
+measurements and why it does not reach 100 tok/s on this host. Inkling is ~20%
+faster than Swift per token but not used for agents: in long tool sessions it
+repeats one tool call instead of the one it means (see `docs/decisions.md`).
+Swift is the active model; `ops/pi.sh` starts Pi with `--thinking medium`.
 
 The complete command list is:
 

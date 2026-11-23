@@ -172,6 +172,15 @@ They may be reopened only through the explicit complete-latency gate in
   then 230.3 us after one corrective patch; rejected after the second failure.
   Even before global visits, loop controllers and the head it implies
   ~11.1 ms/token (~90 tok/s), so it cannot reach 100 tok/s.
+- Inkling 2 Mini as the agent model (2026-11-24). Fast (56-60 tok/s in Pi with
+  TP3 and suffix drafts, 10/10 on a read-only project task), but unreliable in
+  long tool sessions: at ~106K context it emitted ~600 near-identical `bash`
+  calls in 20 minutes while its thinking said to use `edit`; earlier it paged
+  the same `grep` output for over an hour. The server forwards `edit` calls
+  intact (a 4,052-character `newText` parsed exactly) and a clean Pi turn uses
+  `read` -> `edit` -> `read` correctly, so the cause is the model. Swift stays
+  the agent model; a harness guard should stop a turn after repeated calls
+  without progress.
 - Swift 1.5 Flash-Next faster decode on 3 x P100 (2026-11-23). The layer split
   runs one GPU at a time (one busy 78%, none 19%). Tensor parallel through
   Strata's `strata-split` builds for sm_60 but needs every expert in VRAM

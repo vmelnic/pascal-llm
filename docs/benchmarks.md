@@ -1,3 +1,11 @@
+## Swift: two real Pi agents at once (2026-11-24)
+
+Full method and data: `benchmarks/2026-11-24-swift-two-agents/`. Swift 1.5
+Flash-Next IQ3_S, service config (`parallel=2`), `--thinking medium`: task A
+alone 96.4 s, task C alone 37.8 s (134.2 s one after the other); both at once
+92.1 s (A 92.1 s, C 68.0 s), 31% sooner. While both decode each request runs at
+19-31 tok/s instead of ~48. Unlike Inkling, two agents are worth it on Swift.
+
 ## Swift decode profile on 3 x P100 (2026-11-23)
 
 Full method and data: `benchmarks/2026-11-23-swift-decode-profile/`. Layer
