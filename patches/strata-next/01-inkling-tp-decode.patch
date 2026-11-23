@@ -2370,3 +2370,292 @@ index 00000000..99e2ed50
 +};
 +
 +}  // namespace strata::ink
+diff --git a/terminal/serve/inkling_dialect.py b/terminal/serve/inkling_dialect.py
+index 719d380b..3941a042 100644
+--- a/terminal/serve/inkling_dialect.py
++++ b/terminal/serve/inkling_dialect.py
+@@ -34,6 +34,10 @@ ENDOFTEXT = "<|endoftext|>"
+ _HEADER_TAGS = (CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML, END_MSG, END_SAMPLING, ENDOFTEXT, MSG_MODEL)
+ _IDLE_TAGS = (MSG_MODEL, CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML, END_MSG, END_SAMPLING, ENDOFTEXT)
+ _BODY_TAGS = (END_MSG, END_SAMPLING, ENDOFTEXT, MSG_MODEL)
++# pascal-llm: inside thinking only an end of the message or a direct switch to an answer channel ends it. A
++# <|message_model|> or <|content_thinking|> written there is text the model quotes (a file comment, the template), and
++# treating it as a new message sent the rest of the thinking to the visible answer.
++_THINK_TAGS = (END_MSG, END_SAMPLING, ENDOFTEXT, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML)
+ _MAX_TAG = max(len(t) for t in _HEADER_TAGS)
+ _MAX_HEADER_CHARS = 128
+ 
+@@ -121,7 +125,9 @@ class InklingDialect:
+         self._in_think = False
+ 
+     def _tags_for(self):
+-        if self.state in ("idle", "think"):
++        if self.state == "think":
++            return _THINK_TAGS
++        if self.state == "idle":
+             return _IDLE_TAGS
+         if self.state == "header":
+             return _HEADER_TAGS
+@@ -189,7 +195,9 @@ class InklingDialect:
+         if not chunk:
+             return
+         if self.state == "think":
+-            # Inkling-2-Mini has no thinking mode (off / "none" only): silently discard any raw <|content_thinking|> span.
++            # pascal-llm: the requested effort is honoured (template_kwargs), so the thinking channel is the reply's
++            # reasoning (upstream discarded it).
++            out.append(("reasoning", chunk))
+             return
+         elif self.state in ("idle", "text"):
+             out.append(("content", chunk))
+@@ -280,24 +288,49 @@ def translate(text: str) -> str:
+     return InklingDialect().feed(text, final=True)
+ 
+ 
+-# ---- thinking mode: Inkling-2-Mini has NO thinking mode (default is off / "none", and that's it) ----
++# ---- thinking effort ----
++# pascal-llm: Inkling-2-Mini's chat_template.jinja maps none / minimal / low / medium / high / xhigh / max (or a number
++# in [0, 0.99]) to a "Thinking effort level: N" system turn. Upstream forced "none" for every request (#6612, #6620,
++# #6627: thinking used up max_tokens, looped, and broke prompt reuse); here the client's level is honoured. A request
++# that names no level keeps the previous behaviour (thinking off). Prompt reuse with thinking relies on the engine's
++# --tail-role-token checkpoint in front of the reply's <|message_model|>.
+ DEFAULT_EFFORT = "none"
++LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+ EFFORT = {
+     "none": "none", "off": "none", "no_think": "none", "disabled": "none", "false": "none", "0": "none", "0.0": "none",
++    **{level: level for level in LEVELS},
+ }
+ 
+ 
+-def normalize_effort(value=None) -> str:
+-    """Inkling-2-Mini has no thinking mode: always normalizes to `"none"` (`Thinking effort level: 0`)."""
+-    return DEFAULT_EFFORT
++def normalize_effort(value=None):
++    """A client's reasoning effort -> the template's value: a LEVELS word, or a number in [0, 0.99]."""
++    if value is None or value == "" or value is False:
++        return DEFAULT_EFFORT
++    if value is True:
++        return "high"
++    if isinstance(value, (int, float)):
++        v = float(value)
++        if not 0.0 <= v <= 0.99:
++            raise ValueError(f"unknown reasoning effort {value!r}: use a number in [0, 0.99] or one of {', '.join(LEVELS)}")
++        return "none" if v == 0.0 else v
++    key = str(value).strip().lower()
++    if key not in EFFORT:
++        raise ValueError(f"unknown reasoning effort {value!r}: use one of {', '.join(LEVELS)}")
++    return EFFORT[key]
++
++
++def thinking_on(effort) -> bool:
++    return effort not in (None, "", "none", 0, 0.0)
+ 
+ 
+ def template_kwargs(kwargs: dict) -> dict:
+-    """Normalize kwargs for Inkling-2-Mini's chat_template.jinja: always enforces thinking off (`reasoning_effort="none"`)."""
++    """Normalize kwargs for Inkling-2-Mini's chat_template.jinja: the requested effort, `none` when absent or when
++    `enable_thinking` is False."""
+     out = dict(kwargs)
+     out.pop("thinking_mode", None)
+-    out["enable_thinking"] = False
+-    out["reasoning_effort"] = DEFAULT_EFFORT
++    effort = "none" if out.get("enable_thinking") is False else normalize_effort(out.get("reasoning_effort"))
++    out["enable_thinking"] = thinking_on(effort)
++    out["reasoning_effort"] = effort
+     return out
+ 
+ 
+@@ -332,7 +365,7 @@ def prepare_messages(messages: list[dict]) -> list[dict]:
+     return out
+ 
+ 
+-def finish_prompt(prompt: str, *, has_tools: bool = False, forced: bool = False) -> str:
++def finish_prompt(prompt: str, *, has_tools: bool = False, forced: bool = False, effort=DEFAULT_EFFORT) -> str:
+     """Append an explicit non-thinking turn opener to a rendered Inkling-2-Mini prompt (#6612, #6620, #6627).
+ 
+     Inkling-2-Mini's `chat_template.jinja` ends at `<|end_message|>` with no assistant opener, so even with
+@@ -347,6 +380,10 @@ def finish_prompt(prompt: str, *, has_tools: bool = False, forced: bool = False)
+     """
+     if not prompt or forced:
+         return prompt
++    if thinking_on(effort):
++        # pascal-llm: thinking requested: open the reply turn only; the model writes <|content_thinking|> itself and
++        # the parser routes it to reasoning. The engine's tail-role checkpoint sits in front of this <|message_model|>.
++        return prompt if prompt.endswith((MSG_MODEL, CONTENT_THINK)) else prompt + MSG_MODEL
+     empty_think = f"{MSG_MODEL}{CONTENT_THINK}{END_MSG}"
+     if prompt.endswith((CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, empty_think)):
+         return prompt
+diff --git a/terminal/serve/server.py b/terminal/serve/server.py
+index 814f0345..3c1693d5 100644
+--- a/terminal/serve/server.py
++++ b/terminal/serve/server.py
+@@ -5171,8 +5171,9 @@ class Service:
+         if self.hy4:                                   # Hy4's template reads reasoning_effort no_think | high | max (serve/hy4_dialect.py)
+             return self.template.render(messages, tools=tools, **hy4_dialect.template_kwargs(kwargs))
+         if self.inkling:                               # Inkling-2-Mini: skip hidden <|content_thinking|> at the prompt boundary (#6612, #6620, #6627)
+-            rendered = self.template.render(inkling_dialect.prepare_messages(messages), tools=tools, **inkling_dialect.template_kwargs(kwargs))
+-            return inkling_dialect.finish_prompt(rendered, has_tools=bool(tools))
++            ikw = inkling_dialect.template_kwargs(kwargs)
++            rendered = self.template.render(inkling_dialect.prepare_messages(messages), tools=tools, **ikw)
++            return inkling_dialect.finish_prompt(rendered, has_tools=bool(tools), effort=ikw["reasoning_effort"])
+         effort = kwargs.get("reasoning_effort")
+         off = kwargs.get("enable_thinking") is False
+         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+diff --git a/terminal/serve/test_inkling_dialect.py b/terminal/serve/test_inkling_dialect.py
+index a09c1bdb..dcc153ab 100644
+--- a/terminal/serve/test_inkling_dialect.py
++++ b/terminal/serve/test_inkling_dialect.py
+@@ -20,10 +20,10 @@ class TestInklingDialect(unittest.TestCase):
+             "<|message_model|><|content_text|>The answer is 4.<|end_message|>"
+             "<|content_model_end_sampling|>"
+         )
+-        # Feed 1 character at a time: raw <|content_thinking|> is silently discarded (no thinking mode), text streams cleanly
++        # Feed 1 character at a time: pascal-llm keeps <|content_thinking|> as reasoning, text streams cleanly
+         d = inkling_dialect.InklingDialect()
+         out = "".join(d.feed(ch) for ch in raw) + d.feed(final=True)
+-        self.assertEqual(out, "The answer is 4.")
++        self.assertEqual(out, "<think>Let me check 2 + 2 = 4.</think>The answer is 4.")
+         self.assertEqual(d.calls, 0)
+ 
+     def test_tool_call_preserves_xml_chars_quotes_and_closing_tags(self):
+@@ -57,7 +57,7 @@ class TestInklingDialect(unittest.TestCase):
+             elif ev.kind == "tool_call" and ev.call is not None:
+                 tool_calls.append({"name": ev.call.name, "arguments": ev.call.arguments})
+ 
+-        self.assertEqual("".join(reasoning_parts), "")
++        self.assertEqual("".join(reasoning_parts), "Writing patch with < and > and </tool_call>.")
+         self.assertEqual("".join(content_parts), "")
+         self.assertEqual(len(tool_calls), 1)
+         self.assertEqual(tool_calls[0]["name"], "write_file")
+@@ -77,15 +77,43 @@ class TestInklingDialect(unittest.TestCase):
+         calls = [ev.call for ev in events if ev.kind == "tool_call" and ev.call is not None]
+         self.assertEqual([c.arguments["path"] for c in calls], ["a.py", "b.py"])
+ 
+-    def test_no_thinking_mode_always_off(self):
+-        # Inkling-2-Mini has no thinking mode: default is off ("none") and every input normalizes to "none"
+-        for level in (None, "", "none", "off", "minimal", "low", "medium", "high", "max", "xhigh", 0.0, 0.9):
++    def test_reasoning_effort_is_honoured(self):
++        # pascal-llm: the client's level reaches the template; no level (or enable_thinking False) stays "none"
++        for level in (None, "", "none", "off", False, 0.0):
+             self.assertEqual(inkling_dialect.normalize_effort(level), "none")
++        for level in ("minimal", "low", "medium", "high", "xhigh", "max"):
++            self.assertEqual(inkling_dialect.normalize_effort(level), level)
++        self.assertEqual(inkling_dialect.normalize_effort(0.9), 0.9)
++        with self.assertRaises(ValueError):
++            inkling_dialect.normalize_effort("ultra")
+         self.assertEqual(inkling_dialect.template_kwargs({}), {"enable_thinking": False, "reasoning_effort": "none"})
+-        for level in ("none", "minimal", "low", "medium", "high", "max"):
+-            got = inkling_dialect.template_kwargs({"reasoning_effort": level})
+-            self.assertEqual(got, {"enable_thinking": False, "reasoning_effort": "none"})
+-        self.assertEqual(inkling_dialect.template_kwargs({"enable_thinking": True, "thinking_mode": "high"}), {"enable_thinking": False, "reasoning_effort": "none"})
++        self.assertEqual(inkling_dialect.template_kwargs({"reasoning_effort": "medium"}),
++                         {"enable_thinking": True, "reasoning_effort": "medium"})
++        self.assertEqual(inkling_dialect.template_kwargs({"reasoning_effort": "xhigh", "enable_thinking": False}),
++                         {"enable_thinking": False, "reasoning_effort": "none"})
++        self.assertEqual(inkling_dialect.template_kwargs({"thinking_mode": "high"}), {"enable_thinking": False, "reasoning_effort": "none"})
++
++    def test_quoted_role_tag_inside_thinking_stays_reasoning(self):
++        # pascal-llm: the model quoted "<|message_model|> (200001)" from a file comment while thinking (Pi, xhigh)
++        raw = ("<|message_model|><|content_thinking|>The checkpoint sits in front of the last <|message_model|> (200001)"
++               " so tool turns resume. Draft the answer.<|end_message|>"
++               "<|message_model|><|content_text|>Answer.<|end_message|><|content_model_end_sampling|>")
++        d = inkling_dialect.InklingDialect()
++        chunks = []
++        for ch in raw:
++            chunks += d.feed_channels(ch)
++        chunks += d.feed_channels("", final=True)
++        reasoning = "".join(t for k, t in chunks if k == "reasoning")
++        content = "".join(t for k, t in chunks if k == "content")
++        self.assertEqual(content, "Answer.")
++        self.assertIn("last <|message_model|> (200001) so tool turns resume. Draft the answer.", reasoning)
++
++    def test_finish_prompt_opens_the_reply_when_thinking(self):
++        base = "<|message_user|><|content_text|>hi<|end_message|>"
++        for tools in (False, True):
++            got = inkling_dialect.finish_prompt(base, has_tools=tools, effort="medium")
++            self.assertEqual(got, base + "<|message_model|>")
++            self.assertEqual(inkling_dialect.finish_prompt(got, has_tools=tools, effort="medium"), got)
+ 
+     def test_chat_template_empty_kwargs_forces_effort_zero_and_caps_no_reasoning(self):
+         import tempfile
+@@ -294,7 +322,7 @@ class TestInklingDialect(unittest.TestCase):
+             "<|message_model|><|content_thinking|>internal plan"
+             "<|content_text|>Visible YAML answer.<|end_message|>"
+         )
+-        self.assertEqual(inkling_dialect.translate(direct_exit), "Visible YAML answer.")
++        self.assertEqual(inkling_dialect.translate(direct_exit), "<think>internal plan</think>Visible YAML answer.")
+ 
+         # 4. Truncated non-JSON inside <|content_invoke_tool_json|> on final=True releases text instead of bogus raw call
+         truncated_prose = "<|message_model|>search_web<|content_invoke_tool_json|>services:\n  db:\n    image: postgres:16"
+diff --git a/terminal/serve/test_inkling_e2e.py b/terminal/serve/test_inkling_e2e.py
+index e2cdbef1..f6bb477d 100644
+--- a/terminal/serve/test_inkling_e2e.py
++++ b/terminal/serve/test_inkling_e2e.py
+@@ -374,7 +374,7 @@ class TestInklingServing(unittest.TestCase):
+         reason = "".join(e.text for e in events if e.kind == "reasoning")
+         content = "".join(e.text for e in events if e.kind == "content")
+         calls = [e.call for e in events if e.kind == "tool_call"]
+-        self.assertEqual(reason, "")
++        self.assertEqual(reason, "Let me check Tokyo weather.")
+         self.assertIn("Checking now.", content)
+         self.assertEqual(len(calls), 1)
+         self.assertEqual(calls[0].name, "get_weather")
+@@ -397,9 +397,11 @@ class TestInklingServing(unittest.TestCase):
+         self.assertIn("a < b && c > 0", calls2[0].arguments["code"])
+ 
+     def test_reasoning_effort_and_parallel_64_args(self):
+-        # Inkling-2-Mini has no thinking mode: default is off ("none") and every input normalizes to "none".
+-        for k in ("none", "off", "minimal", "low", "medium", "high", "max"):
++        # pascal-llm: off words normalize to "none"; the template's levels pass through.
++        for k in ("none", "off"):
+             self.assertEqual(inkling_dialect.normalize_effort(k), "none")
++        for k in ("minimal", "low", "medium", "high", "max"):
++            self.assertEqual(inkling_dialect.normalize_effort(k), k)
+         cfg = {"arch": "inkling2_loop", "exe": "component:strata-inkling", "args": ["--native", "m.strata"], "parallel": 64}
+         self.assertEqual(srv_engines.parallel_args(cfg, list(cfg["args"])), ["--parallel", "64"])
+         self.assertTrue(inkling_kind.is_inkling(cfg))
+diff --git a/terminal/serve/test_inkling_serve_e2e.py b/terminal/serve/test_inkling_serve_e2e.py
+index ed37d91f..6b355026 100644
+--- a/terminal/serve/test_inkling_serve_e2e.py
++++ b/terminal/serve/test_inkling_serve_e2e.py
+@@ -257,7 +257,7 @@ class TestInklingServeE2E(unittest.TestCase):
+                     "messages": [{"role": "user", "content": "Say hi"}],
+                 })
+                 msg1 = r1["choices"][0]["message"]
+-                self.assertFalse(msg1.get("reasoning_content"))
++                self.assertEqual(msg1.get("reasoning_content"), "Quick thought.")
+                 self.assertEqual(msg1["content"], "Hello from Inkling!")
+ 
+                 # 2. Tool call round-trip with XML special chars
+@@ -295,17 +295,19 @@ class TestInklingServeE2E(unittest.TestCase):
+                     "messages": [{"role": "user", "content": "Ping"}],
+                 })
+                 blocks = {b["type"]: b for b in r4["content"]}
+-                self.assertNotIn("thinking", blocks)
++                self.assertEqual(blocks["thinking"]["thinking"], "Anthropic check.")
+                 self.assertEqual(blocks["text"]["text"], "Anthropic OK.")
+ 
+                 # Verify wire protocol recorded exact reasoning effort levels & image= key
+                 lines = h.record_path.read_text(encoding="utf-8").splitlines()
+                 self.assertEqual(len(lines), 4)
+-                # Decode prompt tokens: Inkling-2-Mini has no thinking mode so all requests render Thinking effort level: 0.0
++                # Decode prompt tokens: pascal-llm honours the requested effort (low -> 0.2, max -> 0.99) and opens the
++                # reply turn with <|message_model|> only, so the model writes its own thinking channel.
+                 p1 = h.tok.decode([int(x) for x in lines[0].split()[-1].split(",")])
+                 p2 = h.tok.decode([int(x) for x in lines[1].split()[-1].split(",")])
+-                self.assertIn("Thinking effort level: 0.0", p1)
+-                self.assertIn("Thinking effort level: 0.0", p2)
++                self.assertIn("Thinking effort level: 0.2", p1)
++                self.assertIn("Thinking effort level: 0.99", p2)
++                self.assertTrue(p1.endswith("<|message_model|>"))
+                 self.assertIn("image=", lines[2])
+ 
+     def test_concurrent_streaming_4_8_32_64(self):
+@@ -331,7 +333,7 @@ class TestInklingServeE2E(unittest.TestCase):
+                     self.assertEqual(len(results), conc)
+                     for txt, thk in results:
+                         self.assertEqual(txt, "Batch OK.", f"failed at c={conc}")
+-                        self.assertEqual(thk, "", f"unexpected reasoning leaked at c={conc}")
++                        self.assertEqual(thk, "Parallel slot.", f"reasoning lost at c={conc}")
+ 
+ 
+ if __name__ == "__main__":

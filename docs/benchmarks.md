@@ -1,3 +1,33 @@
+## Thinking effort in Pi: Inkling vs Swift (2026-11-23)
+
+Full method, table and evaluation: `benchmarks/2026-11-23-thinking-effort/`.
+One real Pi task about this repository, `--thinking low / medium / xhigh`:
+Inkling 41.0 / 68.6 / 173.5 s, Swift 75.8 / 69.8 / 180.9 s; answers 10/10
+facts except Swift low (9/10). Medium is enough on both; `ops/pi.sh` now
+defaults to `--thinking medium`. Inkling decodes ~20% faster but thinks about
+twice as much at xhigh. A parser defect (a quoted `<|message_model|>` inside
+Inkling's thinking leaked the rest into the answer) was found and fixed.
+
+## Inkling thinking effort honoured (2026-11-23)
+
+Upstream Strata forced `Thinking effort level: 0` for every Inkling request and
+discarded any `<|content_thinking|>` output (`serve/inkling_dialect.py`; upstream
+#6612, #6620, #6627: thinking used up `max_tokens`, looped and broke prompt
+reuse). The patch now passes the client's `reasoning_effort` (none, minimal, low,
+medium, high, xhigh, max, or a number in [0, 0.99]) to the model's template,
+opens the reply with `<|message_model|>` when thinking is on, and returns the
+thinking channel as `reasoning_content`. No level keeps effort 0. Checks: the
+Inkling server tests pass (updated for the new behaviour); API, one question:
+none 19, low 96, medium 135, xhigh 154 generated tokens; Pi `hi` with
+`--thinking low` / `xhigh`: thinking then text, rc 0, 18-19 s.
+
+## Suffix-lookup drafts on Inkling TP3 (2026-11-23)
+
+Full method and data: `benchmarks/2026-11-23-suffix-drafts/`. Pi agent A long
+answer 55.8 -> 58.7 tok/s; verify step M=4 33.6 ms against 17.0 ms plain; drafts
+cover about a quarter of the tokens. SQ-15 measured at 20.5 tok/s against 44.6
+for SQ-20 (layer split) and rejected.
+
 ## Real Pi agents on Inkling TP3, two slots (2026-11-23)
 
 Full method, artifacts and table: `benchmarks/2026-11-23-two-agents-real/`.

@@ -45,9 +45,11 @@ command -v pi >/dev/null 2>&1 || {
   exit 2
 }
 
+# Default thinking level medium: in the 2026-11-23 effort benchmark (benchmarks/2026-11-23-thinking-effort/) medium
+# answered as correctly as xhigh on both Strata models in ~40% of the time. A later --thinking argument overrides it.
 exec pi \
   --approve \
   --provider "${pi_provider}" \
   --model "${model_id}" \
-  --thinking xhigh \
+  --thinking "${PASCAL_PI_THINKING:-medium}" \
   "$@"
