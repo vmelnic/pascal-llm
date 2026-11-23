@@ -172,6 +172,12 @@ They may be reopened only through the explicit complete-latency gate in
   then 230.3 us after one corrective patch; rejected after the second failure.
   Even before global visits, loop controllers and the head it implies
   ~11.1 ms/token (~90 tok/s), so it cannot reach 100 tok/s.
+- Inkling 2 Mini SQ-15 pack for speed (2026-11-23). Lossy (96.68% top-1
+  upstream), and its expert codecs are not uniform SF4/MX8, so the TP3 row
+  split cannot load it; on the layer split it decodes at 20.5 tok/s against
+  44.6 for SQ-20 on the same build. SQ-20 stays.
+- Inkling DSpark/MTP drafts on TP3 (2026-11-23). Embedded 3-layer drafter
+  (`mtp_config`), replicated on every rank: 51.0 tok/s against 62.4 plain.
 
 ## Open decision
 

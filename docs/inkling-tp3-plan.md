@@ -222,3 +222,38 @@ the second slot pushes the tail of every slot's global KV beyond 161,536 tokens
 into mapped host RAM. With one slot, all 262,144 tokens of KV stay in VRAM
 (12,941 / 11,917 / 12,941 MiB), and Pi `hi` decodes at 57.5 tok/s with the
 7,001-token prompt read in ~16 s (18.1 s wall).
+
+## Suffix-lookup drafts (2026-11-23)
+
+`--draft suffix --suffix-k 3 --suffix-min 4` (`ink_suffix.h`, the main engine's
+`SuffixDrafter` algorithm): no draft model; when the last >= 4 tokens occur
+earlier in the prompt or reply, the up to 3 tokens that followed are verified
+by the target model in one step. Sampled requests use the existing snapshot /
+tree-verify / rollback path with host rejection sampling; greedy requests use
+`verify_chain_greedy` (tree verify, TP exact argmax, no logits D2H). Pi sends
+`temperature 1.0` for Inkling, so it takes the sampled path.
+
+| Measurement | Result |
+|---|---|
+| Offline replay of 89 real agent turns (greedy, step costs below) | x1.04-1.14 on answers (A, C), x1.69 on the looping task B |
+| Verify step, `STRATA_BENCH_CHAIN` (512-token prompt) | M=1 16.0 ms, M=2 21.6 ms, M=4 27.4 ms |
+| Verify step in service, M=4 (~7K prompt) | 33.6 ms (device argmax), 37.6 ms (host sampling) |
+| Plain M=1 decode by depth (`--bench`) | 512: 62.5, 8,192: 57.3, 11,264: 56.1 tok/s; Pi at ~11K: 55.8 tok/s |
+| Pi agent A, long answer | 55.8 -> 58.7 tok/s; tool-call turns 57 -> 61-71 tok/s |
+| Draft acceptance in Pi (sampled) | 52-55% of offered tokens |
+
+Drafts cover about a quarter of the emitted tokens, so even a verify step as
+cheap as a plain step would give ~65 tok/s on that answer. The service-vs-bench
+gap at equal depth is ~0.1 ms/token: the remaining cost is global attention
+over the context, not overhead.
+
+Greedy output with drafts is not bit-identical to plain decode: at the first
+verify step (identical state) the M=4 path's logits already differ by ~0.07
+from the M=1 kernels (different reduction order, cuBLAS router for M > 1); the
+reply changed at a near tie (top-2 gap 0.11) after 339 tokens.
+`STRATA_SFX_TRACE=1` prints the path, top-1 and top-2 gap of every token.
+Data: `benchmarks/2026-11-23-suffix-drafts/`.
+
+SQ-15 (lossy, 96.68% top-1 upstream) was measured as a faster-pack candidate:
+the TP row split rejects its non-uniform expert codecs, and on the unmodified
+layer split it decodes at 20.5 tok/s against 44.6 for SQ-20. Rejected.

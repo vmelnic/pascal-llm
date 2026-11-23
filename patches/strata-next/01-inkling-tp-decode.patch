@@ -1,5 +1,5 @@
 diff --git a/engine/src/inkling2/cuda/ink_cuda_backend.cu b/engine/src/inkling2/cuda/ink_cuda_backend.cu
-index bb9b3226..10bef4be 100644
+index bb9b3226..8615e449 100644
 --- a/engine/src/inkling2/cuda/ink_cuda_backend.cu
 +++ b/engine/src/inkling2/cuda/ink_cuda_backend.cu
 @@ -20,6 +20,7 @@
@@ -49,7 +49,57 @@ index bb9b3226..10bef4be 100644
              INK_CK(cudaMemcpyAsync(h_logits_pin_, runner_->d_logits,
                                     (size_t)nw * V * sizeof(float), cudaMemcpyDeviceToHost, runner_->st));
              INK_CK(cudaStreamSynchronize(runner_->st));
-@@ -909,4 +925,226 @@ std::unique_ptr<InkBackend> make_cuda_backend() {
+@@ -821,6 +837,49 @@ public:
+         return n_emit;
+     }
+ 
++    int verify_chain_greedy(int slot, int32_t anchor_tok, int anchor_pos, const int32_t* draft, int n_draft,
++                            int max_emit, int32_t* out_emitted, std::string& /*err*/) override {
++        // Same verify and commit as dspark_spec_step_greedy, with the draft chain given by the caller. Only the
++        // TP exact-argmax head is used here (head_argmax_exact's TP branch); other configurations fall back.
++        if (!initialized_ || model_.ls_active || slot != 0 || !runner_->tp_on() || !d_sconv_snap_) return 0;
++        if (n_draft < 1 || max_emit < 1 || !out_emitted) return 0;
++        const int M = std::min(n_draft + 1, std::min(runner_->tree_cap, 8));
++        if (anchor_pos <= 0 || anchor_pos + M + 1 >= eff_max_ctx_) return 0;
++        if (!runner_->ensure_global_kv_cap(anchor_pos + M + 1)) return 0;
++        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
++            runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
++        strata::ink::InkTreeSpec tr{};
++        tr.M = M;
++        for (int k = 0; k < M; ++k) {
++            tr.tok[k] = (k == 0) ? anchor_tok : draft[k - 1];
++            tr.parent[k] = (int8_t)(k - 1);
++            tr.depth[k] = (uint8_t)k;
++        }
++        tr.build();
++        runner_->forward_tree_verify(tr, anchor_pos, 0, false);
++        int32_t target_next[strata::ink::kInkMaxTree] = {};
++        runner_->head_argmax_exact(M, target_next);
++        const int emit_cap = std::min(max_emit, M);
++        int32_t path[strata::ink::kInkMaxTree] = {};
++        int n_emit = 0;
++        while (n_emit < emit_cap) {
++            path[n_emit] = n_emit;
++            const int32_t t = target_next[n_emit];
++            out_emitted[n_emit++] = t;
++            if (n_emit >= M || tr.tok[n_emit] != t) break;   // the next chain node is this token: keep walking
++        }
++        INK_CK(cudaMemcpyAsync(runner_->d_acc_path, path, (size_t)n_emit * 4, cudaMemcpyHostToDevice, runner_->st));
++        strata::ink::k_ink_commit_sconv_all48<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
++            runner_->d_sconv_pool_arr, runner_->d_stage_sconv, runner_->d_acc_path, n_emit, 0, runner_->max_slots, runner_->tree_cap);
++        strata::ink::k_ink_commit_kv_all48<<<dim3(strata::ink::kInkVisits, strata::ink::kInkKVHeads), 128, 0, runner_->st>>>(
++            runner_->d_kv_desc_arr, runner_->d_stage_k, runner_->d_stage_v, runner_->d_acc_path, anchor_pos, n_emit, 0, runner_->tree_cap);
++        tree_snap_ready_ = true;
++        tree_snap_p0_ = anchor_pos;
++        tree_snap_M_ = n_emit;
++        for (int i = 0; i < n_emit; ++i) tree_snap_path_[i] = path[i];
++        return n_emit;
++    }
++
+     bool selfcheck(std::string& err) override {
+         cudaDeviceProp prop{};
+         cudaError_t ce = cudaGetDeviceProperties(&prop, gpu_id_);
+@@ -909,4 +968,242 @@ std::unique_ptr<InkBackend> make_cuda_backend() {
      return std::make_unique<InkCudaBackend>();
  }
  
@@ -253,6 +303,22 @@ index bb9b3226..10bef4be 100644
 +            }
 +        }
 +        if (out_drafted) *out_drafted = dr[0];
++        return n;
++    }
++
++    int verify_chain_greedy(int slot, int32_t anchor_tok, int anchor_pos, const int32_t* draft, int n_draft,
++                            int max_emit, int32_t* out_emitted, std::string& err) override {
++        const int W = (int)ranks_.size();
++        std::vector<std::vector<int32_t>> em(W, std::vector<int32_t>(16, 0));
++        const int n = all_ranks([&](int r, std::string& e) {
++            return ranks_[r]->verify_chain_greedy(slot, anchor_tok, anchor_pos, draft, n_draft, max_emit, em[r].data(), e);
++        }, err);
++        if (n > 0) {
++            for (int i = 0; i < n; ++i) out_emitted[i] = em[0][i];
++            for (int r = 1; r < W; ++r) {
++                for (int i = 0; i < n; ++i) if (em[r][i] != em[0][i]) { err = "TP ranks emitted different tokens"; return -1; }
++            }
++        }
 +        return n;
 +    }
 +
@@ -1677,7 +1743,7 @@ index 00000000..56a22d6e
 +}  // namespace strata::ink
 +
 diff --git a/engine/src/inkling2/ink_backend.h b/engine/src/inkling2/ink_backend.h
-index e8b05e78..d07bc9fa 100644
+index e8b05e78..fc60f957 100644
 --- a/engine/src/inkling2/ink_backend.h
 +++ b/engine/src/inkling2/ink_backend.h
 @@ -35,6 +35,9 @@ struct BackendOpts {
@@ -1690,7 +1756,25 @@ index e8b05e78..d07bc9fa 100644
  };
  
  struct BackendStats {
-@@ -133,6 +136,7 @@ std::unique_ptr<InkBackend> make_cpu_backend();
+@@ -118,6 +121,17 @@ public:
+         return 0;
+     }
+ 
++    // pascal-llm: greedy verify of a caller-given linear draft (suffix lookup) on the device: the chain
++    // [anchor_tok, draft[0..n_draft-1]] in one tree-verify step, exact argmax per row, the accepted prefix plus one
++    // target token committed. Returns n_emit in 1..min(n_draft + 1, max_emit), 0 to fall back, -1 on error.
++    virtual int verify_chain_greedy(
++        int slot, int32_t anchor_tok, int anchor_pos, const int32_t* draft, int n_draft, int max_emit,
++        int32_t* out_emitted, std::string& err) {
++        (void)slot; (void)anchor_tok; (void)anchor_pos; (void)draft; (void)n_draft; (void)max_emit;
++        (void)out_emitted; (void)err;
++        return 0;
++    }
++
+     // Optional GPU Vision ViT encoder: returns true if encoded on device, false to fall back to CPU ViT.
+     virtual bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) {
+         (void)img; (void)out_embeds; (void)err;
+@@ -133,6 +147,7 @@ std::unique_ptr<InkBackend> make_cpu_backend();
  
  #ifdef INKLING_ENABLE_CUDA
  std::unique_ptr<InkBackend> make_cuda_backend();
@@ -1698,7 +1782,7 @@ index e8b05e78..d07bc9fa 100644
  #endif
  #ifdef INKLING_ENABLE_EP_CUDA
  std::unique_ptr<InkBackend> make_ep_cuda_backend();
-@@ -153,6 +157,7 @@ inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false,
+@@ -153,6 +168,7 @@ inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false,
  #ifdef INKLING_ENABLE_CUDA
          // Primary InkCudaBackend natively supports .strata, .gguf, safetensors, FP16/FP8/K8V8/K8V4 KV,
          // hybrid offload + GPU+SSD streaming, Dual-GPU EP, AND multi-GPU --layer-split!
@@ -1707,7 +1791,7 @@ index e8b05e78..d07bc9fa 100644
  #elif defined(INKLING_ENABLE_EP_CUDA)
          return make_ep_cuda_backend();
 diff --git a/engine/src/inkling2/ink_main.cpp b/engine/src/inkling2/ink_main.cpp
-index e9ab31b8..b3654c00 100644
+index e9ab31b8..de01a092 100644
 --- a/engine/src/inkling2/ink_main.cpp
 +++ b/engine/src/inkling2/ink_main.cpp
 @@ -166,6 +166,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
@@ -1728,18 +1812,38 @@ index e9ab31b8..b3654c00 100644
              }
          }
          if (!backend->forward_batch(batch, (p0 + len == prompt_len) ? logits.data() : nullptr, nullptr, err)) {
-@@ -192,7 +194,10 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -192,7 +194,29 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
  
      double t_dec0 = now_s();
      int total_gen = 0;
+-    if (use_dspark && P == 1) {
 +    int spec_steps = 0;
-     if (use_dspark && P == 1) {
++    // pascal-llm: STRATA_BENCH_CHAIN=M times the device chain verify (verify_chain_greedy) at M tokens per step;
++    // the draft repeats the current token, so a step usually emits one token: the figure is the verify step cost.
++    const char* chain_env = std::getenv("STRATA_BENCH_CHAIN");
++    const int chain_m = chain_env ? std::max(0, std::min(8, std::atoi(chain_env))) : 0;
++    if (chain_m >= 2 && P == 1) {
++        int cur_pos = prompt_len;
++        int steps = 0;
++        while (total_gen < gen_len && cur_pos + 12 < eff_ctx) {
++            int32_t draft[8], emitted[16]{};
++            for (int i = 0; i < chain_m - 1; ++i) draft[i] = next_tok[0];
++            const int n = backend->verify_chain_greedy(0, next_tok[0], cur_pos, draft, chain_m - 1, gen_len - total_gen, emitted, err);
++            if (n <= 0) { fprintf(stderr, "bench chain verify: %s (%d)\n", err.c_str(), n); return 1; }
++            next_tok[0] = emitted[n - 1];
++            cur_pos += n;
++            total_gen += n;
++            ++steps;
++        }
++        std::fprintf(stderr, "[bench] chain M=%d steps=%d tokens=%d ms/step=%.2f\n", chain_m, steps, total_gen,
++                     (now_s() - t_dec0) * 1e3 / std::max(1, steps));
++    } else if (use_dspark && P == 1) {
 +        const bool print_spec = std::getenv("STRATA_BENCH_TOKENS") != nullptr;
 +        if (print_spec) std::fprintf(stderr, "[bench] tokens=%d", next_tok[0]);
          int cur_pos = prompt_len;
          while (total_gen < gen_len && cur_pos < eff_ctx) {
              const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
-@@ -203,6 +208,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -203,6 +227,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                      0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
                  if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
                  if (n_emit > 0) {
@@ -1748,7 +1852,7 @@ index e9ab31b8..b3654c00 100644
                      next_tok[0] = emitted[n_emit - 1];
                      cur_pos += n_emit;
                      total_gen += n_emit;
-@@ -219,10 +226,17 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -219,10 +245,17 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
              int32_t best = 0;
              for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
              next_tok[0] = best;
@@ -1766,7 +1870,7 @@ index e9ab31b8..b3654c00 100644
              batch.clear();
              batch.capture_taps = use_dspark;
              for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
-@@ -238,8 +252,11 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+@@ -238,8 +271,11 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                  ++total_gen;
              }
          }
@@ -1778,7 +1882,7 @@ index e9ab31b8..b3654c00 100644
      double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
      double tps_agg = total_gen / std::max(dec_s, 1e-9);
      printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
-@@ -282,10 +299,22 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
+@@ -282,10 +318,22 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
  
      std::vector<float> got_lg(static_cast<size_t>(n_tok) * V);
      StepBatch batch;
@@ -1805,7 +1909,7 @@ index e9ab31b8..b3654c00 100644
      }
  
      double kld_sum = 0.0, nll_sum = 0.0;
-@@ -409,6 +438,10 @@ int main(int argc, char** argv) {
+@@ -409,6 +457,10 @@ int main(int argc, char** argv) {
              cfg.bopts.max_ctx = std::atoi(next().c_str());
          } else if (a == "--parallel" || a == "--batch" || a == "--slots") {
              cfg.bopts.parallel = std::max(1, std::min(kMaxParallelSlots, std::atoi(next().c_str())));
@@ -1816,7 +1920,20 @@ index e9ab31b8..b3654c00 100644
          } else if (a == "--chunk") {
              cfg.bopts.chunk = std::max(1, std::atoi(next().c_str()));
          } else if (a == "--kv-dtype" || a == "--kv") {
-@@ -462,6 +495,8 @@ int main(int argc, char** argv) {
+@@ -422,7 +474,11 @@ int main(int argc, char** argv) {
+             cfg.bopts.kv_offload = next();
+         } else if (a == "--draft") {
+             cfg.draft_mode = next();
+-            cfg.bopts.enable_dspark = (cfg.draft_mode != "off");
++            cfg.bopts.enable_dspark = (cfg.draft_mode != "off" && cfg.draft_mode != "suffix");
++        } else if (a == "--suffix-k") {
++            cfg.suffix_k = std::atoi(next().c_str());
++        } else if (a == "--suffix-min") {
++            cfg.suffix_min = std::atoi(next().c_str());
+         } else if (a == "--dspark") {
+             cfg.bopts.dspark_path = next();
+         } else if (a == "--vram-experts-gb") {
+@@ -462,6 +518,8 @@ int main(int argc, char** argv) {
                  cfg.bopts.gpu_ids.clear();
                  cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
              }
@@ -1825,11 +1942,49 @@ index e9ab31b8..b3654c00 100644
          } else if (a == "--ep-split") {
              cfg.bopts.ep_split = std::atof(next().c_str());
          } else if (a == "--layer-split") {
+@@ -488,7 +546,7 @@ int main(int argc, char** argv) {
+                    "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpus 1|2] [--kv fp16|fp8|k8v8|k8v4]\n"
+                    "  --bench --native PATH [--parallel 1..64] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--ep-split F] [--vram-experts-gb F] [--ram-experts-gb F] [--ssd-experts] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--prompt-len N] [--gen N]\n"
+                    "  --kld-eval REF.bin --native PATH\n"
+-                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--draft auto|dspark|off]\n",
++                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1..4] [--layer-split auto|K1,K2,...] [--kv auto|fp16|fp8|k8v8|k8v4] [--kv-offload auto|on|off] [--draft auto|dspark|suffix|off] [--suffix-k 1..7] [--suffix-min N]\n",
+                    INKLING_VERSION);
+             return 0;
+         } else {
 diff --git a/engine/src/inkling2/ink_serve.h b/engine/src/inkling2/ink_serve.h
-index 6cbb1e8c..86fd8b2a 100644
+index 6cbb1e8c..57b956f5 100644
 --- a/engine/src/inkling2/ink_serve.h
 +++ b/engine/src/inkling2/ink_serve.h
-@@ -417,7 +417,8 @@ struct ActiveReq {
+@@ -27,6 +27,7 @@
+ #include "ink_backend.h"
+ #include "ink_batch.h"
+ #include "ink_manifest.h"
++#include "ink_suffix.h"
+ #include "ink_vision.h"
+ 
+ namespace ink2 {
+@@ -134,6 +135,20 @@ inline bool finite_logits(const float* lg, int V) noexcept {
+     return true;
+ }
+ 
++// pascal-llm: STRATA_SFX_TRACE=1 prints, for every emitted token, the path ('v' verify step row, 'd' plain decode),
++// the generated index, the top-1 id and the top-1 minus top-2 logit (diagnostics for draft/no-draft divergence).
++inline bool sfx_trace_on() {
++    static const bool on = [] { const char* e = std::getenv("STRATA_SFX_TRACE"); return e && e[0] == '1'; }();
++    return on;
++}
++inline void sfx_trace(char path, int gen_idx, const float* lg, int V) {
++    int a = 0;
++    for (int i = 1; i < V; ++i) if (lg[i] > lg[a]) a = i;
++    float second = -INFINITY;
++    for (int i = 0; i < V; ++i) if (i != a && lg[i] > second) second = lg[i];
++    std::fprintf(stderr, "[sfx-trace] %c %d %d %.5f\n", path, gen_idx, a, lg[a] - second);
++}
++
+ // Exact lossless speculative verification sampler for DSpark (Leviathan et al., 2023):
+ // Given target logits `lg[0..V-1]` and a deterministic draft token `draft_tok`:
+ //   - If greedy: picks argmax and accepts iff argmax == draft_tok.
+@@ -417,7 +432,8 @@ struct ActiveReq {
      std::vector<int32_t> cached_prefix;       // tokens currently resident in slot KV
      std::vector<int32_t> prompt_ckpt_prefix;  // prompt-end checkpoint prefix saved before generation (#6627)
      int reused_tokens = 0;                    // prefix tokens reused for this request
@@ -1839,7 +1994,16 @@ index 6cbb1e8c..86fd8b2a 100644
      double t_start = 0.0;
      double prompt_ms = 0.0;
      double decode_t0 = 0.0;
-@@ -436,6 +437,14 @@ struct ServeConfig {
+@@ -432,10 +448,22 @@ struct ServeConfig {
+     std::string model_path;
+     std::string vision_path;
+     BackendOpts bopts;
+-    std::string draft_mode = "auto";  // auto | dspark | off
++    std::string draft_mode = "auto";  // auto | dspark | suffix | off
++    // pascal-llm: --draft suffix: model-free suffix-lookup drafts (ink_suffix.h) verified by the target model in one
++    // step of up to suffix_k + 1 tokens; drafts only when the current suffix matches >= suffix_min earlier tokens.
++    int suffix_k = 3;
++    int suffix_min = 4;
      bool force_cpu = false;
      bool anti_loop = true;
      std::string version = "0.1.66";
@@ -1854,17 +2018,37 @@ index 6cbb1e8c..86fd8b2a 100644
  };
  
  inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& backend) {
-@@ -444,6 +453,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+@@ -443,7 +471,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+     const int V = c.vocab_unpadded;
      const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
      const int chunk_sz = std::max(1, cfg.bopts.chunk);
-     const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
+-    const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
++    const bool use_sfx = (cfg.draft_mode == "suffix");
++    const bool use_dspark = !use_sfx && (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
++    const int sfx_k = std::max(1, std::min(7, cfg.suffix_k));
++    if (use_sfx) std::fprintf(stderr, "[inkling2] suffix drafts: up to %d tokens, match >= %d\n", sfx_k, std::max(3, cfg.suffix_min));
 +    const float pf_share = std::min(1.0f, std::max(0.05f, cfg.prefill_share));
 +    double dec_owed_ms = 0.0;   // decode-only time still owed to decoding slots (prefill share < 1)
 +    if (pf_share < 1.0f) std::fprintf(stderr, "[inkling2] prefill share %.2f while another slot decodes\n", pf_share);
  
      // Probe Vision shard lazily (zero VRAM/RAM until first image request)
      bool images_ok = false;
-@@ -617,7 +629,16 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+@@ -480,11 +514,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
+           P, kv_str,
+           mf.m.dspark.present ? "dspark" : "none",
+-          use_dspark ? "dspark" : "off",
++          use_dspark ? "dspark" : (use_sfx ? "suffix" : "off"),
+           images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
+     proto("READY %d stop hold holdb", eff_max_ctx);
+ 
+     std::vector<ActiveReq> reqs(P);
++    std::vector<strata::ink::InkSuffixDrafter> sfx(use_sfx ? P : 0, strata::ink::InkSuffixDrafter(cfg.suffix_min));
++    std::vector<size_t> sfx_fed(P, 0);          // rq.hist tokens already in sfx[slot]
+     std::unordered_map<std::string, int> req_id_to_slot;
+     ServeInput in;
+     in.start();
+@@ -617,11 +653,24 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
              proto("RESUME %d", reuse);
          }
          rq.reused_tokens = reuse;
@@ -1882,7 +2066,15 @@ index 6cbb1e8c..86fd8b2a 100644
          rq.prefill_pos = reuse;
          rq.cur_pos = reuse;
          rq.hist = rq.prompt_ids;
-@@ -691,6 +712,23 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+         rq.next_tok = -1;
++        if (use_sfx) {
++            sfx[rq.slot].reset(std::min<size_t>((size_t)eff_max_ctx, (size_t)rq.prompt_len + (size_t)std::max(0, rq.max_new) + 8));
++            sfx_fed[rq.slot] = 0;
++        }
+         return true;
+     };
+ 
+@@ -691,6 +740,23 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
                  }
                  pg.slot = free_s;
              }
@@ -1906,7 +2098,105 @@ index 6cbb1e8c..86fd8b2a 100644
              if (pg.slot < 0 || pg.slot >= P) {
                  proto("ERR BGEN: slot %d out of range 0..%d", pg.slot, P - 1);
                  return true;
-@@ -903,8 +941,11 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+@@ -760,18 +826,37 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+         }
+ 
+         // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 Rejection Sampling (temperature >= 0) (#6633)!
+-        if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
++        if ((use_dspark || use_sfx) && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
+             reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
+             reqs[sole_slot].cur_pos + 8 < eff_max_ctx) {
+             auto& rq = reqs[sole_slot];
+             // 2a. Zero-D2H fused greedy Beam Tree speculative step (when greedy, no penalties, and headroom >= 12)
++            // (pascal-llm: with --draft suffix the same on-device greedy verify runs on the suffix lookup's chain.)
+             if (rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
+                 int32_t emitted[16]{};
+                 int drafted = 0;
+                 std::string serr;
+                 const int max_emit = rq.max_new - rq.generated;
+-                const int n_emit = backend.dspark_spec_step_greedy(
+-                    rq.slot, rq.next_tok, rq.cur_pos, max_emit, emitted, &drafted, serr);
++                int n_emit = 0;
++                const double t_g0 = now_s();
++                if (use_dspark) {
++                    n_emit = backend.dspark_spec_step_greedy(
++                        rq.slot, rq.next_tok, rq.cur_pos, max_emit, emitted, &drafted, serr);
++                } else {
++                    auto& d = sfx[rq.slot];
++                    if (sfx_fed[rq.slot] < rq.hist.size()) {
++                        d.append(rq.hist.data() + sfx_fed[rq.slot], rq.hist.size() - sfx_fed[rq.slot]);
++                        sfx_fed[rq.slot] = rq.hist.size();
++                    }
++                    int32_t chain[8]{};
++                    const int nd = d.propose(std::min(sfx_k, max_emit - 1), chain);
++                    if (nd > 0) {
++                        n_emit = backend.verify_chain_greedy(rq.slot, rq.next_tok, rq.cur_pos, chain, nd, max_emit, emitted, serr);
++                        if (n_emit > 0) drafted = nd;
++                        if (sfx_trace_on() && n_emit > 0)
++                            std::fprintf(stderr, "[sfx-time] g nd=%d emit=%d fwd=%.2f\n", nd, n_emit, (now_s() - t_g0) * 1e3);
++                    }
++                }
+                 if (n_emit < 0) {
+                     proto("ERR fatal GPU error: %s", serr.c_str());
+                     return 1;
+@@ -812,22 +897,35 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+             }
+             int32_t draft_ids[8]{};
+             std::string derr;
+-            const int max_d = std::min(7, rq.max_new - rq.generated - 1);
+-            int nd = backend.dspark_draft(rq.slot, rq.next_tok, rq.cur_pos, max_d, draft_ids, derr);
++            const int max_d = std::min(use_sfx ? sfx_k : 7, rq.max_new - rq.generated - 1);
++            int nd = 0;
++            if (use_sfx) {
++                // history = prompt + every emitted token; rq.hist ends with next_tok, the token fed this step
++                auto& d = sfx[rq.slot];
++                if (sfx_fed[rq.slot] < rq.hist.size()) {
++                    d.append(rq.hist.data() + sfx_fed[rq.slot], rq.hist.size() - sfx_fed[rq.slot]);
++                    sfx_fed[rq.slot] = rq.hist.size();
++                }
++                nd = d.propose(max_d, draft_ids);
++            } else {
++                nd = backend.dspark_draft(rq.slot, rq.next_tok, rq.cur_pos, max_d, draft_ids, derr);
++            }
+             if (nd > 0) {
+                 backend.snapshot_slot(rq.slot);
+                 batch.clear();
+-                batch.capture_taps = true;
++                batch.capture_taps = use_dspark;
+                 batch.push(rq.slot, rq.cur_pos, rq.next_tok, true);
+                 for (int i = 0; i < nd; ++i) {
+                     batch.push(rq.slot, rq.cur_pos + 1 + i, draft_ids[i], true);
+                 }
+                 logits_buf.resize(static_cast<size_t>(nd + 1) * V);
+                 std::string ferr;
++                const double t_v0 = now_s();
+                 if (!backend.forward_batch(batch, logits_buf.data(), nullptr, ferr)) {
+                     proto("ERR fatal GPU error: %s", ferr.c_str());
+                     return 1;
+                 }
++                const double t_v1 = now_s();
+                 rq.drafts_offered += nd;
+                 int accepted = 0;
+                 bool done = false;
+@@ -844,6 +942,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+                         break;
+                     }
+                     bool draft_ok = false;
++                    if (sfx_trace_on()) sfx_trace('v', rq.generated, lg, V);
+                     int32_t tok = (i < nd)
+                         ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok)
+                         : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+@@ -867,6 +966,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+                         break;
+                     }
+                 }
++                if (sfx_trace_on())
++                    std::fprintf(stderr, "[sfx-time] v nd=%d emit=%d fwd=%.2f host=%.2f\n", nd, accepted,
++                                 (t_v1 - t_v0) * 1e3, (now_s() - t_v1) * 1e3);
+                 if (!done) {
+                     if (accepted <= nd) {
+                         // Rolled back to anchor + accepted tokens
+@@ -903,8 +1005,11 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
              --token_budget;
          }
  
@@ -1919,7 +2209,7 @@ index 6cbb1e8c..86fd8b2a 100644
              std::vector<int> pf_slots;
              for (int s = 0; s < P; ++s) if (reqs[s].active && reqs[s].prefill_pos < reqs[s].prompt_len) pf_slots.push_back(s);
              if (!pf_slots.empty()) {
-@@ -914,8 +955,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+@@ -914,8 +1019,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
                      const int rem = rq.prompt_len - rq.prefill_pos;
                      int take = std::min(rem, per_slot);
                      // #6627: Pause 1 token before prompt_len so we save the exact prompt-end checkpoint at prompt_len - 1!
@@ -1930,10 +2220,11 @@ index 6cbb1e8c..86fd8b2a 100644
                      }
                      const int img_base = static_cast<int>(merged_img_embeds.size()) / c.hidden;
                      if (!rq.img_embeds.empty()) {
-@@ -942,6 +983,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+@@ -942,6 +1047,14 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
              return 1;
          }
          const double step_ms = (now_s() - t_step0) * 1000.0;
++        if (sfx_trace_on() && n_want == 1 && batch.n_tokens == 1) std::fprintf(stderr, "[sfx-time] d fwd=%.2f\n", step_ms);
 +        if (pf_share < 1.0f) {
 +            int fed = 0;
 +            for (int s = 0; s < P; ++s) fed += prefill_fed[s];
@@ -1944,7 +2235,7 @@ index 6cbb1e8c..86fd8b2a 100644
  
          // Update prefill progress & emit PP lines (+ save prompt-end checkpoint at prompt_len - 1 for #6627!)
          for (int s = 0; s < P; ++s) {
-@@ -951,7 +999,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+@@ -951,7 +1064,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
                  rq.prefill_pos += prefill_fed[s];
                  rq.cur_pos = rq.prefill_pos;
                  rq.prompt_ms += step_ms;
@@ -1953,3 +2244,129 @@ index 6cbb1e8c..86fd8b2a 100644
                      rq.ckpt_pending = false;
                      if (backend.save_prompt_checkpoint(rq.slot, rq.prefill_pos)) {
                          rq.prompt_ckpt_prefix.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.prefill_pos);
+@@ -985,6 +1098,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+                 finish_req(rq, "length");
+                 continue;
+             }
++            if (sfx_trace_on()) sfx_trace('d', rq.generated, lg, V);
+             int32_t tok = sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+             rq.hist.push_back(tok);
+             rq.gen_ids.push_back(tok);
+diff --git a/engine/src/inkling2/ink_suffix.h b/engine/src/inkling2/ink_suffix.h
+new file mode 100644
+index 00000000..99e2ed50
+--- /dev/null
++++ b/engine/src/inkling2/ink_suffix.h
+@@ -0,0 +1,112 @@
++// engine/src/inkling2/ink_suffix.h - pascal-llm: suffix-lookup drafter for `strata-inkling --draft suffix`.
++//
++// The same algorithm as the main engine's strata::spec::SuffixDrafter (src/spec/suffix_drafter.cpp): every trigram
++// of the history (prompt + emitted tokens) maps to its WAYS most recent end positions in a fixed open-addressing
++// table; a proposal extends each candidate backwards up to `max_match`, keeps the longest (most recent on ties) and,
++// when it is at least `min_match` long, proposes the tokens that followed it. No weights, no GPU, microseconds.
++// Header-only so the standalone inkling2 build needs no extra library.
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace strata::ink {
++
++class InkSuffixDrafter {
++public:
++    static constexpr int WAYS = 4;
++
++    InkSuffixDrafter(int min_match = 4, int max_match = 32) { configure(min_match, max_match); }
++
++    void configure(int min_match, int max_match) {
++        min_match_ = std::max(3, min_match);
++        max_match_ = std::max(min_match_, max_match);
++    }
++
++    /// Clear the history; the table is sized for `capacity_tokens` (load factor <= 0.5) and reused when large enough.
++    void reset(size_t capacity_tokens) {
++        size_t cap = 1;
++        while (cap < capacity_tokens * 2) cap <<= 1;
++        if (table_.size() < cap) table_.assign(cap, Slot{});
++        else std::fill(table_.begin(), table_.end(), Slot{});
++        mask_ = table_.size() - 1;
++        hist_.clear();
++        hist_.reserve(capacity_tokens);
++    }
++
++    void append(const int32_t* tokens, size_t n) {
++        for (size_t i = 0; i < n; ++i) {
++            hist_.push_back(tokens[i]);
++            const size_t end = hist_.size() - 1;
++            if (end < 2) continue;
++            Slot* s = find_slot(key_at(end), true);
++            if (s == nullptr) continue;
++            for (int w = WAYS - 1; w > 0; --w) s->pos[w] = s->pos[w - 1];
++            s->pos[0] = (uint32_t)end;
++            if (s->n < WAYS) ++s->n;
++        }
++    }
++
++    /// Up to `max_k` proposed next tokens in `out`; 0 when no match of at least min_match exists.
++    int propose(int max_k, int32_t* out) const {
++        const size_t n = hist_.size();
++        if (n < 4 || max_k <= 0 || table_.empty()) return 0;
++        const size_t cur = n - 1;
++        const Slot* s = const_cast<InkSuffixDrafter*>(this)->find_slot(key_at(cur), false);
++        if (s == nullptr) return 0;
++        size_t best_end = 0;
++        int best_len = 0;
++        for (int w = 0; w < s->n; ++w) {
++            const size_t p = s->pos[w];
++            if (p >= cur) continue;
++            int len = 0;
++            while (len < max_match_ && len <= (int)p && hist_[p - len] == hist_[cur - len]) ++len;
++            if (len > best_len) { best_len = len; best_end = p; }
++        }
++        if (best_len < min_match_) return 0;
++        int k = 0;
++        for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) out[k++] = hist_[q];
++        return k;
++    }
++
++    size_t size() const { return hist_.size(); }
++
++private:
++    struct Slot {
++        uint64_t key = 0;
++        uint32_t pos[WAYS] = {};
++        uint8_t n = 0;
++    };
++    static uint64_t mix(uint64_t x) {
++        x ^= x >> 33;
++        x *= 0xff51afd7ed558ccdull;
++        x ^= x >> 33;
++        x *= 0xc4ceb9fe1a85ec53ull;
++        return x ^ (x >> 33);
++    }
++    uint64_t key_at(size_t end) const {
++        const uint64_t a = (uint32_t)hist_[end - 2], b = (uint32_t)hist_[end - 1], c = (uint32_t)hist_[end];
++        return mix(a * 0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;
++    }
++    Slot* find_slot(uint64_t key, bool insert) {
++        for (size_t i = key & mask_, probes = 0; probes <= mask_; i = (i + 1) & mask_, ++probes) {
++            Slot& s = table_[i];
++            if (s.key == key) return &s;
++            if (s.key == 0) {
++                if (!insert) return nullptr;
++                s.key = key;
++                return &s;
++            }
++        }
++        return nullptr;
++    }
++
++    int min_match_ = 4, max_match_ = 32;
++    std::vector<int32_t> hist_;
++    std::vector<Slot> table_;
++    size_t mask_ = 0;
++};
++
++}  // namespace strata::ink
