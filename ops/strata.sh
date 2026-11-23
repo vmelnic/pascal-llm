@@ -35,7 +35,12 @@ done
 
 remote_host="${PASCAL_REMOTE_HOST}"
 remote_root="${PASCAL_REMOTE_ROOT}"
-server_url="${PASCAL_SERVER_URL%/}"
+server_url="${PASCAL_STRATA_SERVER_URL:-http://${PASCAL_REMOTE_HOST#*@}:8081}"
+server_url="${server_url%/}"
+[[ "${server_url}" =~ ^https?://[A-Za-z0-9._:-]+$ ]] || {
+  echo "PASCAL_STRATA_SERVER_URL must contain only the scheme, host and optional port" >&2
+  exit 2
+}
 service_name="pascal-strata.service"
 
 sync_remote() {
@@ -53,11 +58,34 @@ install_service() {
      systemctl --user daemon-reload"
 }
 
-require_llama_inactive() {
-  if ssh "${remote_host}" "systemctl --user is-active --quiet pascal-llm.service"; then
-    echo "pascal-llm.service owns P100 devices 0,1,2; stop it with ./ops/model.sh stop" >&2
-    exit 2
-  fi
+require_service_placement() {
+  ssh "${remote_host}" \
+    "python3 '${remote_root}/ops/check-service-placement.py' --service pascal-strata --devices 0,1,2 --port 8081"
+}
+
+# Active model of the single P100 Strata service: swift (default) or inkling.
+select_model() {
+  case "${1:-}" in
+    "") ;;
+    swift|inkling)
+      ssh "${remote_host}" "mkdir -p \"\$HOME/.config/pascal-llm\"; printf '%s\\n' '$1' > \"\$HOME/.config/pascal-llm/active-strata-model\""
+      ;;
+    *)
+      echo "unknown Strata model: $1 (expected swift or inkling)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+active_model() {
+  ssh "${remote_host}" "cat \"\$HOME/.config/pascal-llm/active-strata-model\" 2>/dev/null || echo swift"
+}
+
+configure_remote() {
+  # Only the Swift run configuration is normalized; Inkling's is written by run-strata-server.sh.
+  [[ "$(active_model)" == "swift" ]] || return 0
+  ssh "${remote_host}" \
+    "'${remote_root}/ops/configure-strata.py' --config '${remote_root}/work/strata-next/strata-swift-iq3_s.json'"
 }
 
 wait_until_ready() {
@@ -86,13 +114,15 @@ command_name="${1:-status}"
 case "${command_name}" in
   download)
     sync_remote
-    require_llama_inactive
+    require_service_placement
     ssh "${remote_host}" "'${remote_root}/ops/download-strata-model.sh'"
     ;;
   start)
     sync_remote
     install_service
-    require_llama_inactive
+    require_service_placement
+    select_model "${2:-}"
+    configure_remote
     ssh "${remote_host}" "systemctl --user restart '${service_name}'"
     wait_until_ready
     ;;
@@ -102,7 +132,9 @@ case "${command_name}" in
   restart)
     sync_remote
     install_service
-    require_llama_inactive
+    require_service_placement
+    select_model "${2:-}"
+    configure_remote
     ssh "${remote_host}" "systemctl --user restart '${service_name}'"
     wait_until_ready
     ;;
@@ -121,14 +153,20 @@ case "${command_name}" in
     echo
     ;;
   pi-config)
-    "${script_dir}/configure-pi-strata.py"
+    "${script_dir}/configure-pi-strata.py" --base-url "${server_url}/v1"
     ;;
   pi)
     shift
-    exec "${script_dir}/pi.sh" "$@"
+    case "$(active_model)" in
+      inkling) pi_model=inkling-2-mini-sq20 ;;
+      *) pi_model=swift-flash-next-iq3-s ;;
+    esac
+    PASCAL_PI_PROVIDER=pascal-strata \
+      PASCAL_MODEL_ID="${pi_model}" \
+      exec "${script_dir}/pi.sh" "$@"
     ;;
   *)
-    echo "usage: $0 {download|start|stop|restart|status|logs|models|pi-config|pi [Pi args...]}" >&2
+    echo "usage: $0 {download|start [swift|inkling]|stop|restart [swift|inkling]|status|logs|models|pi-config|pi [Pi args...]}" >&2
     exit 2
     ;;
 esac

@@ -143,6 +143,9 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${PASCAL_IMAGE_CUDA_DEVICES}"
 
+python3 "${script_dir}/check-service-placement.py" \
+  --service pascal-image --devices "${PASCAL_IMAGE_CUDA_DEVICES}" --port "${PASCAL_IMAGE_PORT}"
+
 exec "${server_binary}" \
   --model "${PASCAL_IMAGE_MODEL_PATH}" \
   --backend "${PASCAL_IMAGE_BACKEND}" \

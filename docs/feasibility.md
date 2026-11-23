@@ -1,3 +1,227 @@
+## Inkling 2 Mini admission (2026-11-23)
+
+Model: Thinking Machines Inkling 2 Mini, Apache 2.0, 26.4B total / 3.4B
+active. Hidden 2304; 24 stored layers, layers 6-17 looped three times, so one
+token makes `V = 6 + 3*12 + 6 = 48` layer visits. 128 routed experts, top-8,
+no shared expert, expert width 1152. Attention: 24 query heads, 8 KV heads,
+head dim 128; stored layers 5, 11, 17, 23 are global, the rest use a
+1024-token window. Global visits are `1 + 3 + 3 + 1 = 8`; window visits 40.
+Each loop slot keeps its own KV. Native context 1,048,576; target 262,144.
+
+The official checkpoint is NVFP4 (20 layers) + MXFP8 (last 4). vLLM requires
+Hopper/Blackwell-class GPUs, so the official files have no Pascal path. Two
+artifacts were admitted, both downloaded by `ops/download-model.sh` with
+pinned revision, size and SHA-256:
+
+| Artifact | Bytes | Representation |
+|---|---:|---|
+| Unsloth `Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL` (llama.cpp) | 22,867,452,896 | 40 NVFP4 expert tensors, 330 BF16, 374 F32: NVFP4 layers are native, the MXFP8 layers are expanded to BF16 |
+| Strata `Inkling-2-Mini-SQ-20.strata` | 19,346,685,952 | upstream native SF4+MX8 encoding, reported KLD 0.00000 vs. the original |
+
+### Capacity (exact IEEE F16 KV)
+
+```text
+global KV/token = 8 visits * 2 (K,V) * 8 heads * 128 * 2 B = 32,768 B
+global KV at 262,144 tokens = 8,589,934,592 B = 8 GiB
+window KV/sequence = 40 * 2 * 8 * 128 * 2 B * 1024 = 167,772,160 B
+SQ-20 weights = trunk 3.67 GB + expert bodies 15.68 GB (upstream fit table)
+```
+
+llama.cpp measured these per-device allocations for UD-Q8_K_XL at 262,144
+context, four unified slots, `-ub 128`, `-ts 14,8,27`: weights
+8,428/7,608/4,877 MiB (plus 883 MiB token embedding in host RAM), global KV
+2,048/1,024/5,120 MiB, window KV 204/119/357 MiB, compute 3,440 MiB per device.
+The default even split failed: physical layers 20-23 (BF16 experts, about
+2 GiB each) and every virtual loop slot with its KV land on the last devices.
+Strata loaded SQ-20 in three stages: layers 0-5, 6-14, 15-23, all 3,072
+experts on GPU and no host experts. Activation and intermediate charges inside
+Strata were not separately reported.
+
+### Traffic and the 100 tok/s question
+
+```text
+expert params/token   = 48 * 8 * 3 * 2304 * 1152 = 3,057,647,616
+attention params/token = 48 * (2*2304*3072 + 2*2304*1024) = 905,969,664
+weights read/token (SQ-20) ~= 4 GB  -> P100 peak 732 GB/s -> <= ~185 tok/s
+KV read/token at depth n = 32,768 * n B -> 8.6 GB at n = 262,144
+at full 262K depth: ~12.6 GB/token -> <= ~58 tok/s on one P100
+```
+
+A 3-stage layer split runs the stages serially, so it does not raise this
+single-stream bound. It crosses a device boundary six times per token (two
+stage edges, re-crossed by each loop pass), 9,216 B of FP32 hidden state each,
+about 6 * 14 us of measured P2P latency: negligible against the measured
+25.9 ms/token. The measured 38.6 tok/s is about 21% of the short-context
+bandwidth bound, so the engine is kernel- and launch-limited, not
+transfer-limited. Strata disables DSpark and CUDA graphs whenever layer split
+is active (`engine/src/inkling2/cuda/ink_cuda_backend.cu:236,243`).
+
+TP3 implementation (this host, `patches/strata-next/`): row-split dense and
+unembed, 384-feature expert shards, owner-only global-visit KV (3/3/2) and
+in-kernel P2P exchanges ({value, epoch} 8-byte stores, 5.4 us floor). Per P100
+at 262,144 context: 3.67 GB trunk + ~5.2 GB expert shard + 3 or 2 GiB global KV
++ replicated SWA KV and workspaces; observed 12,927/11,903/12,927 MiB. Measured
+best 64.8 tok/s (benchmark), 58.9 tok/s real Pi `hi`; KLD within the engine's
+own noise (see `benchmarks.md`). Remaining step time is ~1,270 dependent
+latency-bound kernels per token (about 320 us per visit); graphs, fusing and
+speculative decoding were measured and did not reach 10 ms/token.
+
+Measured on this host (one real Pi `hi` unless noted):
+
+| Runtime | Placement | Decode | Prefill |
+|---|---|---:|---:|
+| llama.cpp `212c547` + PR #32752, UD-Q8_K_XL (direct API, rejected) | 3 x P100 layer split | 15.1 tok/s | 61 tok/s at 24K |
+| Strata 0.2.20, SQ-20, Pi `hi` | 3 x P100 layer split, no DSpark | 38.6 tok/s | ~229 tok/s |
+
+### Measured decode decomposition and the >=100 tok/s plan
+
+`nvprof` on `strata-inkling --bench` (SQ-20, 3 x P100 layer split, 128
+decode tokens, 3.32 s, 38.6 tok/s) attributes 25.9 ms/token as follows; kernel
+time totals about 3.0 s of the 3.32 s, so the device is busy, not launch-gap
+bound:
+
+| Work | ms/token | Bytes/token | Effective |
+|---|---:|---:|---:|
+| `k_ink_gemv_multi_bf16` + `gemv_f32` (dense BF16, 153 + 64 calls) | 7.4 | ~2.3 GB | ~330 GB/s |
+| `k_ink_moe_gu/dn_sf4_mx8` (8 experts x 48 visits) | 9.9 | 1.96 GB | ~198 GB/s |
+| ~900 small kernels (norms, router, attention, sconv, residual mix) | ~6.7 | small | latency |
+
+A probe kernel on one P100 reads 443 GB/s at 5 MiB, 579 GB/s at 40 MiB and
+606 GB/s at 2 GiB; an empty launch costs 1.91 us back to back. Hence even with
+perfect kernels a serial layer split needs about
+`2.3/0.58 + 1.96/0.58 + ~2.5 = ~9.8 ms/token`, i.e. 100 tok/s exactly at the
+limit. The MoE kernel is limited by software SF4/E4M3 decoding on SM60
+(no FP8/FP4 conversion hardware), not by memory.
+
+Selected direction: a single-stream decode path in `strata-inkling` that makes
+the three P100s read concurrently instead of serially, keeping SQ-20 bytes,
+F16 KV and FP32 accumulation:
+
+```text
+dense projections  : output rows split 1/3 per P100 (TP3), all-gather after
+experts (8/visit)  : gate/up features 384 per P100, down by matching input
+                     columns, partial sums all-reduced (balanced, no EP skew)
+small kernels      : replicated on each P100 on identical inputs
+attention          : KV heads 3/3/2 per P100, Q heads 9/9/6
+sync               : ~3 in-kernel P2P exchanges per visit = 144/token,
+                     9-36 KiB each, target <= 8 us -> <= 1.2 ms/token
+graphs             : one CUDA graph per P100 for the whole 48-visit step
+budget             : (2.3 + 1.96) GB / (3 * 0.58 GB/s) = 2.4 ms
+                     + small ~2.5-4 ms + sync <= 1.2 ms = ~6-8 ms/token
+                     -> 125-165 tok/s ideal, gate >= 100 tok/s
+per-P100 memory    : dense 1/3 + experts 1/3 (~6.4 GB) + replicated small
+                     tensors + KV 1/3 (2.7 GiB at 262,144) + scratch < 12 GiB
+```
+
+Gate: one real Pi `hi` through the normal provider at >= 100 tok/s decode, and
+top-1 agreement with the unmodified engine on `--kld-eval` (same weights; only
+FP32 summation order changes). Work is carried as pinned patches under
+`patches/strata-next/`, applied by `ops/install-strata-next.sh`.
+
+No public report reaches 100 tok/s single-stream on Pascal; the best are
+35.0 tok/s (Strata, one P100, SQ-10 with DSpark) and 16-21 tok/s (llama.cpp,
+P100). All >100 tok/s reports use RTX 3090/A6000/5090, V100 or Apple GPUs, and
+the fastest engines (`maya-ik2`, UnbiasedStrata, NInfer) do not build below
+sm_80 or sm_70. Result: **>100 tok/s single-stream is not reachable with an
+existing engine on this host**, and at a populated 262K context it is excluded
+by P100 bandwidth. Untested proposals, in order of expected value:
+
+1. Strata EP2 on two P100s, which keeps DSpark enabled (`--gpus 0,1
+   --layer-split ep2 --ep-split 0.6`); estimate 35-55 tok/s, KV on GPU 0 only.
+2. SQ-20 on the P40 alone with DSpark and CUDA graphs; estimate 25-45 tok/s.
+3. Port `maya-ik2` kernels to SM60 without tensor cores; a multi-week kernel
+   project with an uncertain result above the current 38.6 tok/s.
+
+## Separate Gemma P40 build gate (2026-11-18)
+
+The user authorized stopping Gemma, a separate SM61 build, restarting Gemma
+on P40 at port 8080, and exactly one real Pi prompt, `hi`. The user subsequently
+requested stopping Strata during compilation and using all 44 CPU threads;
+Strata is restored on P100s 0,1,2 at port 8081 after the build. This narrow Pi transport check does not
+qualify coding tools, concurrency or populated maximum contexts.
+
+The original `work/llama.cpp/build` SM60 artifacts are preserved and hashed
+before and after compilation. The same pinned, patched source is compiled
+into `work/llama.cpp/build-sm61`; only the Gemma profile selects that build.
+Other profiles retain their existing build selection. The source's
+`FAST_FP16_AVAILABLE` excludes architecture 610, while an SM60-only binary
+selects the SM60 half-arithmetic FlashAttention path even on P40. Native SM61
+compilation selects the source's FP32 compute alternative where appropriate.
+The weight artifact, exact F16 K/V storage, context and four slots do not
+change, so the per-device capacity and traffic equations below still apply.
+Activations and intermediates remain separate runtime allocations, and their
+new layout is not inferred from the old SM60 allocation snapshot. The initial
+single-job build was interrupted to apply the user's requested full-resource
+compilation policy; Ninja retains the completed objects.
+
+The completed build uses GCC/G++ 13.4.0 and CUDA 12.4.131. CUDA image inspection
+reports only SM61. SHA-256 is
+`a6b8755134cbeeb0202c344a59095a59347760d80bc8776c4252187b5817d6a9`
+for the new server and
+`c714c4a92e11cb01c7334301f5def564e4a7ed4241695fb49311eb062f93731f`
+for its CUDA library. The original SM60 server and CUDA library still match
+their pre-build hashes. One build correction was needed: the moving upstream
+UI download no longer met this source's embedded-asset manifest. The script
+copies only the existing static UI assets into the new build, disables that
+download, and lets the current-source embedder validate and compile them.
+No old executable or inference library is copied into the new build.
+
+Gemma initialization succeeded on P40, using the new server and CUDA library
+from `build-sm61`, with 20347 MiB total device residency before requests.
+The weight and F16 KV equations below remain unchanged; this is a total
+allocation observation, not separate activation/intermediate accounting.
+
+The single requested real Pi `hi` completed normally in 10.670852 seconds,
+with provider `pascal-llm`, the unchanged Gemma model ID, project instructions
+and normal skill discovery. The server processed 5358 prompt tokens in
+7086.09 ms (756.13 tok/s) and generated 105 tokens in 1887.80 ms
+(55.09 tok/s, including reasoning). Pi returned a Romanian greeting with
+`stopReason=stop` and no error. Both services remained active with zero
+restarts, and Gemma used 20407 MiB on P40 after the request. Evidence is in
+`out/llama-p40-build/pi-hi/`; build hashes and logs are in its parent directory.
+This completes only the user-authorized single-prompt transport gate.
+
+## Concurrent Gemma P40 / Strata P100 deployment gate (2026-11-18)
+
+The requested placement preserves Gemma's existing model ID, API key and
+port 8080, moves only its physical CUDA selection to P40 device 3, and serves
+Strata Swift on P100 devices 0,1,2 at port 8081. Both artifacts, the 262144
+context settings and exact F16 K/V remain unchanged. This is a placement and
+transport gate; it does not qualify populated maximum contexts or coding quality.
+
+Gemma's existing admission equations below still apply on one device:
+`W_file + KV_full + KV_sliding = 14,439,363,584 + 5,368,709,120 +
+943,718,400 = 20,751,791,104 B`. P40 physical capacity is 25,769,803,776 B;
+the remaining 5,018,012,672 B must cover runtime-resident weight layout
+differences, activations, intermediates, graphs, CUDA context and workspace.
+File size is an admission bound, not a measured device weight allocation.
+Startup telemetry and real concurrent Pi tool loops must decide whether this
+reserve is sufficient. No P100 memory can pay a P40 allocation.
+
+Strata retains the per-P100 capacity, host expert, KV, recurrent-state,
+compute and PCIe traffic equations in the next section. The two models have
+no shared tensors or inter-model activation transfers. Gemma has no
+inter-GPU transfer on its single P40; its input/output still crosses the
+host/P40 boundary. Strata's two P100 stage boundaries and host KV/expert
+transfers remain explicit. Host admission additionally requires both
+services' anonymous/pinned memory plus unreclaimable system memory to fit
+65,162,362,880 B of installed usable RAM; file-backed mappings must not be
+double-counted as irreclaimable memory. Earlier Strata-only cgroup residency
+was 58,680,033,280 B, so current host RAM, swap and service cgroups must be
+measured under concurrent requests. Weights, KV, activations and intermediates
+must remain separately labelled wherever telemetry permits decomposition.
+
+Both services started on their requested ports and reported the expected
+models. Observed device ownership was Strata only on P100s 0,1,2 and Gemma
+only on P40 3, with no service restarts. The initial concurrent-load snapshot
+was 15873/15285/15505 MiB on the P100s and 20445 MiB on P40. These totals
+include allocations beyond weights and KV; activation/intermediate charges
+were not independently measured. Available host RAM was 2,523,967,488 B.
+The user explicitly stopped testing; the four in-progress Pi qualification
+processes were terminated and no completed concurrent Pi gate is claimed.
+The inactive image service also uses port 8081 and P40; launch checks reject
+its conflicts with this placement.
+
 ## Strata Swift 1.5 IQ3_S deployment gate (2026-10-21)
 
 The selected artifact is the full-expert Swift 1.5 IQ3_S release, not IQ2_XS
@@ -742,6 +966,47 @@ bounded real Pi read-tool flow at 40.07 tok/s on the initial/tool turn and
 capacity but failed performance at 63.81 prompt tok/s, 4,106.2 s TTFT and
 6.18 decode tok/s; it has not been rerun and the short-context improvement
 must not be transferred to it.
+
+## Gemma 4 26B A4B admission
+
+The prepared text target is Google's instruction-tuned, quantization-aware
+Q4_0 GGUF at revision `d1c082be9cf3c8a514acf63b8761f4b41935842e`.
+The exact artifact is `gemma-4-26B_q4_0-it.gguf`, size `14,439,363,584 B`,
+SHA-256 `3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d`.
+QAT Q4_0 is a weight-fidelity change relative to the BF16 checkpoint and must
+remain an explicit profile. The optional `1,194,828,160 B` vision projector is
+not part of this text and tool-calling admission.
+
+The model has 30 layers: five full-attention layers and 25 sliding-attention
+layers with a 1,024-token window. Full layers use two 512-wide KV heads;
+sliding layers use eight 256-wide KV heads. The model declares 262,144 maximum
+positions. With exact F16 K and V, four unified server slots, and llama.cpp's
+default 512-token physical micro-batch, the sliding cache has
+`pad256(1024 * 4 + 512) = 4,608` cells. Capacity at maximum aggregate context
+is therefore:
+
+```text
+official QAT Q4_0 text GGUF            14,439,363,584 B = 13.4477 GiB
+five-layer full-attention F16 KV        5,368,709,120 B =  5.0000 GiB
+25-layer four-slot sliding F16 KV         943,718,400 B =  0.8789 GiB
+admission subtotal                     20,751,791,104 B = 19.3266 GiB
+three-P100 physical capacity                              48.0000 GiB
+remaining before graphs/workspaces                        28.6734 GiB
+```
+
+The full-attention term is
+`5 * 262144 * 2(K,V) * 2 heads * 512 * sizeof(F16)`. The sliding term is
+`25 * 4608 * 2(K,V) * 8 heads * 256 * sizeof(F16)`. Tensor split keeps the
+weights and KV on the coherent three-P100 domain; P40 is excluded because it
+has no peer path to the P100s and capacity does not require it. The original
+BF16 tensor files total `51,612,009,916 B = 48.0674 GiB`, already exceeding
+the complete three-P100 capacity before KV and runtime reserve.
+
+The pinned llama.cpp source contains the Gemma 4 architecture, hybrid
+full/sliding KV implementation, canonical Jinja template, and native tool-call
+parser. These establish software-path and capacity admission, not production
+qualification. Clean initialization, populated-context telemetry, direct chat,
+a real Pi tool loop, and concurrent independent Pi sessions remain unrun.
 
 ## Nemotron-3.5-Lightning-30B-A3B admission
 

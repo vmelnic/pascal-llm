@@ -1,3 +1,73 @@
+## Inkling 2 Mini TP3, one real Pi `hi` (2026-11-23)
+
+The `pascal-strata` service with Inkling selected (Strata 0.2.20 + `patches/strata-next/01-inkling-tp-decode.patch`,
+`--tp 3`, 262,144 context, F16 K/V, `--draft off`), `pi --no-session --mode json -p hi`
+with project `AGENTS.md` and skills: 7,001 prompt tokens read in ~16 s (~440 tok/s),
+75 generated at 57.6 tok/s, Pi wall 17.9 s, normal stop, Romanian answer. The same
+request on unmodified Strata layer split: ~229 tok/s prefill, 38.6 tok/s decode, 32.1 s.
+Engine benchmark (128-token prompt, 128 greedy tokens identical to the unmodified
+engine): 63.9 tok/s best, 62.4 tok/s with global-visit KV ownership, 58.1 tok/s at
+2K depth with 262,144 allocated. Through the service on port 8081 the same Pi `hi`
+decoded at 58.9 tok/s (18.2 s wall).
+
+Fidelity, 512 tokens of repository text, teacher-forced against the unmodified
+engine's prefill logits (`--dump-ref`, layer split): TP3 prefill KLD 0.000889,
+top-1 99.22%; TP3 single-token steps KLD 0.001348, top-1 98.63%. The unmodified
+engine's own single-token steps against its prefill give KLD 0.001249, top-1
+98.43%, so TP3 is within the engine's FP32 summation noise. Evidence:
+`out/inkling-tp/`, `out/inkling-mini-pi/`, `out/inkling-kld/`.
+
+## Strata 0.2.20: Swift and Inkling 2 Mini, one real Pi `hi` each (2026-11-23)
+
+Both runs used `pi --no-session --mode json -p hi` from this repository, with
+project `AGENTS.md`, skill discovery and default xhigh thinking. Gemma stayed
+on P40. Server timings are the engine's own line for the request.
+
+| Model | Runtime | Prompt | Prefill | Generated | Decode | Pi wall |
+|---|---|---:|---:|---:|---:|---:|
+| Swift 1.5 Flash-Next IQ3_S | Strata 0.2.20, 3 x P100 layer split, MTP | 5,666 new | 246.5 tok/s | 164 | 38.1 tok/s (MTP 91/165) | 27.9 s |
+| Inkling 2 Mini SQ-20 | Strata 0.2.20 `strata-inkling`, 3 x P100 layer split, no DSpark | 7,001 new | ~229 tok/s | 55 | 38.6 tok/s | 32.1 s |
+
+For reference, one earlier Pi tool-flow request on Swift with Strata 0.1.46.3
+the same day decoded 40.7, 32.3 and 35.3 tok/s across its three turns
+(5,693-token first prompt at 211.0 tok/s). The prompts differ; this is not a
+controlled comparison. Evidence: `out/swift-pi/`, `out/inkling-mini-pi/`,
+`out/swift-strata-next/`, `out/inkling-mini-strata/`.
+
+## Strata: requested Pi prompt of a few thousand new tokens (2026-11-18)
+
+One normal Pi request to `pascal-strata/swift-flash-next-iq3-s` used a technical
+prompt derived from the feasibility note. Project instructions, skill discovery
+and default xhigh thinking remained enabled. No tool calls or service restarts
+were requested. Gemma stayed resident on P40 while Strata used P100s 0,1,2.
+
+The total prompt was 8458 tokens: 5572 reused and 2886 newly read. Processing
+the new tokens took 10964 ms (263.2 tok/s); do not divide the full prompt by
+that time and label the result uncached prefill. The server generated 4585
+tokens, including reasoning, in 111928 ms (41.0 tok/s). Pi wall time was
+124.765279 s, CLI exit zero and normal model stop. The visible answer contained
+480 words. Expert-cache hit rate was 97.2%; MTP accepted 2755 of 4081 proposals.
+This single warm-service result falls within the historical 39.3–42.9 tok/s
+range, but the prompts differ and it is not a controlled before/after
+comparison. Evidence: `out/strata-pi-speed/`, including the exact prompt,
+Pi events, timings, existing server logs and one passive GPU/RAM snapshot.
+
+## Gemma P40 native SM61: requested Pi `hi` (2026-11-18)
+
+The separate `work/llama.cpp/build-sm61` runtime serves the unchanged official
+QAT Q4_0 Gemma artifact on P40 at port 8080. The original SM60 artifacts remain
+byte-identical. Strata was stopped for the 44-job build, then restored on the
+three P100s at port 8081 before this single user-requested Pi prompt.
+
+Normal Pi with project instructions and skill discovery processed `hi` and
+returned a Romanian greeting: 5358 prompt tokens, 105 generated tokens, normal
+stop, CLI exit zero. End-to-end time was 10.670852 s. Server timings were
+7086.09 ms prefill (756.13 tok/s) and 1887.80 ms decode (55.09 tok/s, including
+reasoning). P40 total residency after the request was 20407 MiB; activations
+and intermediates were not independently measured. Both services stayed active
+with zero restarts. This is one transport result, not a tool-loop, concurrency,
+quality or populated-262K qualification. Evidence: `out/llama-p40-build/pi-hi/`.
+
 # Measurement ledger
 
 Status: through 2026-10-08. Component gates and service results are kept

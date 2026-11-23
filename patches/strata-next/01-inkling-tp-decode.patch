@@ -1,0 +1,1762 @@
+diff --git a/engine/src/inkling2/cuda/ink_cuda_backend.cu b/engine/src/inkling2/cuda/ink_cuda_backend.cu
+index bb9b3226..10bef4be 100644
+--- a/engine/src/inkling2/cuda/ink_cuda_backend.cu
++++ b/engine/src/inkling2/cuda/ink_cuda_backend.cu
+@@ -20,6 +20,7 @@
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
++#include <thread>
+ 
+ namespace strata::ink {
+ 
+@@ -77,6 +78,10 @@ public:
+ 
+     int effective_max_ctx() const override { return initialized_ ? eff_max_ctx_ : 0; }
+ 
++    // TP backend access (pascal-llm).
++    strata::ink::InkCudaRunner* tp_runner() { return runner_.get(); }
++    int tp_gpu() const { return gpu_id_; }
++
+     bool dspark_ready() const override { return initialized_ && dspark_ && dspark_->ready; }
+ 
+     std::string device_info() const override { return dev_info_; }
+@@ -191,6 +196,8 @@ public:
+ 
+         // Load .strata v1.1 / .gguf (Unsloth + ggml-org) / HF safetensors trunk + experts (Single-GPU, EP2, Layer-Split, or 4-tier GPU+RAM+SSD!)
+         const bool build_screen = opts.enable_dspark && mf.m.dspark.present;
++        model_.tp_rank = opts.tp_rank;
++        model_.tp_world = std::max(1, opts.tp_world);
+         if (!model_.load_from_model_file(mf, gpu_id_, peer_gpu_id, (float)opts.ep_split, build_screen, err,
+                                          min_reserve_bytes, gguf_detail::gguf_dequant_row_f32, gguf_detail::gguf_row_bytes,
+                                          opts.vram_experts_gb, opts.ram_experts_gb, opts.ssd_experts,
+@@ -550,8 +557,17 @@ public:
+                 }
+             }
+             runner_->head_logits_from(h_src, nw);
+-            // Use pinned host staging buffer for full PCIe 5.0 DMA bandwidth (~50 GB/s vs ~12 GB/s pageable)!
+             ensure_pinned_logits(nw, V);
++            if (nw == 1 && (runner_->tp_head_a != 0 || runner_->tp_head_b != V)) {
++                // TP vocab slice: copy only this rank's columns; ranks write disjoint ranges.
++                const int a = runner_->tp_head_a, b = runner_->tp_head_b;
++                INK_CK(cudaMemcpyAsync(h_logits_pin_ + a, runner_->d_logits + a, (size_t)(b - a) * sizeof(float),
++                                       cudaMemcpyDeviceToHost, runner_->st));
++                INK_CK(cudaStreamSynchronize(runner_->st));
++                std::memcpy(logits_out + (size_t)dst_rows[0] * V + a, h_logits_pin_ + a, (size_t)(b - a) * sizeof(float));
++                return;
++            }
++            // Use pinned host staging buffer for full PCIe 5.0 DMA bandwidth (~50 GB/s vs ~12 GB/s pageable)!
+             INK_CK(cudaMemcpyAsync(h_logits_pin_, runner_->d_logits,
+                                    (size_t)nw * V * sizeof(float), cudaMemcpyDeviceToHost, runner_->st));
+             INK_CK(cudaStreamSynchronize(runner_->st));
+@@ -909,4 +925,226 @@ std::unique_ptr<InkBackend> make_cuda_backend() {
+     return std::make_unique<InkCudaBackend>();
+ }
+ 
++// ---- Tensor-parallel single-stream decode backend (pascal-llm) ----
++// tp_world InkCudaBackend ranks, one per GPU, each with the whole trunk and 1/tp_world of the experts.
++// Every rank executes the identical kernel sequence; dense M=1 projections are row-split and
++// all-gathered, MoE partials all-reduced, through in-kernel P2P exchanges (cuda/ink_tp.cuh).
++class InkCudaTpBackend final : public InkBackend {
++public:
++    ~InkCudaTpBackend() override {
++        ranks_.clear();
++        for (size_t i = 0; i < arenas_.size(); ++i) {
++            cudaSetDevice(gpus_[i]);
++            if (arenas_[i]) cudaFree(arenas_[i]);
++        }
++    }
++    const char* backend_name() const noexcept override { return "cuda-tp"; }
++    std::string device_info() const override { return info_; }
++    int effective_max_ctx() const override { return ranks_.empty() ? 0 : ranks_[0]->effective_max_ctx(); }
++    BackendStats stats() const override {
++        BackendStats st{};
++        if (ranks_.empty()) return st;
++        st = ranks_[0]->stats();
++        for (size_t i = 1; i < ranks_.size(); ++i) {
++            const BackendStats o = ranks_[i]->stats();
++            st.vram_experts_loaded += o.vram_experts_loaded;
++            st.ram_experts_loaded += o.ram_experts_loaded;
++            st.total_experts += o.total_experts;
++        }
++        return st;
++    }
++
++    bool init(const InkModelFile& mf, const BackendOpts& opts, std::string& err) override {
++        int n_dev = 0;
++        if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev <= 0) { err = "no CUDA devices"; return false; }
++        gpus_.clear();
++        if (!opts.gpu_ids.empty()) gpus_ = opts.gpu_ids;
++        else for (int g = 0; g < n_dev && (int)gpus_.size() < opts.tp_world; ++g) gpus_.push_back(g);
++        const int W = (int)gpus_.size();
++        if (W < 2 || W > strata::ink::kTpMaxWorld || W != opts.tp_world) {
++            err = "--tp " + std::to_string(opts.tp_world) + " needs exactly that many GPUs in --gpus";
++            return false;
++        }
++        for (int a = 0; a < W; ++a) {
++            for (int b = 0; b < W; ++b) {
++                if (a == b) continue;
++                int ok = 0;
++                cudaDeviceCanAccessPeer(&ok, gpus_[a], gpus_[b]);
++                if (!ok) { err = "--tp requires CUDA P2P between all GPUs"; return false; }
++                cudaSetDevice(gpus_[a]);
++                const cudaError_t e = cudaDeviceEnablePeerAccess(gpus_[b], 0);
++                if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
++                    err = std::string("cudaDeviceEnablePeerAccess: ") + cudaGetErrorString(e);
++                    return false;
++                }
++                cudaGetLastError();
++            }
++        }
++        for (int r = 0; r < W; ++r) {
++            BackendOpts o = opts;
++            o.gpu_ids = {gpus_[r]};
++            o.gpu_index = gpus_[r];
++            o.gpus = 1;
++            o.layer_split.clear();
++            o.tp_rank = r;
++            o.tp_world = W;
++            cudaSetDevice(gpus_[r]);
++            auto b = std::make_unique<InkCudaBackend>();
++            if (!b->init(mf, o, err)) { err = "TP rank " + std::to_string(r) + ": " + err; return false; }
++            ranks_.push_back(std::move(b));
++        }
++        arenas_.assign(W, nullptr);
++        const size_t arena_elems = (size_t)strata::ink::kTpSlots * strata::ink::kTpMaxWorld * strata::ink::kTpSlotFloats;
++        for (int r = 0; r < W; ++r) {
++            cudaSetDevice(gpus_[r]);
++            INK_CK(cudaMalloc(&arenas_[r], arena_elems * sizeof(uint2)));
++            INK_CK(cudaMemset(arenas_[r], 0, arena_elems * sizeof(uint2)));  // epoch 0 never matches
++            INK_CK(cudaDeviceSynchronize());
++        }
++        // No allocation or free may happen inside a step once ranks exchange: cudaFree can
++        // synchronize peer devices that spin in an exchange. Pre-size every lazy buffer now.
++        for (int r = 0; r < W; ++r) {
++            cudaSetDevice(gpus_[r]);
++            auto* rn = ranks_[r]->tp_runner();
++            if (!rn->ensure_global_kv_cap(ranks_[r]->effective_max_ctx())) {
++                err = "TP rank " + std::to_string(r) + ": cannot pre-size global KV";
++                return false;
++            }
++            rn->ensure_pf_attn(strata::ink::InkCudaRunner::kInkPfKvTile);
++            rn->ensure_logits(16);
++            rn->tp_scratch();
++            INK_CK(cudaDeviceSynchronize());
++        }
++        for (int r = 0; r < W; ++r) {
++            auto* rn = ranks_[r]->tp_runner();
++            for (int p = 0; p < W; ++p) {
++                rn->tp_peers.recv[p] = arenas_[p];
++            }
++            rn->tp_rank = r;
++            rn->tp_world = W;
++            rn->tp_epoch = 0;
++        }
++        info_ = "TP" + std::to_string(W) + "[";
++        for (int r = 0; r < W; ++r) info_ += (r ? "," : "") + std::string("GPU") + std::to_string(gpus_[r]);
++        info_ += "] " + ranks_[0]->device_info();
++        std::fprintf(stderr, "[InkCUDA] tensor-parallel decode: %s\n", info_.c_str());
++        return true;
++    }
++
++    bool alloc_slot(int slot, int max_ctx, KvDtype kvd, std::string& err) override {
++        for (int r = 0; r < (int)ranks_.size(); ++r) {
++            cudaSetDevice(gpus_[r]);
++            if (!ranks_[r]->alloc_slot(slot, max_ctx, kvd, err)) return false;
++        }
++        return true;
++    }
++    void free_slot(int slot) override { each([&](int r) { ranks_[r]->free_slot(slot); }); }
++    void reset_slot(int slot) override { each([&](int r) { ranks_[r]->reset_slot(slot); }); }
++    void snapshot_slot(int slot) override { each([&](int r) { ranks_[r]->snapshot_slot(slot); }); }
++    bool save_prompt_checkpoint(int slot, int seq_len) override {
++        bool ok = true;
++        each([&](int r) { ok = ranks_[r]->save_prompt_checkpoint(slot, seq_len) && ok; });
++        return ok;
++    }
++    bool restore_prompt_checkpoint(int slot, int seq_len) override {
++        bool ok = true;
++        each([&](int r) { ok = ranks_[r]->restore_prompt_checkpoint(slot, seq_len) && ok; });
++        return ok;
++    }
++    void rollback_slot(int slot, int keep_len) override { each([&](int r) { ranks_[r]->rollback_slot(slot, keep_len); }); }
++
++    bool forward_batch(const StepBatch& batch, float* logits_out, TapCapture* taps_out, std::string& err) override {
++        const int W = (int)ranks_.size();
++        std::vector<std::string> errs(W);
++        std::vector<char> ok(W, 0);
++        int n_want = 0;
++        for (int i = 0; i < batch.n_tokens; ++i) n_want += batch.want_logits[i] ? 1 : 0;
++        // One wanted row: every rank computes its vocab slice. Otherwise rank 0 computes the full head.
++        const bool slice = (logits_out != nullptr && n_want == 1);
++        for (int r = 0; r < W; ++r) ranks_[r]->tp_runner()->tp_head_slice = slice;
++        auto run = [&](int r) {
++            cudaSetDevice(gpus_[r]);
++            float* lo = (r == 0 || slice) ? logits_out : nullptr;
++            ok[r] = ranks_[r]->forward_batch(batch, lo, r == 0 ? taps_out : nullptr, errs[r]) ? 1 : 0;
++            if (r != 0) cudaStreamSynchronize(ranks_[r]->tp_runner()->st);
++        };
++        std::vector<std::thread> th;
++        th.reserve(W - 1);
++        for (int r = 1; r < W; ++r) th.emplace_back(run, r);
++        run(0);
++        for (auto& t : th) t.join();
++        for (int r = 0; r < W; ++r) {
++            if (!ok[r]) { err = "TP rank " + std::to_string(r) + ": " + errs[r]; return false; }
++        }
++        return true;
++    }
++
++    // Speculative steps run on every rank: replicated state is bit-identical, so each rank drafts the same tree,
++    // verifies it through the same TP exchanges and accepts the same path. Rank 0's result is returned.
++    bool dspark_ready() const override {
++        for (const auto& r : ranks_) if (!r->dspark_ready()) return false;
++        return !ranks_.empty();
++    }
++    template <class F> int all_ranks(F&& f, std::string& err) {
++        const int W = (int)ranks_.size();
++        std::vector<int> res(W, 0);
++        std::vector<std::string> errs(W);
++        for (int r = 0; r < W; ++r) ranks_[r]->tp_runner()->tp_head_slice = false;
++        auto run = [&](int r) { cudaSetDevice(gpus_[r]); res[r] = f(r, errs[r]); };
++        std::vector<std::thread> th;
++        for (int r = 1; r < W; ++r) th.emplace_back(run, r);
++        run(0);
++        for (auto& t : th) t.join();
++        for (int r = 1; r < W; ++r) {
++            if (res[r] != res[0]) { err = "TP ranks diverged in a speculative step"; return -1; }
++        }
++        if (res[0] < 0) err = errs[0];
++        return res[0];
++    }
++    int dspark_draft(int slot, int32_t anchor_tok, int anchor_pos, int max_draft, int32_t* out_draft_ids, std::string& err) override {
++        const int W = (int)ranks_.size();
++        std::vector<std::vector<int32_t>> ids(W, std::vector<int32_t>(16, 0));
++        const int n = all_ranks([&](int r, std::string& e) {
++            return ranks_[r]->dspark_draft(slot, anchor_tok, anchor_pos, max_draft, ids[r].data(), e);
++        }, err);
++        if (n > 0) for (int i = 0; i < n; ++i) out_draft_ids[i] = ids[0][i];
++        return n;
++    }
++    int dspark_spec_step_greedy(int slot, int32_t anchor_tok, int anchor_pos, int max_emit, int32_t* out_emitted,
++                                int* out_drafted, std::string& err) override {
++        const int W = (int)ranks_.size();
++        std::vector<std::vector<int32_t>> em(W, std::vector<int32_t>(16, 0));
++        std::vector<int> dr(W, 0);
++        const int n = all_ranks([&](int r, std::string& e) {
++            return ranks_[r]->dspark_spec_step_greedy(slot, anchor_tok, anchor_pos, max_emit, em[r].data(), &dr[r], e);
++        }, err);
++        if (n > 0) {
++            for (int i = 0; i < n; ++i) out_emitted[i] = em[0][i];
++            for (int r = 1; r < W; ++r) {
++                for (int i = 0; i < n; ++i) if (em[r][i] != em[0][i]) { err = "TP ranks emitted different tokens"; return -1; }
++            }
++        }
++        if (out_drafted) *out_drafted = dr[0];
++        return n;
++    }
++
++    bool selfcheck(std::string& err) override {
++        cudaSetDevice(gpus_.empty() ? 0 : gpus_[0]);
++        return ranks_.empty() ? false : ranks_[0]->selfcheck(err);
++    }
++
++private:
++    template <class F> void each(F&& f) {
++        for (int r = 0; r < (int)ranks_.size(); ++r) { cudaSetDevice(gpus_[r]); f(r); }
++    }
++    std::vector<int> gpus_;
++    std::vector<std::unique_ptr<InkCudaBackend>> ranks_;
++    std::vector<uint2*> arenas_;
++    std::string info_;
++};
++
++std::unique_ptr<InkBackend> make_cuda_tp_backend() {
++    return std::make_unique<InkCudaTpBackend>();
++}
++
+ }  // namespace ink2
+diff --git a/engine/src/inkling2/cuda/ink_dspark.cuh b/engine/src/inkling2/cuda/ink_dspark.cuh
+index f28ed564..11533a97 100644
+--- a/engine/src/inkling2/cuda/ink_dspark.cuh
++++ b/engine/src/inkling2/cuda/ink_dspark.cuh
+@@ -1233,7 +1233,8 @@ struct InkDSpark {
+         // Collapses 21+6 cuBLAS calls -> 12+3 Tensor Core calls (< 0.35 ms on 5090 & V100!)
+         size_t vfree = 0, vtot = 0;
+         INK_CK(ink_cuda_mem_info(&vfree, &vtot));
+-        cache_is_fp16 = (m.sm_cc >= 70 && m.sm_cc < 80);
++        // pascal-llm: SM60/61 have FP16 (not BF16) cuBLAS GEMM, so they use the same FP16 drafter cache as SM70/75.
++        cache_is_fp16 = (m.sm_cc >= 60 && m.sm_cc < 80);
+         auto load_to_tc = [&](const std::string& wn, uint16_t* dst_u16) {
+             const auto& ti = m.tinfo(wn);
+             const int N = (int)ti.rows(), K = (int)ti.cols();
+@@ -1275,7 +1276,7 @@ struct InkDSpark {
+         const bool pack_ho = (cache_is_fp16 || m.tinfo(ho_w).fmt != FMT_BF16);
+         if (pack_rn) tot_elems += (size_t)m.tinfo(rn_w).rows() * m.tinfo(rn_w).cols();
+         if (pack_ho) tot_elems += (size_t)m.tinfo(ho_w).rows() * m.tinfo(ho_w).cols();
+-        if (m.sm_cc >= 70 && vfree > tot_elems * 2 + (768ull << 20)) {
++        if (m.sm_cc >= 60 && vfree > tot_elems * 2 + (768ull << 20)) {
+             d_bf16_pool = dalloc<uint16_t>(tot_elems);
+             size_t cur = 0;
+             for (int il = 0; il < 3; ++il) {
+@@ -1380,7 +1381,7 @@ struct InkDSpark {
+     }
+ 
+     void dspark_linear_b8(const std::string& wn, const float* X, float* Y, int B, bool reuse_x = false) {
+-        if (m.sm_cc >= 70) {
++        if (m.sm_cc >= 60) {
+             const auto& ti = m.tinfo(wn);
+             const int N = (int)ti.rows(), K = (int)ti.cols();
+             auto it = bf16_cache.find(wn);
+diff --git a/engine/src/inkling2/cuda/ink_moe_cuda.cuh b/engine/src/inkling2/cuda/ink_moe_cuda.cuh
+index bcc69196..633f4d68 100644
+--- a/engine/src/inkling2/cuda/ink_moe_cuda.cuh
++++ b/engine/src/inkling2/cuda/ink_moe_cuda.cuh
+@@ -1144,6 +1144,26 @@ __device__ __forceinline__ void sk_paired2_dot_1152(
+     }
+ }
+ 
++// Fast inline __half2 weight decode (8 registers = 16 weights) + 2-accumulator LDS.128 dot across ALL n_e tokens!
++// SM < 100: E2M1 -> half via PRMT (pascal-llm). Every E2M1 magnitude {0,.5,1,1.5,2,3,4,6} is a half whose low
++// byte is 0, so its high byte comes from an 8-entry byte table selected 4-at-a-time by __byte_perm; the sign bit is
++// moved to bit 15/31. Bit-identical to __floats2half2_rn(e2m1_nibble_to_f32(.)) (checked on all 2^16 byte pairs
++// and 2.7e8 random words), at ~4 instead of ~10 integer/float operations per weight.
++__device__ __forceinline__ void sf4_decode8_h2_prmt(uint32_t w, __half2* o) {
++    const uint32_t m = w & 0x77777777u;
++    const uint32_t ev = m & 0x07070707u, od = (m >> 4) & 0x07070707u;
++    const uint32_t se = ev | (ev >> 4), so = od | (od >> 4);
++    const uint32_t E = __byte_perm(0x3E3C3800u, 0x46444240u, (se & 0xFFu) | ((se >> 8) & 0xFF00u));
++    const uint32_t O = __byte_perm(0x3E3C3800u, 0x46444240u, (so & 0xFFu) | ((so >> 8) & 0xFF00u));
++#pragma unroll
++    for (int k = 0; k < 4; ++k) {
++        const uint32_t h = __byte_perm(E, O, ((4u + k) << 12) | (k << 4)) & 0xFF00FF00u;
++        const uint32_t b = w >> (8 * k);
++        const uint32_t v = h | ((b & 0x08u) << 12) | ((b & 0x80u) << 24);
++        o[k] = *reinterpret_cast<const __half2*>(&v);
++    }
++}
++
+ // Fast inline __half2 weight decode (8 registers = 16 weights) + 2-accumulator LDS.128 dot across ALL n_e tokens!
+ __device__ __forceinline__ void sf4_decode16_h2(uint32_t w0, uint32_t w1, __half2 (&w)[8]) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(CUDART_VERSION) && (CUDART_VERSION >= 12080)
+@@ -1151,12 +1171,6 @@ __device__ __forceinline__ void sf4_decode16_h2(uint32_t w0, uint32_t w1, __half
+         __half2_raw r = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)b, __NV_E2M1);
+         return *reinterpret_cast<const __half2*>(&r);
+     };
+-#else
+-    auto c2 = [](uint8_t b) -> __half2 {
+-        float2 f = e2m1x2_byte_to_f32x2(b);
+-        return __floats2half2_rn(f.x, f.y);
+-    };
+-#endif
+     w[0] = c2((uint8_t)(w0 & 0xFFu));
+     w[1] = c2((uint8_t)((w0 >> 8) & 0xFFu));
+     w[2] = c2((uint8_t)((w0 >> 16) & 0xFFu));
+@@ -1165,6 +1179,10 @@ __device__ __forceinline__ void sf4_decode16_h2(uint32_t w0, uint32_t w1, __half
+     w[5] = c2((uint8_t)((w1 >> 8) & 0xFFu));
+     w[6] = c2((uint8_t)((w1 >> 16) & 0xFFu));
+     w[7] = c2((uint8_t)(w1 >> 24));
++#else
++    sf4_decode8_h2_prmt(w0, &w[0]);
++    sf4_decode8_h2_prmt(w1, &w[4]);
++#endif
+ }
+ 
+ __device__ __forceinline__ void mx8_decode16_h2(const uint4& wv, __half2 (&w)[8]) {
+@@ -1206,7 +1224,7 @@ __device__ __forceinline__ float dot16_h2_2acc(const __half2 (&w)[8], const __ha
+ // ---- Ultra-Lean 128B-Coalesced uint4 High-Occupancy SF4/MX8 Gate+Up+SITU Kernel ----
+ // Grid: (1152 / 16 = 72, max_active), Block: 128 (16 features/CTA, 8 lanes/feature -> 576 CTAs at M=1 = 3.4 full waves on 170 SMs!)
+ // Uses 1-instruction hardware e4m3x2_to_f32x2 (zero branches!) + hoisted w_outer + dedicated n_e==1 fast path!
+-template <int MAX_M>
++template <int MAX_M, int F_ = kInkInter>  // F_: resident feature count (TP row shard)
+ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+     const uint8_t* __restrict__ sec4_base,
+     const InkExpertDev* __restrict__ experts,
+@@ -1225,7 +1243,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+     const int sub  = tid >> 3;    // 0..15 features per CTA
+     const int lg   = tid & 7;     // 0..7 lanes per feature (8 x 16B = 128B exact cache line!)
+     const int feat = blockIdx.x * 16 + sub;
+-    if (feat >= kInkInter) return;
++    if (feat >= F_) return;
+ 
+     const uint8_t* body = sec4_base + ed.body_off;
+     float w_outer = 1.0f;
+@@ -1254,7 +1272,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+                 constexpr size_t W_P_ROW = kInkHidden / 2;   // 1152 B = 72 uint4s!
+                 constexpr size_t W_S_ROW = kInkHidden / 16;  // 144 B = 72 uint16s!
+                 const uint8_t* base_p = body + 16;
+-                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
++                const uint8_t* base_s = base_p + (size_t)(2 * F_) * W_P_ROW;
+                 const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                 const uint16_t* gs2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
+@@ -1281,7 +1299,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+                 constexpr size_t W_P_ROW = kInkHidden;
+                 constexpr size_t W_S_ROW = kInkHidden / 32;
+                 const uint8_t* base_p = body;
+-                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
++                const uint8_t* base_s = base_p + (size_t)(2 * F_) * W_P_ROW;
+                 const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                 const uint8_t* gs = base_s + (size_t)(2 * feat) * W_S_ROW;
+@@ -1302,7 +1320,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+                 ag0 += __shfl_xor_sync(0xFFFFFFFFu, ag0, o);
+                 au0 += __shfl_xor_sync(0xFFFFFFFFu, au0, o);
+             }
+-            if (lg == 0) h_f32[(size_t)(row0 + off_m) * kInkInter + feat] = situ_f32(ag0, au0);
++            if (lg == 0) h_f32[(size_t)(row0 + off_m) * F_ + feat] = situ_f32(ag0, au0);
+         } else {
+             float ag[MAX_M] = {};
+             float au[MAX_M] = {};
+@@ -1310,7 +1328,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+                 constexpr size_t W_P_ROW = kInkHidden / 2;
+                 constexpr size_t W_S_ROW = kInkHidden / 16;
+                 const uint8_t* base_p = body + 16;
+-                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
++                const uint8_t* base_s = base_p + (size_t)(2 * F_) * W_P_ROW;
+                 const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                 const uint16_t* gs2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
+@@ -1348,7 +1366,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+                 constexpr size_t W_P_ROW = kInkHidden;
+                 constexpr size_t W_S_ROW = kInkHidden / 32;
+                 const uint8_t* base_p = body;
+-                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
++                const uint8_t* base_s = base_p + (size_t)(2 * F_) * W_P_ROW;
+                 const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                 const uint8_t* gs = base_s + (size_t)(2 * feat) * W_S_ROW;
+@@ -1378,7 +1396,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+                         gv += __shfl_xor_sync(0xFFFFFFFFu, gv, o);
+                         uv += __shfl_xor_sync(0xFFFFFFFFu, uv, o);
+                     }
+-                    if (lg == 0) h_f32[(size_t)(row0 + off_m + m) * kInkInter + feat] = situ_f32(gv, uv);
++                    if (lg == 0) h_f32[(size_t)(row0 + off_m + m) * F_ + feat] = situ_f32(gv, uv);
+                 }
+             }
+         }
+@@ -1388,7 +1406,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
+ 
+ // ---- Ultra-Lean 128B-Coalesced uint4 High-Occupancy SF4/MX8 Down Projection Kernel ----
+ // Grid: (1152 / 16 = 72, max_active), Block: 128 (16 row-pairs/CTA -> 32 outputs/CTA, 576 CTAs at M=1 = 3.4 waves on 170 SMs!)
+-template <int MAX_M>
++template <int MAX_M, int F_ = kInkInter>  // F_: resident feature count (TP row shard)
+ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+     const uint8_t* __restrict__ sec4_base,
+     const InkExpertDev* __restrict__ experts,
+@@ -1416,14 +1434,14 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+         const float2 h23 = *reinterpret_cast<const float2*>(body + 8);
+         w_outer = h23.x / h23.y;
+     }
+-    __shared__ alignas(16) __half2 s_h[MAX_M][kInkInter / 2];
++    __shared__ alignas(16) __half2 s_h[MAX_M][F_ / 2];
+ 
+     for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
+         const int n_e = min(MAX_M, n_total - off_m);
+         for (int m = 0; m < n_e; ++m) {
+-            const float2* src2 = reinterpret_cast<const float2*>(h_f32 + (size_t)(row0 + off_m + m) * kInkInter);
++            const float2* src2 = reinterpret_cast<const float2*>(h_f32 + (size_t)(row0 + off_m + m) * F_);
+             __half2* dst2 = s_h[m];
+-            for (int i = tid; i < (kInkInter / 2); i += 128) {
++            for (int i = tid; i < (F_ / 2); i += 128) {
+                 const float2 f = src2[i];
+                 dst2[i] = __floats2half2_rn(fminf(fmaxf(f.x, -65504.0f), 65504.0f),
+                                             fminf(fmaxf(f.y, -65504.0f), 65504.0f));
+@@ -1434,8 +1452,8 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+         if (n_e == 1) {
+             float y0 = 0.0f, y1 = 0.0f;
+             if (ed.dn_code == FMT_SF4) {
+-                constexpr size_t W_P_ROW = kInkInter / 2;   // 576 B = 36 uint4s!
+-                constexpr size_t W_S_ROW = kInkInter / 16;  // 72 B = 36 uint16s!
++                constexpr size_t W_P_ROW = F_ / 2;   // 576 B = 36 uint4s!
++                constexpr size_t W_S_ROW = F_ / 16;  // 72 B = 36 uint16s!
+                 const uint8_t* base_p = body + ed.dn_off;
+                 const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                 const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+@@ -1443,7 +1461,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+                 const uint16_t* s0 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r) * W_S_ROW);
+                 const uint16_t* s1 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r + 1) * W_S_ROW);
+ 
+-                for (int i = lg; i < 36; i += 8) {
++                for (int i = lg; i < F_ / 32; i += 8) {
+                     const uint4 v0 = p0[i], v1 = p1[i];
+                     const float2 sc0 = e4m3x2_to_f32x2(s0[i]);
+                     const float2 sc1 = e4m3x2_to_f32x2(s1[i]);
+@@ -1461,15 +1479,15 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+                 y0 *= w_outer;
+                 y1 *= w_outer;
+             } else {
+-                constexpr size_t W_P_ROW = kInkInter;
+-                constexpr size_t W_S_ROW = kInkInter / 32;
++                constexpr size_t W_P_ROW = F_;
++                constexpr size_t W_S_ROW = F_ / 32;
+                 const uint8_t* base_p = body + ed.dn_off;
+                 const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                 const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+                 const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+                 const uint8_t* s0 = base_s + (size_t)(2 * pair_r) * W_S_ROW;
+                 const uint8_t* s1 = base_s + (size_t)(2 * pair_r + 1) * W_S_ROW;
+-                for (int i = lg; i < 72; i += 8) {
++                for (int i = lg; i < F_ / 16; i += 8) {
+                     const float sc0 = ue8m0_to_f32(s0[i >> 1]);
+                     const float sc1 = ue8m0_to_f32(s1[i >> 1]);
+                     __half2 w0[8], w1[8];
+@@ -1495,8 +1513,8 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+             float a0[MAX_M] = {};
+             float a1[MAX_M] = {};
+             if (ed.dn_code == FMT_SF4) {
+-                constexpr size_t W_P_ROW = kInkInter / 2;
+-                constexpr size_t W_S_ROW = kInkInter / 16;
++                constexpr size_t W_P_ROW = F_ / 2;
++                constexpr size_t W_S_ROW = F_ / 16;
+                 const uint8_t* base_p = body + ed.dn_off;
+                 const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                 const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+@@ -1504,7 +1522,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+                 const uint16_t* s0 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r) * W_S_ROW);
+                 const uint16_t* s1 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r + 1) * W_S_ROW);
+ 
+-                for (int i = lg; i < 36; i += 8) {
++                for (int i = lg; i < F_ / 32; i += 8) {
+                     const uint4 v0 = p0[i], v1 = p1[i];
+                     const float2 sc0 = e4m3x2_to_f32x2(s0[i]);
+                     const float2 sc1 = e4m3x2_to_f32x2(s1[i]);
+@@ -1533,15 +1551,15 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
+ #pragma unroll
+                 for (int m = 0; m < MAX_M; ++m) { a0[m] *= w_outer; a1[m] *= w_outer; }
+             } else {
+-                constexpr size_t W_P_ROW = kInkInter;
+-                constexpr size_t W_S_ROW = kInkInter / 32;
++                constexpr size_t W_P_ROW = F_;
++                constexpr size_t W_S_ROW = F_ / 32;
+                 const uint8_t* base_p = body + ed.dn_off;
+                 const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                 const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+                 const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+                 const uint8_t* s0 = base_s + (size_t)(2 * pair_r) * W_S_ROW;
+                 const uint8_t* s1 = base_s + (size_t)(2 * pair_r + 1) * W_S_ROW;
+-                for (int i = lg; i < 72; i += 8) {
++                for (int i = lg; i < F_ / 16; i += 8) {
+                     const float sc0 = ue8m0_to_f32(s0[i >> 1]);
+                     const float sc1 = ue8m0_to_f32(s1[i >> 1]);
+                     __half2 w0[8], w1[8];
+diff --git a/engine/src/inkling2/cuda/ink_runner.cuh b/engine/src/inkling2/cuda/ink_runner.cuh
+index 5cce0a82..b33e61d0 100644
+--- a/engine/src/inkling2/cuda/ink_runner.cuh
++++ b/engine/src/inkling2/cuda/ink_runner.cuh
+@@ -10,6 +10,8 @@
+ #include "ink_kernels.cuh"
+ #include "ink_manifest.hpp"
+ #include "ink_moe_cuda.cuh"
++#include "ink_tp.cuh"
++#include "ink_tp_moe.cuh"
+ 
+ #include "strata/artifact/strata_reader.hpp"
+ 
+@@ -219,6 +221,10 @@ struct InkCudaModel {
+     bool ep2_active = false;
+     bool ep2_p2p = false;
+     float ep_split = 0.5f;
++    // Tensor-parallel decode rank (pascal-llm): >= 0 keeps the whole trunk and only experts
++    // with expert_id % tp_world == tp_rank resident on this GPU; the rest are tier 3 (absent).
++    int tp_rank = -1;
++    int tp_world = 1;
+     // Multi-GPU Pipeline Layer-Split (--layer-split auto | K1,K2,...) across 2..4 GPUs (0 duplicated KV/experts!)
+     static constexpr int kMaxStages = 4;
+     bool ls_active = false;
+@@ -392,7 +398,70 @@ struct InkCudaModel {
+             ? static_cast<size_t>(vram_experts_gb * 1073741824.0)
+             : static_cast<size_t>(-1);
+         for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
+-        if (!ssd_experts && vfree > sec4_bytes + reserve && sec4_bytes <= user_vram_cap) {
++        if (tp_rank >= 0) {
++            // TP row split: every expert resident as a feature shard [f0, f0 + Fs) of its 1152 SITU features.
++            // gate/up rows (interleaved 2f, 2f+1) are a contiguous range; down keeps the matching input columns
++            // of every output row. Bytes are copied unchanged (exact repack of the same SF4/MX8 blocks).
++            const int Dh = kInkHidden, F = kInkInter, Fs = F / tp_world, f0 = Fs * tp_rank;
++            if (F % tp_world != 0 || Fs % 32 != 0) { err = "TP row split needs 1152 / tp_world divisible into 32-feature blocks"; return false; }
++            auto al16 = [](size_t v) { return (v + 15) & ~(size_t)15; };
++            auto layout = [&](uint8_t code, size_t& gu_b, size_t& dn_b, size_t& hdr) -> bool {
++                if (code == FMT_SF4) { hdr = 16; gu_b = (size_t)2 * Fs * (Dh / 2 + Dh / 16); dn_b = (size_t)Dh * (Fs / 2 + Fs / 16); return true; }
++                if (code == FMT_MX8) { hdr = 0;  gu_b = (size_t)2 * Fs * (Dh + Dh / 32);     dn_b = (size_t)Dh * (Fs + Fs / 32);     return true; }
++                return false;
++            };
++            size_t total = 0;
++            std::vector<size_t> off(n_total, 0);
++            for (int di = 0; di < n_total; ++di) {
++                const auto& e = dir[di];
++                size_t gb = 0, db = 0, hb = 0;
++                if (e.gu_code_id != e.dn_code_id || !layout(e.gu_code_id, gb, db, hb)) {
++                    err = "TP row split supports uniform SF4 or MX8 experts only";
++                    return false;
++                }
++                off[di] = total;
++                total += al16(hb + gb) + al16(db);
++            }
++            INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, total)));
++            sec4_bytes = total;
++            std::vector<uint8_t> body, shard;
++            for (int di = 0; di < n_total; ++di) {
++                const auto& e = dir[di];
++                const int il = di / man.c.n_experts;
++                const int key = il * man.c.n_experts + e.expert_id;
++                body.resize(e.body_bytes);
++                if (!rd.read_at(hdr.sections[4].file_offset + e.body_offset, body.data(), e.body_bytes, err)) return false;
++                size_t gb = 0, db = 0, hb = 0;
++                layout(e.gu_code_id, gb, db, hb);
++                const bool sf4 = (e.gu_code_id == FMT_SF4);
++                const size_t rp_gu = sf4 ? Dh / 2 : Dh, rs_gu = sf4 ? Dh / 16 : Dh / 32;
++                const size_t rp_dn = sf4 ? F / 2 : F,   rs_dn = sf4 ? F / 16 : F / 32;
++                const size_t cp_dn = sf4 ? Fs / 2 : Fs, cs_dn = sf4 ? Fs / 16 : Fs / 32;
++                const size_t c0p = sf4 ? f0 / 2 : f0,   c0s = sf4 ? f0 / 16 : f0 / 32;
++                const size_t dn_off_new = al16(hb + gb);
++                shard.assign(dn_off_new + al16(db), 0);
++                if (hb) std::memcpy(shard.data(), body.data(), hb);
++                const uint8_t* gp = body.data() + hb;
++                const uint8_t* gs = gp + (size_t)2 * F * rp_gu;
++                uint8_t* o = shard.data() + hb;
++                std::memcpy(o, gp + (size_t)2 * f0 * rp_gu, (size_t)2 * Fs * rp_gu);
++                o += (size_t)2 * Fs * rp_gu;
++                std::memcpy(o, gs + (size_t)2 * f0 * rs_gu, (size_t)2 * Fs * rs_gu);
++                const uint8_t* dp = body.data() + e.dn_offset;
++                const uint8_t* ds = dp + (size_t)Dh * rp_dn;
++                uint8_t* od = shard.data() + dn_off_new;
++                for (int r = 0; r < Dh; ++r) std::memcpy(od + (size_t)r * cp_dn, dp + (size_t)r * rp_dn + c0p, cp_dn);
++                od += (size_t)Dh * cp_dn;
++                for (int r = 0; r < Dh; ++r) std::memcpy(od + (size_t)r * cs_dn, ds + (size_t)r * rs_dn + c0s, cs_dn);
++                INK_CK(cudaMemcpy(d_sec4 + off[di], shard.data(), shard.size(), cudaMemcpyHostToDevice));
++                auto& dev = h_exp[key];
++                dev.body_off = off[di];
++                dev.dn_off = (uint32_t)dn_off_new;
++                dev.tier = 0;
++            }
++            n_vram_experts = n_total;
++            n_host_experts = 0;
++        } else if (!ssd_experts && vfree > sec4_bytes + reserve && sec4_bytes <= user_vram_cap) {
+             // 100% VRAM resident! Single sequential streaming DMA!
+             INK_CK(cudaMalloc(&d_sec4, sec4_bytes));
+             const size_t CH = 64ull << 20;
+@@ -438,9 +507,11 @@ struct InkCudaModel {
+             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0, n_ssd_experts = 0;
+             std::vector<uint8_t> in_vram(n_total, 0);
+             std::vector<uint8_t> in_ram(n_total, 0);
++            std::vector<uint8_t> tp_absent(n_total, 0);
+             const bool force_ssd_only = ssd_experts || (ram_experts_gb == 0.0);
+             for (uint16_t di : order) {
+                 const auto& e = dir[di];
++                if (tp_rank >= 0 && (int)(e.expert_id % tp_world) != tp_rank) { tp_absent[di] = 1; continue; }
+                 max_exp_bytes = std::max<size_t>(max_exp_bytes, e.body_bytes);
+                 const size_t al = (size_t)((e.body_bytes + 63ull) & ~63ull);
+                 if (vram_used + e.body_bytes <= vram_budget) {
+@@ -519,6 +590,11 @@ struct InkCudaModel {
+                 const int il = di / man.c.n_experts;
+                 const int key = il * man.c.n_experts + e.expert_id;
+                 auto& dev = h_exp[key];
++                if (tp_absent[di]) {
++                    dev.body_off = 0;
++                    dev.tier = 3;   // resident on another TP rank
++                    continue;
++                }
+                 if (in_vram[di]) {
+                     tmp_body.resize(e.body_bytes);
+                     if (!rd.read_at(hdr.sections[4].file_offset + e.body_offset, tmp_body.data(), e.body_bytes, err)) return false;
+@@ -1232,7 +1308,13 @@ struct InkCudaModel {
+             const size_t cap0 = std::min(all_fit_gpu ? bud0 : hyb_bud0, user_vram_cap);
+             if (user_vram_cap < bud1) bud1 = user_vram_cap;
+ 
++            if (tp_rank >= 0) {
++                for (int di = 0; di < n_total; ++di) {
++                    if ((dir[di].expert_id % tp_world) != tp_rank) target_tier[di] = 3;
++                }
++            }
+             for (uint16_t di : order) {
++                if (target_tier[di] == 3) continue;
+                 const size_t eb = eff_bytes[di];
+                 const bool pref_p = want_peer(dir[di].expert_id);
+                 if (pref_p && u1 + eb <= bud1) {
+@@ -1441,6 +1523,9 @@ struct InkCudaModel {
+                     d1.body_off = dst_off[di]; d1.tier = 0;
+                     layer_has_peer[il] = true;
+                     mark_info(moe_info_peer[il], layer_gu_code[r], layer_dn_code[r]);
++                } else if (target_tier[di] == 3) {
++                    d0.body_off = 0; d0.tier = 3;
++                    d1.body_off = 0; d1.tier = 3;
+                 } else {
+                     uint8_t* hdst = h_arena_base + dst_off[di];
+                     std::memcpy(hdst, body.data(), body.size());
+@@ -1628,6 +1713,89 @@ struct InkCudaRunner {
+     cudaStream_t st = nullptr;
+     cublasHandle_t cublas = nullptr;
+ 
++    // Tensor-parallel decode state (pascal-llm). tp_world > 1 only on a TP rank.
++    InkTpPeers tp_peers{};
++    int tp_rank = 0;
++    int tp_world = 1;
++    unsigned tp_epoch = 0;
++    unsigned* d_tp_base = nullptr;     // device epoch base for graph replay
++    unsigned* h_tp_base = nullptr;     // pinned ring of host-written bases
++    unsigned tp_base_ring = 0;
++    bool tp_graph_mode = false;        // exchanges use (*d_tp_base + k + 1)
++    unsigned tp_step_k = 0;            // exchange index inside the current step
++    unsigned tp_graph_ops = 0;         // exchanges recorded in the captured M=1 step graph
++    // Global-visit KV ownership: global visit g (0..7 in visit order) lives on rank g % world only.
++    int8_t tp_kv_owner[kInkVisits] = {};
++    void tp_compute_owners() {
++        int g = 0;
++        for (int v = 0; v < kInkVisits; ++v) {
++            const int ip = ink_visit_phys(v);
++            tp_kv_owner[v] = m.man.c.is_swa[ip] ? (int8_t)-1 : (int8_t)((m.tp_rank >= 0) ? (g++ % m.tp_world) : 0);
++        }
++    }
++    bool tp_owns_kv(int v) const { return m.tp_rank < 0 || tp_kv_owner[v] < 0 || tp_kv_owner[v] == m.tp_rank; }
++    void tp_bcast(float* x, size_t n, int owner) {
++        for (size_t o = 0; o < n; o += kTpSlotFloats) {
++            const int len = (int)std::min(kTpSlotFloats, n - o);
++            if (tp_graph_mode) {
++                k_tp_bcast<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, x + o, len, owner, tp_rank, tp_world, d_tp_base, tp_step_k++);
++            } else {
++                k_tp_bcast<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, x + o, len, owner, tp_rank, tp_world, nullptr, ++tp_epoch);
++            }
++        }
++    }
++    float* d_tp_scratch = nullptr;     // compact local blocks for M > 1 row-split projections
++    static constexpr size_t kTpScratchFloats = (size_t)16 * 16384;
++    unsigned* d_tp_counter = nullptr;  // last-CTA counter for the fused M=1 router
++    float* tp_scratch() {
++        if (!d_tp_scratch) d_tp_scratch = dalloc<float>(kTpScratchFloats);
++        if (!d_tp_counter) { d_tp_counter = dalloc<unsigned>(16); INK_CK(cudaMemset(d_tp_counter, 0, 16 * sizeof(unsigned))); }
++        return d_tp_scratch;
++    }
++    template <int MM> void tp_gemv(const InkMultiProj& lp, const float* X, int M, int K) {
++        k_ink_gemv_multi_bf16<MM, false><<<(lp.cumN[lp.count] + 7) / 8, 128, 0, st>>>(lp, X, M, K);
++    }
++    void tp_gemv_any(const InkMultiProj& lp, const float* X, int M, int K) {
++        if (M == 1) tp_gemv<1>(lp, X, M, K);
++        else if (M <= 4) tp_gemv<4>(lp, X, M, K);
++        else if (M <= 8) tp_gemv<8>(lp, X, M, K);
++        else tp_gemv<16>(lp, X, M, K);
++    }
++    static constexpr int kTpMinRows = 96;   // smaller projections stay replicated
++    bool tp_suspend = false;               // head and other rank-local work skip exchanges
++    bool tp_on() const { return tp_world > 1 && !tp_suspend; }
++    bool tp_head_slice = false;            // set per step by the TP backend: this rank computes only its vocab slice
++    int tp_head_a = 0, tp_head_b = 0;      // vocab rows produced by the last head call
++    void tp_allgather(const InkTpSegs& segs) {
++        if (tp_graph_mode) {
++            k_tp_allgather<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, segs, tp_rank, tp_world, d_tp_base, tp_step_k++);
++        } else {
++            k_tp_allgather<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, segs, tp_rank, tp_world, nullptr, ++tp_epoch);
++        }
++    }
++    void tp_allreduce(float* x, size_t n) {
++        for (size_t o = 0; o < n; o += kTpSlotFloats) {
++            const int len = (int)std::min(kTpSlotFloats, n - o);
++            if (tp_graph_mode) {
++                k_tp_allreduce<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, x + o, len, tp_rank, tp_world, d_tp_base, tp_step_k++);
++            } else {
++                k_tp_allreduce<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, x + o, len, tp_rank, tp_world, nullptr, ++tp_epoch);
++            }
++        }
++    }
++    // Graph step: publish the epoch base, run (or capture) the step, then advance by its exchange count.
++    void tp_graph_begin() {
++        if (!d_tp_base) {
++            INK_CK(cudaMalloc(&d_tp_base, sizeof(unsigned)));
++            INK_CK(cudaHostAlloc(&h_tp_base, 64 * sizeof(unsigned), cudaHostAllocPortable));
++        }
++        unsigned* hb = h_tp_base + (tp_base_ring++ & 63u);
++        *hb = tp_epoch;
++        INK_CK(cudaMemcpyAsync(d_tp_base, hb, sizeof(unsigned), cudaMemcpyHostToDevice, st));
++        tp_graph_mode = true;
++        tp_step_k = 0;
++    }
++
+     int max_slots = 1;
+     int max_ctx = 4096;
+     int kv_alloc_ctx = 0;         // Elastic global KV current allocated capacity (dev_ctx + host_ctx <= max_ctx!)
+@@ -1939,11 +2107,12 @@ struct InkCudaRunner {
+                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
+             }
+             const size_t per_visit_pos = kv_bytes_per_visit_pos(kv_dtype);
++            tp_compute_owners();
+             int n_swa_g0 = 0, n_glob_g0 = 0;
+             for (int v = 0; v < kInkVisits; ++v) {
+                 const int ip = ink_visit_phys(v);
+                 if (!m.ls_active || m.layer_owner[ip] == 0) {
+-                    if (m.man.c.is_swa[ip]) ++n_swa_g0; else ++n_glob_g0;
++                    if (m.man.c.is_swa[ip]) ++n_swa_g0; else if (tp_owns_kv(v)) ++n_glob_g0;
+                 }
+             }
+             const size_t swa_kv_bytes = (size_t)n_swa_g0 * max_slots * swa_ring * per_visit_pos;
+@@ -1963,7 +2132,7 @@ struct InkCudaRunner {
+             // Check mapped host RAM budget for Host KV Offloading (8 global visits total!)
+             const uint64_t host_avail = ink_ram_available_bytes();
+             const uint64_t host_os_res = 2ull << 30;
+-            const size_t per_pos_all_glob = (size_t)8 * max_slots * per_visit_pos;
++            const size_t per_pos_all_glob = (size_t)((m.tp_rank >= 0) ? std::max(1, n_glob_g0) : 8) * max_slots * per_visit_pos;
+             const int host_fit_ctx = (host_avail > host_os_res)
+                 ? (int)std::min<size_t>((size_t)max_ctx, ((size_t)(host_avail - host_os_res) / std::max<size_t>(1, per_pos_all_glob)) & ~(size_t)63)
+                 : max_ctx;
+@@ -2012,8 +2181,9 @@ struct InkCudaRunner {
+             const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
+             INK_CK(cudaSetDevice(dev));
+             const bool swa = m.man.c.is_swa[ip] != 0;
+-            const int dcap = swa ? swa_ring : kv_dev_ctx;
+-            const int hcap = swa ? 0 : kv_host_ctx;
++            const bool own = swa || tp_owns_kv(v);   // TP: non-owned global visits keep no KV here
++            const int dcap = swa ? swa_ring : (own ? kv_dev_ctx : 0);
++            const int hcap = (swa || !own) ? 0 : kv_host_ctx;
+             kv_desc[v] = {};
+             kv_desc[v].cap_pos  = dcap + hcap;
+             kv_desc[v].dev_cap  = dcap;
+@@ -2274,7 +2444,7 @@ struct InkCudaRunner {
+             int n_glob_s = 0;
+             for (int v = 0; v < kInkVisits; ++v) {
+                 const int ip = ink_visit_phys(v);
+-                if (!m.man.c.is_swa[ip] && (!m.ls_active || m.layer_owner[ip] == s)) ++n_glob_s;
++                if (!m.man.c.is_swa[ip] && tp_owns_kv(v) && (!m.ls_active || m.layer_owner[ip] == s)) ++n_glob_s;
+             }
+             if (n_glob_s == 0) continue;
+             size_t vf = 0, vt = 0;
+@@ -2301,7 +2471,7 @@ struct InkCudaRunner {
+                             }
+                             bool all_ok = true;
+                             for (int v = 0; v < kInkVisits && all_ok; ++v) {
+-                                if (kv_desc[v].is_swa) continue;
++                                if (kv_desc[v].is_swa || !tp_owns_kv(v)) continue;
+                                 const int ip = ink_visit_phys(v);
+                                 const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
+                                 cudaSetDevice(dev);
+@@ -2321,7 +2491,7 @@ struct InkCudaRunner {
+                             cudaSetDevice(m.primary_gpu);
+                             if (all_ok) {
+                                 for (int v = 0; v < kInkVisits; ++v) {
+-                                    if (kv_desc[v].is_swa) continue;
++                                    if (kv_desc[v].is_swa || !tp_owns_kv(v)) continue;
+                                     kv_desc[v].dev_cap  = kv_dev_ctx;
+                                     kv_desc[v].host_cap = hcap;
+                                     kv_desc[v].cap_pos  = kv_dev_ctx + hcap;
+@@ -2335,7 +2505,7 @@ struct InkCudaRunner {
+                                              kv_dev_ctx, kv_host_ctx, kv_alloc_ctx);
+                                 return true;
+                             }
+-                            for (int v = 0; v < kInkVisits; ++v) if (!kv_desc[v].is_swa) free_host_kv_visit(v);
++                            for (int v = 0; v < kInkVisits; ++v) if (!kv_desc[v].is_swa && tp_owns_kv(v)) free_host_kv_visit(v);
+                         }
+                     }
+                     return false;
+@@ -2355,7 +2525,7 @@ struct InkCudaRunner {
+         }
+ 
+         for (int v = 0; v < kInkVisits; ++v) {
+-            if (kv_desc[v].is_swa) continue;
++            if (kv_desc[v].is_swa || !tp_owns_kv(v)) continue;
+             const int ip = ink_visit_phys(v);
+             const int s  = m.ls_active ? m.layer_owner[ip] : 0;
+             const int dev = m.ls_active ? m.stage_gpu[s] : m.primary_gpu;
+@@ -2643,6 +2813,31 @@ struct InkCudaRunner {
+             mp.N[i] = (int)ti.rows();
+             mp.cumN[i + 1] = mp.cumN[i] + mp.N[i];
+         }
++        if (can_fuse && tp_on() && M <= 16 && ti0.fmt == FMT_BF16 && !is_fp16 && mp.cumN[count] >= kTpMinRows) {
++            InkMultiProj lp{};
++            InkTpSegs segs{};
++            lp.count = count;
++            lp.cumN[0] = 0;
++            float* scr = tp_scratch();
++            size_t so = 0;
++            for (int i = 0; i < count; ++i) {
++                const int n = mp.N[i];
++                const int a = tp_r0(n, tp_rank, tp_world), b = tp_r0(n, tp_rank + 1, tp_world);
++                lp.W[i] = mp.W[i] + (size_t)a * K * 2;
++                lp.Y[i] = (M == 1) ? mp.Y[i] + a : scr + so;     // M > 1: compact [M, b - a] block
++                lp.N[i] = b - a;
++                lp.cumN[i + 1] = lp.cumN[i] + lp.N[i];
++                segs.s[i].y = mp.Y[i];
++                segs.s[i].n = n;
++                segs.s[i].loc = lp.Y[i];
++                so += (size_t)M * (b - a);
++            }
++            segs.count = count;
++            segs.M = M;
++            tp_gemv_any(lp, X, M, K);
++            tp_allgather(segs);
++            return;
++        }
+         if (can_fuse) {
+             const int grid = (mp.cumN[count] + 7) / 8;
+             if (ti0.fmt == FMT_BF16) {
+@@ -2688,6 +2883,17 @@ struct InkCudaRunner {
+         if (ti.fmt == FMT_BF16) {
+             const bool is_fp16 = cur_attn_fp16 && (tname.find(".attn.") != std::string::npos);
+             const int bf16_gemv_max = is_fp16 ? 3 : ((exact_fp32_x || cur_cc < 80) ? 16 : 7);
++            if (tp_on() && M <= bf16_gemv_max && !is_fp16 && N >= kTpMinRows) {
++                const int a = tp_r0(N, tp_rank, tp_world), b = tp_r0(N, tp_rank + 1, tp_world);
++                InkMultiProj lp{};
++                lp.W[0] = W + (size_t)a * K * 2; lp.Y[0] = (M == 1) ? Y + a : tp_scratch(); lp.N[0] = b - a;
++                lp.cumN[0] = 0; lp.cumN[1] = b - a; lp.count = 1;
++                tp_gemv_any(lp, X, M, K);
++                InkTpSegs segs{};
++                segs.s[0].y = Y; segs.s[0].n = N; segs.s[0].loc = lp.Y[0]; segs.count = 1; segs.M = M;
++                tp_allgather(segs);
++                return;
++            }
+             if (M <= bf16_gemv_max) {
+                 InkMultiProj mp{};
+                 mp.W[0] = W; mp.Y[0] = Y; mp.N[0] = N; mp.cumN[0] = 0; mp.cumN[1] = N; mp.count = 1;
+@@ -2870,7 +3076,7 @@ struct InkCudaRunner {
+             const float* q_res = (const float*)m.trunk_ptr_stage(cur_stage, "model.llm.attn_res.attn_queries." + std::to_string(ip - 1));
+             const int nq = is_swa ? 1 : 3;
+             if (!has_msg) {
+-                k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, q_res, d_mixed, nq, M, kInkHidden, nw_q, is_swa ? nullptr : nw_k, is_swa ? nullptr : nw_v);
++                if (tp_world > 1 && M == 1) k_tp_attn_res_mix_m1<<<1, kInkHidden / 4, 0, st>>>(stp, q_res, d_mixed, nq, kInkHidden, nw_q, is_swa ? nullptr : nw_k, is_swa ? nullptr : nw_v); else k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, q_res, d_mixed, nq, M, kInkHidden, nw_q, is_swa ? nullptr : nw_k, is_swa ? nullptr : nw_v);
+                 in_q = d_mixed;
+                 in_k = is_swa ? d_mixed : (d_mixed + 1 * n_hid);
+                 in_v = is_swa ? d_mixed : (d_mixed + 2 * n_hid);
+@@ -2979,6 +3185,9 @@ struct InkCudaRunner {
+             }
+         };
+ 
++        // TP: a global visit's KV and attention live on its owner rank only; the others receive d_attn_out.
++        const bool tp_attn_skip = tp_on() && !is_swa && !tp_owns_kv(visit);
++        if (!tp_attn_skip) {
+         // 5-6. FUSED Post-QKV (K/V ShortConv4 + Q/K/V/R Clip + V RMSNorm + Global Tau + KV Write/Stage) in 1 launch for decode/batched/tree!
+         const auto& ti_qc = m.tinfo(p + ".attn.q_l2_clip.scale");
+         const auto& ti_rc = m.tinfo(p + ".attn.rel_l2_clip.scale");
+@@ -3121,6 +3330,9 @@ struct InkCudaRunner {
+         }
+         prof_mark_end(3); prof_mark_start();
+ 
++        }  // !tp_attn_skip
++        if (tp_on() && !is_swa) tp_bcast(d_attn_out, (size_t)M * kInkQDim, tp_kv_owner[visit]);
++
+         // 8. Output projection wo + FUSED post-attn ShortConv + residual add / block boundary!
+         linear(p + ".attn.wo_ud.weight", d_attn_out, d_wo_raw, M, 0, false, (mode == 2));
+         prof_mark_end(4); prof_mark_start();
+@@ -3150,7 +3362,7 @@ struct InkCudaRunner {
+                     (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.forget_weight"),
+                     mlp_nw, d_moe_in, M, /*cat_ready=*/true, exact_x);
+             } else {
+-                k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, q_mlp, d_moe_in, 1, M, kInkHidden, mlp_nw);
++                if (tp_world > 1 && M == 1) k_tp_attn_res_mix_m1<<<1, kInkHidden / 4, 0, st>>>(stp, q_mlp, d_moe_in, 1, kInkHidden, mlp_nw, nullptr, nullptr); else k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, q_mlp, d_moe_in, 1, M, kInkHidden, mlp_nw);
+             }
+         }
+         prof_mark_end(0); prof_mark_start();
+@@ -3208,6 +3420,46 @@ struct InkCudaRunner {
+             k_ink_add_f32<<<(n_add + 255) / 256, 256, 0, st>>>(d_moe_raw, d_peer_y_rx, n_add);
+             prof_mark_end(5); prof_mark_start();
+             run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
++        } else if (tp_on()) {
++            // TP rank: router replicated, local experts only, fixed-order all-reduce of the partial output.
++            if (M == 1) {
++                InkMoeWorkspace& ws = *cur_moe_ws;
++                k_tp_router_fused_m1<<<kInkExperts, 256, 0, st>>>(
++                    d_moe_in,
++                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".mlp.gate.weight"),
++                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".mlp.gate.bias"),
++                    m.d_experts[ip], ws.r_logits, ws.topk_idx, ws.topk_w, m.man.c.route_scale, ws.tb, tp_scratch() ? d_tp_counter : nullptr);
++            } else {
++                launch_ink_moe_router(
++                    st, cublas,
++                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".mlp.gate.weight"),
++                    (const float*)m.trunk_ptr_stage(cur_stage, p + ".mlp.gate.bias"),
++                    d_moe_in, M, *cur_moe_ws, m.man.c.route_scale, (mode == 2));
++                k_ink_moe_bin<<<1, 128, 0, st>>>(m.d_experts[ip], cur_moe_ws->topk_idx, M, (M <= 128) ? 16 : 64, cur_moe_ws->tb);
++            }
++            {
++                // Row-split shards (F_ = 1152 / 3): same SF4/MX8 kernels, local features only.
++                InkMoeWorkspace& ws = *cur_moe_ws;
++                const int max_act = std::min(M * kInkTopK, kInkExperts);
++                constexpr int FS = kInkInter / 3;
++                dim3 g_gu(FS / 16, max_act);              // 16 local features per CTA
++                dim3 g_dn(kInkHidden / 2 / 16, max_act);   // 16 output row pairs per CTA (all 2304 outputs)
++                if (M == 1 && m.moe_info[ip].has_sf4 && !m.moe_info[ip].has_mx8 && !m.moe_info[ip].has_sk) {
++                    k_tp_moe_gu_sf4_m1<FS><<<dim3(FS / 8, max_act), 256, 0, st>>>(m.d_sec4, m.d_experts[ip], ws.tb, d_moe_in, ws.h_f32);
++                    k_tp_moe_dn_sf4_m1<FS><<<dim3(kInkHidden / 64, max_act), 256, 0, st>>>(m.d_sec4, m.d_experts[ip], ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
++                } else if (M == 1) {
++                    k_ink_moe_gu_sf4_mx8<1, FS><<<g_gu, 128, 0, st>>>(m.d_sec4, m.d_experts[ip], ws.tb, d_moe_in, ws.h_f32);
++                    k_ink_moe_dn_sf4_mx8<1, FS><<<g_dn, 128, 0, st>>>(m.d_sec4, m.d_experts[ip], ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
++                } else {
++                    k_ink_moe_gu_sf4_mx8<4, FS><<<g_gu, 128, 0, st>>>(m.d_sec4, m.d_experts[ip], ws.tb, d_moe_in, ws.h_f32);
++                    k_ink_moe_dn_sf4_mx8<4, FS><<<g_dn, 128, 0, st>>>(m.d_sec4, m.d_experts[ip], ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
++                }
++            }
++            k_ink_moe_reduce8_tier0<<<dim3((kInkHidden + 255) / 256, M), 256, 0, st>>>(
++                m.d_experts[ip], cur_moe_ws->topk_idx, cur_moe_ws->y_pair, d_moe_raw, M);
++            tp_allreduce(d_moe_raw, (size_t)M * kInkHidden);
++            prof_mark_end(5); prof_mark_start();
++            run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
+         } else if (m.layer_has_host[ip] && m.hybrid.active && cur_stage == 0) {
+             launch_ink_moe_hybrid(
+                 st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
+@@ -3353,7 +3605,7 @@ struct InkCudaRunner {
+             for (int b = 0; b < n_blocks; ++b) stp.p[b] = block_ptrs[b];
+             stp.p[n_blocks] = d_cur;
+             stp.count = n_blocks + 1;
+-            k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, (const float*)m.trunk_ptr("model.llm.attn_res.output_query"), d_moe_in, 1, M, kInkHidden);
++            if (tp_world > 1 && M == 1) k_tp_attn_res_mix_m1<<<1, kInkHidden / 4, 0, st>>>(stp, (const float*)m.trunk_ptr("model.llm.attn_res.output_query"), d_moe_in, 1, kInkHidden, nullptr, nullptr, nullptr); else k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, (const float*)m.trunk_ptr("model.llm.attn_res.output_query"), d_moe_in, 1, M, kInkHidden);
+             k_ink_rms_norm<<<M, 256, 0, st>>>(d_moe_in, (const float*)m.trunk_ptr("model.llm.norm.weight"), d_h_norm, nullptr, M, kInkHidden);
+             if (want_taps) INK_CK(cudaMemcpyAsync(d_taps[3], d_h_norm, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+         }
+@@ -3373,6 +3625,7 @@ struct InkCudaRunner {
+             GraphKey key{M, 0, want_taps ? 1 : 0, (int)kv_dtype};
+             cudaGraphExec_t exec = nullptr;
+             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
++            if (tp_world > 1) tp_graph_begin();
+             if (!exec) {
+                 cudaGraph_t gr = nullptr;
+                 cudaError_t ge = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+@@ -3389,13 +3642,16 @@ struct InkCudaRunner {
+                     if (gr) cudaGraphDestroy(gr);
+                     use_cuda_graph = false;
+                     std::fprintf(stderr, "[InkCUDA] CUDA Graph capture unavailable (err=%d): falling back to eager mode\n", (int)ge);
++                    tp_graph_mode = false;   // eager epochs tp_epoch+1.. equal the graph's base+k+1 sequence
+                     emit_48_visits(M, 0, slot0, p0, want_taps);
+                     if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
+                     return;
+                 }
+                 graph_cache.push_back({key, exec});
++                if (tp_world > 1) tp_graph_ops = tp_step_k;
+             }
+             INK_CK(cudaGraphLaunch(exec, st));
++            if (tp_world > 1) { tp_epoch += tp_graph_ops; tp_graph_mode = false; }
+             if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
+             return;
+         }
+@@ -3425,7 +3681,7 @@ struct InkCudaRunner {
+         INK_CK(cudaMemcpyAsync(d_tree_anc,  h_bytes + 128, kInkMaxTree * kInkMaxTreeDepth, cudaMemcpyHostToDevice, st));
+         INK_CK(cudaMemcpyAsync(d_tree_dep,  h_bytes + 384, kInkMaxTree, cudaMemcpyHostToDevice, st));
+ 
+-        if (use_cuda_graph && !m.ls_active && max_passes_override == 0 && slot0 == 0 && M <= tree_cap && m.n_host_experts == 0) {
++        if (use_cuda_graph && tp_world == 1 && !m.ls_active && max_passes_override == 0 && slot0 == 0 && M <= tree_cap && m.n_host_experts == 0) {
+             GraphKey key{M, 2, want_taps ? 1 : 0, (int)kv_dtype};
+             cudaGraphExec_t exec = nullptr;
+             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
+@@ -3467,7 +3723,7 @@ struct InkCudaRunner {
+         INK_CK(cudaMemcpyAsync(d_slots, slot_buf + B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
+         INK_CK(cudaMemcpyAsync(d_pos, slot_buf + 2 * B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
+ 
+-        if (use_cuda_graph && !m.ls_active && B <= 64 && (m.n_host_experts == 0 || B == 1)) {
++        if (use_cuda_graph && tp_world == 1 && !m.ls_active && B <= 64 && (m.n_host_experts == 0 || B == 1)) {
+             GraphKey key{B, 10, want_taps ? 1 : 0, (int)kv_dtype};
+             cudaGraphExec_t exec = nullptr;
+             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
+@@ -3503,6 +3759,28 @@ struct InkCudaRunner {
+     void head_argmax_exact(int M, int32_t* h_out_ids) {
+         prof_mark_start();
+         const auto& ui = m.tinfo("model.llm.unembed.weight");
++        if (tp_on() && M <= 16 && ui.fmt == FMT_BF16) {
++            // TP: exact BF16 logits for this rank's vocab slice, softcap, local argmax, then a global merge.
++            const int V = m.man.c.vocab_unpadded, K = (int)ui.cols();
++            const int a = tp_r0(V, tp_rank, tp_world), b = tp_r0(V, tp_rank + 1, tp_world), w = b - a;
++            ensure_logits(M);
++            InkMultiProj lp{};
++            lp.W[0] = m.trunk_ptr("model.llm.unembed.weight") + (size_t)a * K * 2;
++            lp.Y[0] = d_logits; lp.N[0] = w; lp.cumN[0] = 0; lp.cumN[1] = w; lp.count = 1;
++            tp_gemv_any(lp, d_h_norm, M, K);
++            k_ink_softcap<<<((size_t)M * w + 255) / 256, 256, 0, st>>>(d_logits, (size_t)M * w, m.man.c.logit_softcap);
++            float* pairs_loc = tp_scratch();
++            float* pairs_full = pairs_loc + 64;
++            k_tp_argmax_local<<<M, 1024, 0, st>>>(d_logits, w, a, pairs_loc);
++            InkTpSegs segs{};
++            segs.s[0].y = pairs_full; segs.s[0].n = 2 * M * tp_world; segs.s[0].loc = pairs_loc; segs.count = 1; segs.M = 1;
++            tp_allgather(segs);
++            k_tp_argmax_merge<<<1, 32, 0, st>>>(pairs_full, M, tp_world, d_argmax);
++            prof_mark_end(7);
++            INK_CK(cudaMemcpyAsync(h_out_ids, d_argmax, (size_t)M * 4, cudaMemcpyDeviceToHost, st));
++            INK_CK(cudaStreamSynchronize(st));
++            return;
++        }
+         if (m.unembed_screen.ready && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K) && M <= kInkMaxTree) {
+             const int V = m.man.c.vocab_unpadded;
+             const int g1 = (V + 7) / 8;
+@@ -3551,7 +3829,20 @@ struct InkCudaRunner {
+     void head_logits_from(const float* d_h_src, int n_want) {
+         ensure_logits(n_want);
+         const int V = m.man.c.vocab_unpadded;
+-        linear("model.llm.unembed.weight", d_h_src, d_logits, n_want, V);
++        tp_head_a = 0; tp_head_b = V;
++        const auto& ui = m.tinfo("model.llm.unembed.weight");
++        if (tp_world > 1 && tp_head_slice && n_want == 1 && ui.fmt == FMT_BF16) {
++            const int K = (int)ui.cols();
++            const int a = tp_r0(V, tp_rank, tp_world), b = tp_r0(V, tp_rank + 1, tp_world);
++            InkMultiProj lp{};
++            lp.W[0] = m.trunk_ptr("model.llm.unembed.weight") + (size_t)a * K * 2;
++            lp.Y[0] = d_logits + a; lp.N[0] = b - a; lp.cumN[0] = 0; lp.cumN[1] = b - a; lp.count = 1;
++            k_ink_gemv_multi_bf16<1, false><<<(b - a + 7) / 8, 128, 0, st>>>(lp, d_h_src, 1, K);
++            k_ink_softcap<<<(b - a + 255) / 256, 256, 0, st>>>(d_logits + a, (size_t)(b - a), m.man.c.logit_softcap);
++            tp_head_a = a; tp_head_b = b;
++            return;
++        }
++        { const bool tp_sv = tp_suspend; tp_suspend = true; linear("model.llm.unembed.weight", d_h_src, d_logits, n_want, V); tp_suspend = tp_sv; }
+         const size_t n = (size_t)n_want * V;
+         k_ink_softcap<<<(n + 255) / 256, 256, 0, st>>>(d_logits, n, m.man.c.logit_softcap);
+     }
+diff --git a/engine/src/inkling2/cuda/ink_tp.cuh b/engine/src/inkling2/cuda/ink_tp.cuh
+new file mode 100644
+index 00000000..5b681539
+--- /dev/null
++++ b/engine/src/inkling2/cuda/ink_tp.cuh
+@@ -0,0 +1,145 @@
++// ink_tp.cuh - Tensor-parallel decode exchange for strata-inkling (pascal-llm patch).
++//
++// Each rank runs the same kernel sequence on its own GPU. Exchanges use a
++// low-latency protocol: every element travels as one naturally aligned 8-byte
++// volatile store {float value, uint32 epoch} into the peer's receive arena, so
++// the receiver validates each element by its epoch. There is no memory fence,
++// no separate flag and no host round trip.
++//
++// Receive slots rotate over kTpSlots epochs. A rank cannot write epoch e+kTpSlots
++// into a peer's slot before that peer has finished exchange e: the writer must
++// first read the peer's data of e+1..e+kTpSlots-1, which the peer only writes
++// after its exchange-e kernel completed (stream order).
++//
++// All-reduce sums ranks in fixed order 0..world-1, so every rank holds
++// bit-identical results and the replicated state never diverges.
++#pragma once
++
++#include <cuda_runtime.h>
++#include <cstddef>
++#include <cstdint>
++
++namespace strata::ink {
++
++constexpr int kTpMaxWorld = 4;
++constexpr int kTpSlots = 4;
++constexpr size_t kTpSlotFloats = 131072;  // elements per (slot, source rank)
++constexpr int kTpBlocks = 8;             // exchange grid; elementwise, no cross-block dependency
++constexpr int kTpThreads = 256;
++
++struct InkTpPeers {
++    uint2* recv[kTpMaxWorld] = {};  // rank p's receive arena [kTpSlots][kTpMaxWorld][kTpSlotFloats] of {value, epoch}
++};
++
++struct InkTpSeg {
++    float* y = nullptr;          // full output [M, n] (row stride n)
++    int n = 0;                   // full row length
++    const float* loc = nullptr;  // this rank's compact block [M, r0(rank+1) - r0(rank)]
++};
++
++struct InkTpSegs {
++    InkTpSeg s[8];
++    int count = 0;
++    int M = 1;
++};
++
++__host__ __device__ inline int tp_r0(int n, int rank, int world) { return (int)(((long long)n * rank) / world); }
++
++__device__ inline uint2* tp_slot_ptr(const InkTpPeers& P, int dst, int slot, int src) {
++    return P.recv[dst] + ((size_t)slot * kTpMaxWorld + src) * kTpSlotFloats;
++}
++
++// Exchange epoch: eager steps pass it directly; CUDA-graph steps pass a device base and the op index k within the
++// step, so one captured graph replays with fresh epochs (the host writes *base before every launch).
++__device__ __forceinline__ unsigned tp_epoch_of(const unsigned* base, unsigned k_or_epoch) {
++    if (base == nullptr) return k_or_epoch;
++    return *reinterpret_cast<const volatile unsigned*>(base) + k_or_epoch + 1u;
++}
++
++__device__ __forceinline__ void tp_st(uint2* p, float v, unsigned epoch) {
++    asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};" :: "l"(p), "r"(__float_as_uint(v)), "r"(epoch) : "memory");
++}
++
++__device__ __forceinline__ float tp_ld_wait(const uint2* p, unsigned epoch) {
++    unsigned v, e;
++    do {
++        asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v), "=r"(e) : "l"(p) : "memory");
++    } while (e != epoch);
++    return __uint_as_float(v);
++}
++
++// All-gather of row-partitioned M=1 outputs: rank r owns [r0(r), r0(r+1)) of each segment.
++__global__ void __launch_bounds__(256) k_tp_allgather(InkTpPeers P, InkTpSegs S, int rank, int world, const unsigned* base, unsigned ke) {
++    const unsigned epoch = tp_epoch_of(base, ke);
++    const int slot = (int)(epoch % kTpSlots);
++    const int M = S.M;
++    int off = 0;
++    for (int i = 0; i < S.count; ++i) {
++        const int n = S.s[i].n;
++        const int a = tp_r0(n, rank, world), w = tp_r0(n, rank + 1, world) - a;
++        for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < M * w; t += gridDim.x * blockDim.x) {
++            const float v = S.s[i].loc[t];
++            for (int p = 0; p < world; ++p) {
++                if (p != rank) tp_st(tp_slot_ptr(P, p, slot, rank) + off + t, v, epoch);
++            }
++            const int m = t / w;
++            S.s[i].y[(size_t)m * n + a + (t - m * w)] = v;   // own rows into the strided full output
++        }
++        off += M * w;
++    }
++    for (int p = 0; p < world; ++p) {
++        if (p == rank) continue;
++        const uint2* src = tp_slot_ptr(P, rank, slot, p);
++        int o = 0;
++        for (int i = 0; i < S.count; ++i) {
++            const int n = S.s[i].n;
++            const int a = tp_r0(n, p, world), w = tp_r0(n, p + 1, world) - a;
++            for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < M * w; t += gridDim.x * blockDim.x) {
++                const int m = t / w;
++                S.s[i].y[(size_t)m * n + a + (t - m * w)] = tp_ld_wait(src + o + t, epoch);
++            }
++            o += M * w;
++        }
++    }
++}
++
++// All-reduce (sum) of x[0..n), n <= kTpSlotFloats, fixed rank order.
++__global__ void __launch_bounds__(256) k_tp_allreduce(InkTpPeers P, float* x, int n, int rank, int world, const unsigned* base, unsigned ke) {
++    const unsigned epoch = tp_epoch_of(base, ke);
++    const int slot = (int)(epoch % kTpSlots);
++    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += gridDim.x * blockDim.x) {
++        const float v = x[t];
++        for (int p = 0; p < world; ++p) {
++            if (p != rank) tp_st(tp_slot_ptr(P, p, slot, rank) + t, v, epoch);
++        }
++    }
++    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += gridDim.x * blockDim.x) {
++        const float own = x[t];
++        float acc = 0.0f;
++        for (int p = 0; p < world; ++p) acc += (p == rank) ? own : tp_ld_wait(tp_slot_ptr(P, rank, slot, p) + t, epoch);
++        x[t] = acc;
++    }
++}
++
++}  // namespace strata::ink
++
++namespace strata::ink {
++
++// Broadcast x[0..n) from `owner` to every other rank (attention output of an owner-only global visit).
++__global__ void __launch_bounds__(256) k_tp_bcast(InkTpPeers P, float* x, int n, int owner, int rank, int world, const unsigned* base, unsigned ke) {
++    const unsigned epoch = tp_epoch_of(base, ke);
++    const int slot = (int)(epoch % kTpSlots);
++    if (rank == owner) {
++        for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += gridDim.x * blockDim.x) {
++            const float v = x[t];
++            for (int p = 0; p < world; ++p) {
++                if (p != rank) tp_st(tp_slot_ptr(P, p, slot, rank) + t, v, epoch);
++            }
++        }
++    } else {
++        const uint2* src = tp_slot_ptr(P, rank, slot, owner);
++        for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < n; t += gridDim.x * blockDim.x) x[t] = tp_ld_wait(src + t, epoch);
++    }
++}
++
++}  // namespace strata::ink
+diff --git a/engine/src/inkling2/cuda/ink_tp_moe.cuh b/engine/src/inkling2/cuda/ink_tp_moe.cuh
+new file mode 100644
+index 00000000..56a22d6e
+--- /dev/null
++++ b/engine/src/inkling2/cuda/ink_tp_moe.cuh
+@@ -0,0 +1,398 @@
++// ink_tp_moe.cuh - M=1 SF4 expert kernels for tensor-parallel feature shards (pascal-llm patch).
++//
++// Same shard layout, weight decode (sf4_decode16_h2), 16-weight half2 dot (dot16_h2_2acc), E4M3 block scales and
++// FP32 accumulation as k_ink_moe_gu/dn_sf4_mx8, but with enough independent warps at M=1 to keep HBM2 busy on
++// SM60: the generic kernels run 24 x 8 CTAs of 128 threads for a 384-feature shard (~3.4 CTAs per P100 SM).
++//   gate/up : one warp per feature, 8 features per CTA  -> (FS / 8) x n_active CTAs of 256 threads
++//   down    : four lanes per output row, 64 rows per CTA -> (2304 / 64) x n_active CTAs of 256 threads
++// Only the cross-lane FP32 summation order differs from the generic kernels.
++#pragma once
++
++#include "ink_kernels.cuh"
++#include "ink_moe_cuda.cuh"
++
++namespace strata::ink {
++
++template <int FS>
++__global__ void __launch_bounds__(256) k_tp_moe_gu_sf4_m1(
++    const uint8_t* __restrict__ sec4_base, const InkExpertDev* __restrict__ experts, InkMoeTables tb,
++    const float* __restrict__ x_f32, float* __restrict__ h_f32) {
++    const int ai = blockIdx.y;
++    if (ai >= *tb.nact) return;
++    const int e = tb.active[ai];
++    const int row0 = tb.off[e];
++    const InkExpertDev ed = experts[e];
++    if (ed.tier > 1 || ed.gu_code != FMT_SF4) return;
++
++    __shared__ alignas(16) __half2 s_x[kInkHidden / 2];
++    const float2* src = reinterpret_cast<const float2*>(x_f32 + (size_t)tb.tok_idx[row0] * kInkHidden);
++    for (int i = threadIdx.x; i < kInkHidden / 2; i += 256) {
++        const float2 f = src[i];
++        s_x[i] = __floats2half2_rn(fminf(fmaxf(f.x, -65504.0f), 65504.0f), fminf(fmaxf(f.y, -65504.0f), 65504.0f));
++    }
++    __syncthreads();
++
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int feat = blockIdx.x * 8 + warp;
++    if (feat >= FS) return;
++    const uint8_t* body = sec4_base + ed.body_off;
++    const float2 h01 = *reinterpret_cast<const float2*>(body);
++    const float w_outer = h01.x / h01.y;
++    constexpr size_t RP = kInkHidden / 2, RS = kInkHidden / 16;   // 1152 B packs, 144 B scales per row
++    const uint8_t* bp = body + 16;
++    const uint8_t* bs = bp + (size_t)(2 * FS) * RP;
++    const uint4* gp = reinterpret_cast<const uint4*>(bp + (size_t)(2 * feat) * RP);
++    const uint4* up = reinterpret_cast<const uint4*>(bp + (size_t)(2 * feat + 1) * RP);
++    const uint16_t* gs = reinterpret_cast<const uint16_t*>(bs + (size_t)(2 * feat) * RS);
++    const uint16_t* us = reinterpret_cast<const uint16_t*>(bs + (size_t)(2 * feat + 1) * RS);
++
++    float ag = 0.0f, au = 0.0f;
++#pragma unroll
++    for (int j = 0; j < 3; ++j) {
++        const int i = lane + 32 * j;          // 72 uint4 (32 weights each) per row
++        if (i < 72) {
++            const uint4 gv = gp[i], uv = up[i];
++            const float2 sg = e4m3x2_to_f32x2(gs[i]);
++            const float2 su = e4m3x2_to_f32x2(us[i]);
++            const __half2* xh = s_x + i * 16;
++            __half2 gw[8], uw[8];
++            sf4_decode16_h2(gv.x, gv.y, gw);
++            sf4_decode16_h2(uv.x, uv.y, uw);
++            ag = fmaf(dot16_h2_2acc(gw, xh), sg.x, ag);
++            au = fmaf(dot16_h2_2acc(uw, xh), su.x, au);
++            sf4_decode16_h2(gv.z, gv.w, gw);
++            sf4_decode16_h2(uv.z, uv.w, uw);
++            ag = fmaf(dot16_h2_2acc(gw, xh + 8), sg.y, ag);
++            au = fmaf(dot16_h2_2acc(uw, xh + 8), su.y, au);
++        }
++    }
++#pragma unroll
++    for (int o = 16; o >= 1; o >>= 1) {
++        ag += __shfl_xor_sync(0xFFFFFFFFu, ag, o);
++        au += __shfl_xor_sync(0xFFFFFFFFu, au, o);
++    }
++    if (lane == 0) h_f32[(size_t)row0 * FS + feat] = situ_f32(ag * w_outer, au * w_outer);
++}
++
++template <int FS>
++__global__ void __launch_bounds__(256) k_tp_moe_dn_sf4_m1(
++    const uint8_t* __restrict__ sec4_base, const InkExpertDev* __restrict__ experts, InkMoeTables tb,
++    const float* __restrict__ h_f32, const float* __restrict__ topk_w, float* __restrict__ y_pair) {
++    const int ai = blockIdx.y;
++    if (ai >= *tb.nact) return;
++    const int e = tb.active[ai];
++    const int row0 = tb.off[e];
++    const InkExpertDev ed = experts[e];
++    if (ed.tier > 1 || ed.dn_code != FMT_SF4) return;
++
++    __shared__ alignas(16) __half2 s_h[FS / 2];
++    const float2* src = reinterpret_cast<const float2*>(h_f32 + (size_t)row0 * FS);
++    for (int i = threadIdx.x; i < FS / 2; i += 256) {
++        const float2 f = src[i];
++        s_h[i] = __floats2half2_rn(fminf(fmaxf(f.x, -65504.0f), 65504.0f), fminf(fmaxf(f.y, -65504.0f), 65504.0f));
++    }
++    __syncthreads();
++
++    const int row = blockIdx.x * 64 + (threadIdx.x >> 2);
++    const int q = threadIdx.x & 3;
++    const uint8_t* body = sec4_base + ed.body_off;
++    const float2 h23 = *reinterpret_cast<const float2*>(body + 8);
++    const float w_outer = h23.x / h23.y;
++    constexpr size_t RP = FS / 2, RS = FS / 16;               // 192 B packs, 24 B scales per output row
++    constexpr int NV = FS / 32;                               // uint4 per row (12)
++    const uint8_t* bp = body + ed.dn_off;
++    const uint8_t* bs = bp + (size_t)kInkHidden * RP;
++    const uint4* p = reinterpret_cast<const uint4*>(bp + (size_t)row * RP);
++    const uint16_t* sc = reinterpret_cast<const uint16_t*>(bs + (size_t)row * RS);
++    float y = 0.0f;
++#pragma unroll
++    for (int j = 0; j < (NV + 3) / 4; ++j) {
++        const int i = q + 4 * j;
++        if (i < NV) {
++            const uint4 v = p[i];
++            const float2 s = e4m3x2_to_f32x2(sc[i]);
++            const __half2* hh = s_h + i * 16;
++            __half2 w[8];
++            sf4_decode16_h2(v.x, v.y, w);
++            y = fmaf(dot16_h2_2acc(w, hh), s.x, y);
++            sf4_decode16_h2(v.z, v.w, w);
++            y = fmaf(dot16_h2_2acc(w, hh + 8), s.y, y);
++        }
++    }
++    y += __shfl_xor_sync(0xFFFFFFFFu, y, 2);
++    y += __shfl_xor_sync(0xFFFFFFFFu, y, 1);
++    if (q == 0) {
++        const int pid = tb.pairs[row0];
++        y_pair[(size_t)pid * kInkHidden + row] = (y * w_outer) * topk_w[pid];
++    }
++}
++
++}  // namespace strata::ink
++
++namespace strata::ink {
++
++// M=1 attention-residual depth mix for TP ranks (pascal-llm). Same math as k_ink_attn_res_mix (per-state RMS,
++// scaled dot with each query, softmax over states, weighted sum, optional RMSNorm), but each of 576 threads owns
++// one float4 of every state so all state loads are in flight together and the mix reuses them from registers.
++// Only the FP32 summation order of the reductions differs.
++__global__ void __launch_bounds__(576) k_tp_attn_res_mix_m1(  // launch with D/4 = 576 threads
++    DepthStatePtrs states, const float* __restrict__ queries, float* __restrict__ out, int n_q, int D,
++    const float* __restrict__ nw0, const float* __restrict__ nw1, const float* __restrict__ nw2) {
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int S = states.count;
++    const int D4 = D >> 2;
++    const bool act = tid < D4;
++    __shared__ float red[40][32];
++    __shared__ float tot[40];
++    __shared__ float s_prob[4][8];
++    __shared__ float rq[32];
++
++    float4 sv[8];
++    float val[40];
++#pragma unroll
++    for (int s = 0; s < 8; ++s) {
++        sv[s] = make_float4(0.f, 0.f, 0.f, 0.f);
++        if (s < S && act) sv[s] = reinterpret_cast<const float4*>(states.p[s])[tid];
++    }
++    float4 qv[4];
++#pragma unroll
++    for (int q = 0; q < 4; ++q) {
++        qv[q] = make_float4(0.f, 0.f, 0.f, 0.f);
++        if (q < n_q && act) qv[q] = reinterpret_cast<const float4*>(queries + (size_t)q * D)[tid];
++    }
++#pragma unroll
++    for (int s = 0; s < 8; ++s) {
++        const float4 a = sv[s];
++        val[s * 5] = a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            float d = 0.f;
++            d = fmaf(a.x, qv[q].x, d); d = fmaf(a.y, qv[q].y, d);
++            d = fmaf(a.z, qv[q].z, d); d = fmaf(a.w, qv[q].w, d);
++            val[s * 5 + 1 + q] = d;
++        }
++    }
++#pragma unroll
++    for (int v = 0; v < 40; ++v) {
++        float x = val[v];
++#pragma unroll
++        for (int o = 16; o >= 1; o >>= 1) x += __shfl_xor_sync(0xFFFFFFFFu, x, o);
++        if (lane == 0) red[v][warp] = x;
++    }
++    __syncthreads();
++    if (tid < 40) {
++        float a = 0.f;
++        for (int w = 0; w < (int)(blockDim.x >> 5); ++w) a += red[tid][w];
++        tot[tid] = a;
++    }
++    __syncthreads();
++    if (tid == 0) {
++        const float inv_sqrt_d = rsqrtf((float)D);
++        float inv[8], sc[4][8];
++        for (int s = 0; s < S; ++s) {
++            inv[s] = rsqrtf(tot[s * 5] / (float)D + kInkRmsEps);
++            for (int q = 0; q < n_q; ++q) sc[q][s] = tot[s * 5 + 1 + q] * inv[s] * inv_sqrt_d;
++        }
++        for (int q = 0; q < n_q; ++q) {
++            float mx = -1e30f;
++            for (int s = 0; s < S; ++s) mx = fmaxf(mx, sc[q][s]);
++            float sum = 0.f;
++            for (int s = 0; s < S; ++s) { sc[q][s] = expf(sc[q][s] - mx); sum += sc[q][s]; }
++            const float inv_s = 1.0f / sum;
++            for (int s = 0; s < S; ++s) s_prob[q][s] = sc[q][s] * inv_s * inv[s];
++        }
++    }
++    __syncthreads();
++    for (int q = 0; q < n_q; ++q) {
++        const float* nw = (q == 0) ? nw0 : (q == 1 ? nw1 : nw2);
++        float ax = 0.f, ay = 0.f, az = 0.f, aw = 0.f;
++#pragma unroll
++        for (int s = 0; s < 8; ++s) {
++            if (s < S) {
++                const float w = s_prob[q][s];
++                ax = fmaf(w, sv[s].x, ax); ay = fmaf(w, sv[s].y, ay);
++                az = fmaf(w, sv[s].z, az); aw = fmaf(w, sv[s].w, aw);
++            }
++        }
++        float4* dst4 = reinterpret_cast<float4*>(out + (size_t)q * D);
++        if (!nw) {
++            if (act) dst4[tid] = make_float4(ax, ay, az, aw);
++            continue;
++        }
++        float ss = act ? (ax * ax + ay * ay + az * az + aw * aw) : 0.f;
++#pragma unroll
++        for (int o = 16; o >= 1; o >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, o);
++        if (lane == 0) rq[warp] = ss;
++        __syncthreads();
++        if (warp == 0) {
++            float t = (lane < (int)(blockDim.x >> 5)) ? rq[lane] : 0.f;
++#pragma unroll
++            for (int o = 16; o >= 1; o >>= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, o);
++            if (lane == 0) rq[0] = t;
++        }
++        __syncthreads();
++        const float inv = rsqrtf(rq[0] / (float)D + kInkRmsEps);
++        __syncthreads();
++        if (act) {
++            const float4 wv = reinterpret_cast<const float4*>(nw)[tid];
++            dst4[tid] = make_float4(ax * inv * wv.x, ay * inv * wv.y, az * inv * wv.z, aw * inv * wv.w);
++        }
++    }
++}
++
++}  // namespace strata::ink
++
++namespace strata::ink {
++
++// Exact argmax over this rank's vocabulary slice [a, a + w) of compact logits [M, w]; ties -> smallest index,
++// as k_ink_argmax_rows. Writes {value, index as float bits} per row.
++__global__ void __launch_bounds__(1024) k_tp_argmax_local(const float* __restrict__ lg_c, int w, int a, float* __restrict__ pairs) {
++    __shared__ float sv[32];
++    __shared__ int32_t si[32];
++    const float* lg = lg_c + (size_t)blockIdx.x * w;
++    float bv = -3.0e38f;
++    int32_t bi = 0x7fffffff;
++    for (int i = threadIdx.x; i < w; i += 1024) {
++        const float v = lg[i];
++        if (v > bv) { bv = v; bi = a + i; }
++    }
++#pragma unroll
++    for (int o = 16; o >= 1; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, o);
++        const int32_t oi = __shfl_xor_sync(0xFFFFFFFFu, bi, o);
++        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++    }
++    if ((threadIdx.x & 31) == 0) { sv[threadIdx.x >> 5] = bv; si[threadIdx.x >> 5] = bi; }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float b2 = sv[0]; int32_t i2 = si[0];
++        for (int q = 1; q < 32; ++q)
++            if (sv[q] > b2 || (sv[q] == b2 && si[q] < i2)) { b2 = sv[q]; i2 = si[q]; }
++        pairs[2 * blockIdx.x] = b2;
++        pairs[2 * blockIdx.x + 1] = __int_as_float(i2);
++    }
++}
++
++// Merge per-rank {value, index} pairs (rank r at pairs_full[r * 2M ...]) into the global argmax per row.
++__global__ void k_tp_argmax_merge(const float* __restrict__ pairs_full, int M, int world, int32_t* __restrict__ out) {
++    const int row = blockIdx.x * blockDim.x + threadIdx.x;
++    if (row >= M) return;
++    float bv = -3.0e38f;
++    int32_t bi = 0x7fffffff;
++    for (int r = 0; r < world; ++r) {
++        const float v = pairs_full[(size_t)r * 2 * M + 2 * row];
++        const int32_t i = __float_as_int(pairs_full[(size_t)r * 2 * M + 2 * row + 1]);
++        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
++    }
++    out[row] = bi;
++}
++
++}  // namespace strata::ink
++
++namespace strata::ink {
++
++// M=1 router for TP ranks (pascal-llm): k_ink_router_gemv_smallM<1> (128 CTAs, one per expert, same dot and
++// block_sum) + k_ink_router_select_topk8 + k_ink_moe_bin fused through a last-CTA-done counter. Selection math and
++// tie-breaking are copied unchanged; binning is specialised for 8 distinct experts of one token. The counter is
++// reset by the last CTA, so the kernel replays inside CUDA graphs.
++__global__ void __launch_bounds__(256) k_tp_router_fused_m1(
++    const float* __restrict__ x, const float* __restrict__ gate_w, const float* __restrict__ gate_b,
++    const InkExpertDev* __restrict__ ex, float* __restrict__ r_logits, int32_t* __restrict__ topk_idx,
++    float* __restrict__ topk_w, float route_scale, InkMoeTables tb, unsigned* __restrict__ counter) {
++    const int e = blockIdx.x;
++    const int tid = threadIdx.x;
++    {
++        const float4* gw = reinterpret_cast<const float4*>(gate_w + (size_t)e * kInkHidden);
++        constexpr int K4 = kInkHidden / 4;
++        float acc = 0.0f;
++        for (int i = tid; i < K4; i += 256) {
++            const float4 w = gw[i];
++            const float4 xv = reinterpret_cast<const float4*>(x)[i];
++            acc = fmaf(w.x, xv.x, acc); acc = fmaf(w.y, xv.y, acc);
++            acc = fmaf(w.z, xv.z, acc); acc = fmaf(w.w, xv.w, acc);
++        }
++        __shared__ float sh[32];
++        const float s = block_sum(acc, sh);
++        if (tid == 0) r_logits[e] = s;
++    }
++    __shared__ unsigned s_last;
++    __threadfence();
++    __syncthreads();
++    if (tid == 0) s_last = (atomicAdd(counter, 1u) == (unsigned)(kInkExperts - 1)) ? 1u : 0u;
++    __syncthreads();
++    if (!s_last) return;
++    __threadfence();
++
++    __shared__ int s_id[kInkTopK];
++    __shared__ float s_w[kInkTopK];
++    if (tid < 32) {
++        const int lane = tid;
++        const volatile float* lg = r_logits;
++        float sc[4], pr[4];
++        int id[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const int ee = lane + 32 * j;
++            const float p = 1.0f / (1.0f + expf(-lg[ee]));
++            id[j] = ee; pr[j] = p; sc[j] = p + gate_b[ee];
++        }
++        int best_id[kInkTopK];
++        float best_p[kInkTopK];
++        float psum = 0.0f;
++#pragma unroll
++        for (int k = 0; k < kInkTopK; ++k) {
++            float mv = -1e30f; int mi = 1000000; float mp = 0.0f;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                if (sc[j] > mv || (sc[j] == mv && id[j] < mi)) { mv = sc[j]; mi = id[j]; mp = pr[j]; }
++            }
++#pragma unroll
++            for (int o = 16; o >= 1; o >>= 1) {
++                const float ov = __shfl_xor_sync(0xFFFFFFFFu, mv, o);
++                const int   oi = __shfl_xor_sync(0xFFFFFFFFu, mi, o);
++                const float op = __shfl_xor_sync(0xFFFFFFFFu, mp, o);
++                if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; mp = op; }
++            }
++            best_id[k] = mi; best_p[k] = mp; psum += mp;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) if (id[j] == mi) sc[j] = -1e30f;
++        }
++        if (lane < kInkTopK) {
++            const float inv = route_scale / (psum + 1e-20f);
++            topk_idx[lane] = best_id[lane];
++            topk_w[lane] = best_p[lane] * inv;
++            s_id[lane] = best_id[lane];
++            s_w[lane] = best_p[lane] * inv;
++        }
++    }
++    __syncthreads();
++    // Binning for one token with 8 distinct resident experts (all shards are tier 0 on TP ranks).
++    if (tid < kInkExperts) {
++        int sel = -1, below = 0;
++        for (int k = 0; k < kInkTopK; ++k) {
++            const int id = s_id[k];
++            if (ex[id].tier > 1) continue;
++            if (id == tid) sel = k;
++            if (id < tid) ++below;
++        }
++        tb.cnt[tid] = (sel >= 0) ? 1 : 0;
++        tb.off[tid] = below;
++        if (sel >= 0) {
++            tb.active[below] = tid;
++            tb.pairs[below] = sel;
++            tb.tok_idx[below] = 0;
++            tb.tiles[below] = make_int2(tid, below);
++        }
++        if (tid == kInkExperts - 1) {
++            int n = 0;
++            for (int k = 0; k < kInkTopK; ++k) n += (ex[s_id[k]].tier <= 1) ? 1 : 0;
++            tb.off[kInkExperts] = n;
++            *tb.nact = n;
++            *tb.n_tiles = n;
++            *counter = 0u;
++        }
++    }
++}
++
++}  // namespace strata::ink
++
+diff --git a/engine/src/inkling2/ink_backend.h b/engine/src/inkling2/ink_backend.h
+index e8b05e78..d07bc9fa 100644
+--- a/engine/src/inkling2/ink_backend.h
++++ b/engine/src/inkling2/ink_backend.h
+@@ -35,6 +35,9 @@ struct BackendOpts {
+     bool enable_dspark = true;
+     std::string dspark_path;     // optional external mtp.safetensors or dspark-*.gguf
+     std::string vision_path;
++    // Tensor-parallel single-stream decode across tp_world GPUs (pascal-llm, --tp N).
++    int tp_world = 1;
++    int tp_rank = -1;   // set internally per rank by the TP backend
+ };
+ 
+ struct BackendStats {
+@@ -133,6 +136,7 @@ std::unique_ptr<InkBackend> make_cpu_backend();
+ 
+ #ifdef INKLING_ENABLE_CUDA
+ std::unique_ptr<InkBackend> make_cuda_backend();
++std::unique_ptr<InkBackend> make_cuda_tp_backend();
+ #endif
+ #ifdef INKLING_ENABLE_EP_CUDA
+ std::unique_ptr<InkBackend> make_ep_cuda_backend();
+@@ -153,6 +157,7 @@ inline std::unique_ptr<InkBackend> make_default_backend(bool force_cpu = false,
+ #ifdef INKLING_ENABLE_CUDA
+         // Primary InkCudaBackend natively supports .strata, .gguf, safetensors, FP16/FP8/K8V8/K8V4 KV,
+         // hybrid offload + GPU+SSD streaming, Dual-GPU EP, AND multi-GPU --layer-split!
++        if (opts && opts->tp_world > 1) return make_cuda_tp_backend();
+         return make_cuda_backend();
+ #elif defined(INKLING_ENABLE_EP_CUDA)
+         return make_ep_cuda_backend();
+diff --git a/engine/src/inkling2/ink_main.cpp b/engine/src/inkling2/ink_main.cpp
+index e9ab31b8..570d3441 100644
+--- a/engine/src/inkling2/ink_main.cpp
++++ b/engine/src/inkling2/ink_main.cpp
+@@ -192,7 +192,10 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+ 
+     double t_dec0 = now_s();
+     int total_gen = 0;
++    int spec_steps = 0;
+     if (use_dspark && P == 1) {
++        const bool print_spec = std::getenv("STRATA_BENCH_TOKENS") != nullptr;
++        if (print_spec) std::fprintf(stderr, "[bench] tokens=%d", next_tok[0]);
+         int cur_pos = prompt_len;
+         while (total_gen < gen_len && cur_pos < eff_ctx) {
+             const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
+@@ -203,6 +206,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+                     0, next_tok[0], cur_pos, rem, emitted, &drafted, err);
+                 if (n_emit < 0) { fprintf(stderr, "bench spec err: %s\n", err.c_str()); return 1; }
+                 if (n_emit > 0) {
++                    ++spec_steps;
++                    if (print_spec) for (int i = 0; i < n_emit && total_gen + i + 1 < gen_len; ++i) std::fprintf(stderr, ",%d", emitted[i]);
+                     next_tok[0] = emitted[n_emit - 1];
+                     cur_pos += n_emit;
+                     total_gen += n_emit;
+@@ -219,10 +224,14 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+             int32_t best = 0;
+             for (int i = 1; i < V; ++i) if (logits[i] > logits[best]) best = i;
+             next_tok[0] = best;
++            if (print_spec && total_gen + 1 < gen_len) std::fprintf(stderr, ",%d", best);
+             ++total_gen;
+         }
++        if (spec_steps > 0) std::fprintf(stderr, "\n[bench] spec steps=%d tokens/step=%.2f\n", spec_steps, (double)total_gen / spec_steps);
+     } else {
++        const bool print_tokens = std::getenv("STRATA_BENCH_TOKENS") != nullptr;
+         for (int step = 0; step < gen_len; ++step) {
++            if (print_tokens && P == 1) std::fprintf(stderr, "%s%d", step ? "," : "[bench] tokens=", next_tok[0]);
+             batch.clear();
+             batch.capture_taps = use_dspark;
+             for (int s = 0; s < P; ++s) batch.push(s, prompt_len + step, next_tok[s], true);
+@@ -240,6 +249,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
+         }
+     }
+     double dec_s = now_s() - t_dec0;
++    if (std::getenv("STRATA_BENCH_TOKENS") != nullptr) std::fprintf(stderr, "\n");
+     double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
+     double tps_agg = total_gen / std::max(dec_s, 1e-9);
+     printf("[bench] backend=%s format=%s parallel=%d gpus=%d kv=%s prompt=%d gen=%d | prefill=%.1f ppts (%.2fs) | decode=%.1f tps agg (%.1f tps/slot, %.2fs)\n",
+@@ -282,10 +292,22 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
+ 
+     std::vector<float> got_lg(static_cast<size_t>(n_tok) * V);
+     StepBatch batch;
+-    for (int i = 0; i < n_tok; ++i) batch.push(0, i, ids[i], true);
+-    if (!backend->forward_batch(batch, got_lg.data(), nullptr, err)) {
+-        fprintf(stderr, "forward: %s\n", err.c_str());
+-        return 1;
++    if (std::getenv("STRATA_KLD_STEPWISE") != nullptr) {
++        // Teacher-forced M=1 decode steps (pascal-llm): exercises the single-token decode kernels.
++        for (int i = 0; i < n_tok; ++i) {
++            batch.clear();
++            batch.push(0, i, ids[i], true);
++            if (!backend->forward_batch(batch, got_lg.data() + static_cast<size_t>(i) * V, nullptr, err)) {
++                fprintf(stderr, "forward step %d: %s\n", i, err.c_str());
++                return 1;
++            }
++        }
++    } else {
++        for (int i = 0; i < n_tok; ++i) batch.push(0, i, ids[i], true);
++        if (!backend->forward_batch(batch, got_lg.data(), nullptr, err)) {
++            fprintf(stderr, "forward: %s\n", err.c_str());
++            return 1;
++        }
+     }
+ 
+     double kld_sum = 0.0, nll_sum = 0.0;
+@@ -462,6 +484,8 @@ int main(int argc, char** argv) {
+                 cfg.bopts.gpu_ids.clear();
+                 cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
+             }
++        } else if (a == "--tp") {
++            cfg.bopts.tp_world = std::max(1, std::atoi(next().c_str()));
+         } else if (a == "--ep-split") {
+             cfg.bopts.ep_split = std::atof(next().c_str());
+         } else if (a == "--layer-split") {

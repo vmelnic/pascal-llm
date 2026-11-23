@@ -6,24 +6,29 @@ Copy the public deployment template before using the operational scripts:
 cp .env.example .env
 ```
 
-Set `PASCAL_REMOTE_HOST`, `PASCAL_REMOTE_ROOT`, `PASCAL_SERVER_URL` and the two
-image-service URLs in the ignored `.env`; never commit that file. No host
+Set `PASCAL_REMOTE_HOST`, `PASCAL_REMOTE_ROOT`, `PASCAL_SERVER_URL`,
+`PASCAL_STRATA_SERVER_URL` and the two image-service URLs in the ignored
+`.env`; never commit that file. No host
 identity or installation path is compiled into the scripts.
 
 Local multi-user LLM serving on three Tesla P100 GPUs, with isolated one-P40
 placement available per model profile. Qwen, Ornith, Swift GSQ and Swift
 Heretic have real Pi tool-flow evidence; North Mini Code, GPT-OSS and Granite
 H-Small have 64K direct-chat and minimal-Pi transport evidence on both
-placements. The production path is
-pinned `llama.cpp` v0.4.0 plus a pinned, zero-fuzz SM60 patch set; this
-repository owns its reproducible build, artifact-driven profiles, deployment,
-Pi integration and evidence ledger, not another inference engine.
+placements. The repository operates two text runtimes with separately checked GPU
+placements and TCP ports: pinned `llama.cpp` v0.4.0 with a pinned, zero-fuzz SM60
+patch set, and pinned Strata `0.2.20` (commit `a34979fc`, built for SM60 from
+source) for full-expert Swift 1.5 IQ3_S and Inkling 2 Mini SQ-20. It owns
+their reproducible builds, artifact-driven deployment, Pi integration and
+evidence ledger.
 
 ## Verified status
 
 Measured through the real Pi harness with project instructions and a tool
 round trip. The Qwen ordinary-context row was refreshed on 2026-09-17 after
-deploying the SM60 patch set; older rows retain their recorded runtime:
+deploying the SM60 patch set; older rows retain their recorded runtime.
+The Gemma P40 row is the separately requested single Pi `hi` transport check,
+with normal project instructions and skill discovery, and no tool round trip:
 
 | Model | Artifact | Compute | Context/KV | Prompt | Decode | Result |
 |---|---|---|---|---:|---:|---|
@@ -34,20 +39,27 @@ deploying the SM60 patch set; older rows retain their recorded runtime:
 | Ornith-1.5-35B-A3B | official Q4_K_M, 20.22 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | 592-612 tok/s in Pi | 38.5-40.2 tok/s | direct chat and Pi tool flow passed |
 | Swift 1.5 Qwen3.8 GSQ-RCO | IQ2_S with embedded MTP, 8.95 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 46.37 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | Swift 1.5 Qwen3.8 Heretic | i1 Q4_K_M with embedded MTP, 15.66 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 40.55 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
+| Swift 1.5 Flash-Next via Strata 0.1.46.3 | full-expert IQ3_S, 77.99 GiB source | 3 x P100 layer split | 262,144 maximum, F16 K/V, 32K GPU-resident window | 56.5 tok/s short prompt | 39.3-42.9 tok/s | OpenAI, real Pi and two concurrent Pi transports passed; populated 262K unqualified |
+| Swift 1.5 Flash-Next via Strata 0.2.20 (active) | same prepared IQ3_S pack | 3 x P100 layer split, MTP | same | 246.5 tok/s, 5,666-token Pi `hi` | 38.1 tok/s, 164 tokens | one real Pi `hi` passed in 27.9 s; MTP accepted 91/165 |
+| Inkling 2 Mini via Strata 0.2.20 + pascal-llm TP3 (active) | SQ-20 native SF4+MX8, 19.35 GB | 3 x P100 tensor parallel (`--tp 3`, patches/strata-next) | 262,144 allocated, F16 K/V, global KV split 3/3/2 | ~440 tok/s, 7,001-token Pi `hi` | 58.9 tok/s, 75 tokens | real Pi `hi` through the `pascal-strata` service on 8081 passed in 18.2 s; KLD 0.0013 vs unmodified engine (its own noise 0.0012) |
+| Inkling 2 Mini via unmodified Strata 0.2.20 | same | 3 x P100 layer split; DSpark disabled by the engine in layer split | same | ~229 tok/s | 38.6 tok/s | superseded |
+| Gemma 4 26B A4B | official QAT Q4_0, 13.45 GiB | 1 x P40, native SM61 build | 262,144 configured, F16 K/V | 756.13 tok/s, 5,358 tokens | 55.09 tok/s, 105 tokens | one real Pi `hi` passed in 10.67 s; tools and populated maximum unqualified |
 | North Mini Code 1.0 | Q4_K_M, 17.46 GiB | 3 x P100 tensor / 1 x P40 | 65,536 shared, F16 K/V | 200.63 / 47.67 tok/s | 45.11 / 30.42 tok/s | direct and minimal Pi transport passed |
 | GPT-OSS-20B | native MXFP4, 11.28 GiB | 3 x P100 tensor / 1 x P40 | 65,536 shared, F16 K/V | 165.07 / 96.08 tok/s | 70.71 / 47.94 tok/s | direct and minimal Pi transport passed |
 | Granite 4.0 H-Small | Q4_K_M, 18.14 GiB | 3 x P100 layer / 1 x P40 | 65,536 shared, F16 K/V | 42.09 / 25.20 tok/s | 28.55 / 16.05 tok/s | direct and minimal Pi transport passed |
 
-The 262,144 capacity is now proven by an actually populated 262,016-token
-prompt plus 128 generated tokens. Its cold prefill took about 68 minutes
-26 seconds and decode fell to 6.18 tok/s, so maximum-context performance does
-not meet the target. Four slots share one 262K KV pool dynamically; four
-simultaneous 262K conversations do not fit. The weight artifact is quantized;
-only the runtime KV contract is exact IEEE F16.
+For the `llama.cpp` Qwen profile, 262,144 capacity is proven by an actually
+populated 262,016-token prompt plus 128 generated tokens. Its cold prefill took
+about 68 minutes 26 seconds and decode fell to 6.18 tok/s, so maximum-context
+performance does not meet the target. Four slots share one 262K KV pool
+dynamically; four simultaneous 262K conversations do not fit. Strata is
+configured and allocation-tested at 262,144 with two slots, but has not run an
+actually populated 262K prompt. The weight artifacts are quantized; only each
+runtime's KV contract is exact IEEE F16.
 
 The P40 is intentionally excluded from the text-model collective. It has no
 CUDA P2P path to the P100 domain and made the measured hot path slower when
-host-staged. It now owns the independent image service instead. Qwen uses
+host-staged. It can host Gemma independently, or the image service when Gemma is stopped. Qwen uses
 about 12.5-12.7 GiB per P100 with its MTP context; Ornith uses 8.7-9.2 GiB per
 P100 without MTP.
 
@@ -60,28 +72,110 @@ disk cache and does not survive a model-service restart.
 
 ## Operation
 
-The service is manual, not enabled at boot:
+### llama.cpp profiles (port 8080)
+
+The service is manual, not enabled at boot. All repository model profiles are
+listed below; `download <profile>` fetches that profile's declared artifact,
+and `start <profile>` selects and starts it:
 
 ```bash
 ./ops/model.sh profiles
+./ops/model.sh download gemma4
+./ops/model.sh download qwen
 ./ops/model.sh download qwen-abliterated
+./ops/model.sh download swift-gsq
+./ops/model.sh download swift-heretic
+./ops/model.sh download ornith
+./ops/model.sh download nemotron
+./ops/model.sh download north
+./ops/model.sh download gpt
+./ops/model.sh download granite
+./ops/model.sh start gemma4
 ./ops/model.sh start qwen
 ./ops/model.sh start qwen-abliterated
 ./ops/model.sh start swift-gsq
 ./ops/model.sh start swift-heretic
-./ops/model.sh restart ornith
+./ops/model.sh start ornith
 ./ops/model.sh start nemotron
 ./ops/model.sh start north
 ./ops/model.sh start gpt
 ./ops/model.sh start granite
+./ops/model.sh restart ornith
 ./ops/model.sh status
 ./ops/model.sh logs
 ./ops/model.sh stop
 ```
 
-Only one profile is resident at a time. `start <profile>` and
+Only one llama.cpp profile is resident at a time; a disjoint Strata service
+may run alongside it. The start commands above are alternatives, not a batch
+that loads every model together. `start <profile>` and
 `restart <profile>` select the artifact transactionally; subsequent `start`
 without a profile reuses that selection.
+
+### Strata model (port 8081)
+
+Strata uses a separate lifecycle wrapper and its own port, `8081`. It can run
+alongside Gemma on P40 at the unchanged port `8080`. Other llama.cpp profiles
+that select P100s must be stopped before Strata starts.
+
+The service runs Strata `0.2.20` from `work/strata-next`, installed by
+`ops/install-strata-next.sh`. It reuses the Swift runtime pack prepared by
+the pinned `0.1.46.3` setup; `work/strata` and `ops/install-strata.sh` remain
+only as the rollback runtime and as the Swift preparation path used by
+`./ops/strata.sh download`.
+
+| Model | OpenAI model ID | Physical GPUs | Pi provider | Launch |
+|---|---|---|---|---|
+| Swift 1.5 Flash-Next, full-expert IQ3_S | `swift-flash-next-iq3-s` | P100 `0,1,2` | `pascal-strata` | `pascal-strata` service, port 8081 |
+| Inkling 2 Mini SQ-20 (TP3, active) | `inkling-2-mini-sq20` | P100 `0,1,2` | `pascal-strata` | `pascal-strata` service, port 8081 |
+
+Both models share the one `pascal-strata` service, its P100s and port 8081;
+exactly one is loaded. `./ops/strata.sh start inkling` or `start swift` selects
+it (stored on X99E in `~/.config/pascal-llm/active-strata-model`; default
+`swift`); `start`/`restart` without a name keep the current selection, and
+`./ops/strata.sh pi` opens Pi on the active model. `pi-config` registers both
+models under the `pascal-strata` provider.
+
+Inkling runs with the pascal-llm tensor-parallel decode
+(`patches/strata-next/01-inkling-tp-decode.patch`, `--tp 3`), 262,144 context and
+F16 K/V; `ops/run-strata-server.sh` writes its run configuration. Its SQ-20 pack
+is downloaded with
+`PASCAL_MODEL_PROFILE_DIR=config/strata ./ops/download-model.sh inkling-mini-sq20`
+on X99E. See `docs/inkling-tp3-plan.md` and `docs/feasibility.md` for the
+measurements and why it does not reach 100 tok/s on this host.
+
+The complete command list is:
+
+```bash
+./ops/strata.sh download
+./ops/strata.sh start
+./ops/strata.sh restart
+./ops/strata.sh status
+./ops/strata.sh logs
+./ops/strata.sh models
+./ops/strata.sh pi-config
+./ops/strata.sh pi
+./ops/strata.sh stop
+```
+
+`download` runs setup for the configured Swift IQ3_S model: it downloads and
+checks the source shards, prepares the runtime packs and builds the engine.
+The prepared runtime model already exists on X99E. Commands take no
+model-profile argument:
+`./ops/strata.sh start` always starts `swift-flash-next-iq3-s`.
+`models` queries the running server's `/v1/models` endpoint; it does not list
+an upstream download catalog. The llama.cpp profiles above are managed only
+by `model.sh` and are not selectable through `strata.sh`.
+
+`start` and `restart` synchronize the repository, install the user service and
+wait for OpenAI health at `${PASCAL_STRATA_SERVER_URL}` (port `8081`).
+`pi-config` registers the separate `pascal-strata` provider and selects Swift
+as Pi's default while preserving the `pascal-llm` endpoint on port `8080`.
+`pi` launches the normal project-aware Pi session using that Strata provider;
+additional Pi arguments may follow `pi`. The service is manual and remains
+disabled at boot.
+
+### Web and image services
 
 The optional web interface starts automatically with Docker after it has been
 installed once:
@@ -109,8 +203,10 @@ environment:
 ./ops/comfyui.sh stop
 ```
 
-`pascal-comfyui.service` and `pascal-image.service` cannot run together because
-both own CUDA device 3. Qwen may remain active on CUDA devices 0-2.
+`pascal-comfyui.service`, `pascal-image.service` and the Gemma profile all use
+CUDA device 3 and cannot run together. The image API also shares port 8081
+with Strata. Launch checks reject overlapping GPU selections or TCP ports.
+Qwen may remain active on CUDA devices 0-2 when Strata is stopped.
 
 RealVisXL V5.0, Juggernaut XL v9 and Animagine XL 4.0 use the pinned upstream
 `stable-diffusion.cpp` server and its OpenAI-compatible Images API on the
@@ -137,7 +233,8 @@ curl http://10.10.88.7:8081/v1/images/generations \
 ```
 
 Only one image profile is resident per image-service process. Image profiles
-use physical CUDA device `3`; text profiles use `0,1,2`. The launchers permit
+use physical CUDA device `3`; Gemma also uses `3`, while the other default text
+profiles use `0,1,2`. The launchers permit
 both services to run together only when their profile-declared CUDA sets are
 disjoint and fail closed on missing, malformed or overlapping declarations.
 RealVisXL is the default photorealistic checkpoint in Open WebUI. Juggernaut
@@ -166,6 +263,7 @@ From this repository or any real project, use Pi with its normal `AGENTS.md`,
 skills, tools and sessions intact:
 
 ```bash
+./ops/pi.sh gemma4
 ./ops/pi.sh qwen
 ./ops/pi.sh qwen-abliterated
 ./ops/pi.sh swift-gsq
@@ -175,12 +273,15 @@ skills, tools and sessions intact:
 ./ops/pi.sh north
 ./ops/pi.sh gpt
 ./ops/pi.sh granite
+./ops/strata.sh pi
 ```
 
 Each `config/models/<profile>.env` owns its context and placement. North,
 GPT-OSS and Granite default to 64K on the three P100s; Qwen, Ornith, Nemotron
-and both Swift profiles declare a 262K shared context pool. The 64K defaults
-are:
+Gemma 4 and both Swift profiles declare a 262K shared context pool. Gemma 4 is
+prepared with Google's official QAT Q4_0 text artifact and uses a separate
+SM61 build on P40. Initialization and one real Pi `hi` passed; tool use,
+concurrent requests and populated maximum context remain unqualified. The 64K defaults are:
 
 ```text
 PASCAL_CUDA_DEVICES=0,1,2
@@ -201,6 +302,27 @@ PASCAL_SPLIT_MODE=none
 PASCAL_CUDA_P2P=0
 ```
 
+The concurrent deployment uses these independent OpenAI-compatible endpoints:
+
+| Runtime/model | Physical GPUs | Base URL |
+|---|---|---|
+| llama.cpp / Gemma 4 | P40 `3` | `${PASCAL_SERVER_URL}/v1` (port `8080`, unchanged) |
+| Strata / Swift Flash-Next IQ3_S | P100 `0,1,2` | `${PASCAL_STRATA_SERVER_URL}/v1` (port `8081`) |
+
+Pi keeps `pascal-llm` pointed at Gemma and registers Swift under the separate
+`pascal-strata` provider with `./ops/strata.sh pi-config`. Both wrappers retain
+normal project instruction and skill discovery.
+
+Gemma selects the separate `work/llama.cpp/build-sm61` runtime for P40.
+The original P100 runtime remains in `work/llama.cpp/build`; other profiles
+keep that default. On X99E, `./ops/build-llama-p40.sh` builds SM61 from the
+already pinned and patched source without resetting the source or overwriting
+the SM60 build. It uses all CPU threads by default; stop Strata first to free
+its host RAM, or set `PASCAL_BUILD_JOBS` to limit compiler parallelism. It records the P100 artifact hashes
+before and after compilation. To move Gemma back to P100s, change both its
+placement and its `PASCAL_LLAMA_BUILD_DIR` selection to the original build,
+and stop Strata before starting it on the same P100 domain.
+
 OpenAI-compatible clients use:
 
 ```text
@@ -210,6 +332,8 @@ Qwen model     qwen3.8-27b-ud-q4-k-m
 Qwen abliterated model qwen3.8-27b-abliterated-ud-q4-k-xl
 Swift GSQ model swift-1.5-qwen3.8-27b-gsq-rco-iq2-s-mtp
 Swift Heretic model swift-1.5-qwen3.8-27b-heretic-i1-q4-k-m
+Strata Swift model swift-flash-next-iq3-s
+Gemma 4 model  gemma-4-26b-a4b-it-qat-q4-0 (Pi hi passed; tools unqualified)
 Ornith model   ornith-1.5-35b-a3b-q4-k-m
 Nemotron model nvidia-nemotron-3.5-lightning-30b-a3b-q4-0 (prepared, unqualified)
 North model     north-mini-code-1.0-q4-k-m
@@ -221,13 +345,16 @@ Open WebUI discovers the currently resident model from the OpenAI-compatible
 endpoint; no UI configuration is tied to Qwen. See
 [web interface](docs/web-ui.md).
 
-The host uses `llama.cpp` v0.4.0 and the P100 patch set pinned by
+The profile runtime uses `llama.cpp` v0.4.0 and the P100 patch set pinned by
 `ops/install-llama.sh`, CUDA SM60, NCCL 2.27.7, tensor split `1,1,1`,
 FlashAttention, continuous batching and a shared F16 KV pool. Decode graph
 slots are disabled because their tensor-split embedded-MTP path failed the
 real Pi gate; two optional graph fusions with reported non-deterministic MoE
-output are also disabled. The stable `quantum-llm` repository remains
-separate.
+output are also disabled. The alternative Strata runtime is pinned by
+`ops/install-strata-next.sh` (v0.2.20); it uses layer split on CUDA devices 0/1/2, exact FP16
+KV, host KV streaming, two request slots and a 262,144-token maximum context.
+P40 device 3 is excluded from both text collectives. The stable `quantum-llm`
+repository remains separate.
 
 See [hardware](docs/hardware.md), [feasibility](docs/feasibility.md),
 [Qwen contract](docs/qwen3.8-contract.md),

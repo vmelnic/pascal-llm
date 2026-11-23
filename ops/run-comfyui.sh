@@ -67,6 +67,8 @@ esac
 }
 
 checkpoint_dir="${data_root}/models/checkpoints/pascal-llm"
+python3 "${script_dir}/check-service-placement.py" \
+  --service pascal-comfyui --devices "${PASCAL_COMFYUI_CUDA_DEVICES}" --port "${PASCAL_COMFYUI_PORT}"
 mkdir -p \
   "${checkpoint_dir}" \
   "${data_root}/input" \

@@ -1,3 +1,13 @@
+## Concurrent text deployment (2026-11-18)
+
+Gemma now owns the P40 and keeps the existing OpenAI endpoint on port 8080.
+Strata Swift runs separately on P100 devices 0,1,2 at port 8081. Open WebUI's
+existing text connection remains pointed at port 8080. The image-service
+configuration below also uses port 8081 and P40, and therefore cannot run
+alongside this two-model placement. Launchers reject both GPU and port
+collisions. Stop the conflicting text services before returning to image
+serving; no image endpoint has been silently moved.
+
 # Web interface
 
 Status: Open WebUI is deployed through Docker Compose and is connected to a

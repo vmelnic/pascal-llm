@@ -2,7 +2,6 @@
 Description=Pascal Strata multi-user inference service
 After=network-online.target
 Wants=network-online.target
-Conflicts=pascal-llm.service
 
 [Service]
 Type=simple

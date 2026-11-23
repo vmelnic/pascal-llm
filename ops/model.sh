@@ -161,6 +161,11 @@ require_comfyui_service_compatible() {
   fi
 }
 
+require_service_placement() {
+  ssh "${remote_host}" \
+    "PASCAL_MODEL_PROFILE='$1' '${remote_root}/ops/run-server.sh' --check-placement"
+}
+
 command_name="${1:-status}"
 case "${command_name}" in
   sync)
@@ -176,6 +181,7 @@ case "${command_name}" in
     validate_profile "${target_profile}"
     require_image_service_compatible "${target_profile}"
     require_comfyui_service_compatible "${target_profile}"
+    require_service_placement "${target_profile}"
     if [[ -n "${2:-}" ]]; then
       select_profile "$2"
       ssh "${remote_host}" "systemctl --user restart '${service_name}'"
@@ -204,6 +210,7 @@ case "${command_name}" in
     validate_profile "${target_profile}"
     require_image_service_compatible "${target_profile}"
     require_comfyui_service_compatible "${target_profile}"
+    require_service_placement "${target_profile}"
     if [[ -n "${2:-}" ]]; then
       select_profile "$2"
     else

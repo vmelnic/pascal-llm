@@ -72,7 +72,7 @@ Secrets and the WireGuard profile are intentionally outside this repository.
 The original Qwen profile exposes only CUDA devices 0-2. When selected, its
 three P100s form the tensor-parallel compute domain and each holds approximately
 11 GiB after initialization. That profile is currently inactive while the
-mutually exclusive Strata service below owns the same P100 domain.
+Strata service below owns the same P100 domain; Gemma can instead run on the isolated P40.
 
 Placement is declared directly by each model profile. North Mini Code,
 GPT-OSS-20B and Granite H-Small were also initialized at a configured 65,536
@@ -92,6 +92,38 @@ ComfyUI and the OpenAI-compatible `stable-diffusion.cpp` service are mutually
 exclusive; neither may claim device 3 while the other is active.
 
 ## Strata deployment
+
+### Active runtime: Strata 0.2.20 (2026-11-23)
+
+`ops/install-strata-next.sh` checks out release `v0.2.20` (commit
+`a34979fc94f3d126b9bb8210f4ad311345688b52`) into `work/strata-next` and builds
+`strata` (engine 0.1.66) and `strata-inkling` (0.1.66) with CUDA 12.4.131,
+GCC 13, `STRATA_EXPERIMENTAL_SM60=ON` and only SM60 images. CUDA 12.4's front
+end rejects GCC 13's AMX intrinsic headers included through one `.cu` file;
+the script pre-defines only those header guards for CUDA compilation. Binary
+SHA-256: `strata`
+`094a3e314c17a757211cad674d3fa892a18bfa3b77b5fafe769069fe4ea9827a`,
+`strata-inkling`
+`1ab016a5074ea2a2b150748ab10eb033ce4888c3cdb41d2e773347e5f56d3f37`.
+The front end moved to `terminal/serve/server.py` with its venv in
+`terminal/.venv`, created through `work/bin/uv` because the host has no
+`python3-venv`.
+
+`pascal-strata.service` now runs Swift from
+`work/strata-next/strata-swift-iq3_s.json`. It is the previous run
+configuration with only `exe`, `cwd` and `log` changed; it reuses the
+unchanged prepared pack, MTP runtime and expert profile under
+`work/strata-data` and `work/strata/data`. After start the P100s held
+15,441/14,931/14,931 MiB. The 0.1.46.3 description below remains the rollback
+runtime and the Swift preparation path.
+
+Inkling 2 Mini SQ-20 is the other model of the same `pascal-strata` service
+(port 8081, `./ops/strata.sh start inkling`). It runs `strata-inkling` with the
+pascal-llm tensor-parallel decode (`--tp 3`): every P100 holds the 3.67 GB
+trunk, a 1/3 feature shard of all 3,072 experts and 3 or 2 of the 8 global-visit
+KV caches. At 262,144 context the P100s held 12,927/11,903/12,927 MiB after start.
+
+### Rollback runtime: Strata 0.1.46.3
 
 The pinned Strata `0.1.46.3` source at commit
 `9de04cd44e927a9a3df6bbc0e94fc1be8b844ba4` is cloned under
@@ -113,8 +145,11 @@ devices 0/1/2, resident experts, exact FP16 KV, a 262,144-token maximum context
 and two request slots. KV outside a 32,768-cell-per-QSA-layer GPU window is
 kept in pinned host RAM; no device boundary is described as unified memory.
 The configuration reserves 1,115 MiB for late CUDA graph capture instead of
-giving that space to expert caches. `pascal-llm.service` is inactive and
-conflicts with it. After graph capture and concurrent real Pi requests, a
+giving that space to expert caches. `pascal-llm.service`
+was inactive in that historical measurement. As of 2026-11-18, Gemma instead
+runs concurrently on P40 device 3 at the unchanged port 8080, and Strata uses
+port 8081. Device/port admission checks replace the blanket service conflict.
+After graph capture and concurrent real Pi requests in the original deployment, a
 snapshot reported 16,003 MiB, 15,405 MiB and 15,629 MiB allocated on P100
 devices 0, 1 and 2; P40 device 3 remained at 0 MiB. The service cgroup used
 58,680,033,280 B and the host reported 2,402,856,960 B available RAM. No
@@ -122,11 +157,21 @@ driver, CUDA toolkit or system package was installed, removed or changed.
 
 Operate this deployment only through `ops/strata.sh`: `start`, `stop`,
 `restart`, `status`, `logs` and `models` manage or inspect the remote service;
-`pi-config` registers `swift-flash-next-iq3-s` under the existing `pascal-llm`
-provider as its first model in `~/.pi/agent/models.json`, places
-`pascal-llm/swift-flash-next-iq3-s:xhigh` first in the `enabledModels` list in
+`pi-config` registers `swift-flash-next-iq3-s` under a separate `pascal-strata`
+provider at port 8081 in `~/.pi/agent/models.json`, preserving `pascal-llm`
+at port 8080. It places
+`pascal-strata/swift-flash-next-iq3-s:xhigh` first in the `enabledModels` list in
 `~/.pi/agent/settings.json`, declares `contextWindow: 262144`, and selects it as
 Pi's default model. The separate maximum response allowance remains 32,768
 tokens. The configurator creates one-time `*.before-strata` backups. `pi`
 launches the normal repository-aware Pi harness against Strata. The service is
 deliberately not enabled at boot.
+
+## Separate Gemma P40 runtime (2026-11-18)
+
+Gemma selects `work/llama.cpp/build-sm61`, built from the same pinned patched
+source with GCC 13.4.0 and CUDA 12.4.131. Its CUDA library contains SM61 images;
+`work/llama.cpp/build` remains the unchanged P100 SM60 build. The profile's
+`PASCAL_LLAMA_BUILD_DIR` selects the separate runtime. Port 8080, the model ID,
+exact F16 KV and the 262144 configured context remain unchanged. The requested
+single real Pi `hi` passed; see the benchmark and feasibility records.

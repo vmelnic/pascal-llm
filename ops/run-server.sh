@@ -67,6 +67,12 @@ for variable_name in "${required_variables[@]}"; do
   }
 done
 
+python3 "${script_dir}/check-service-placement.py" \
+  --service pascal-llm --devices "${PASCAL_CUDA_DEVICES}" --port "${PASCAL_PORT}"
+if [[ "${1:-}" == "--check-placement" ]]; then
+  exit 0
+fi
+
 [[ "${PASCAL_DECODE_GRAPH_SLOTS}" =~ ^[0-9]+$ ]] || {
   echo "PASCAL_DECODE_GRAPH_SLOTS must be a non-negative integer" >&2
   exit 2
@@ -90,7 +96,8 @@ case "${PASCAL_CUDA_P2P}" in
     ;;
 esac
 
-server_binary="${PASCAL_LLAMA_ROOT}/build/bin/llama-server"
+llama_build_dir="${PASCAL_LLAMA_BUILD_DIR:-${PASCAL_LLAMA_ROOT}/build}"
+server_binary="${llama_build_dir}/bin/llama-server"
 [[ -x "${server_binary}" ]] || {
   echo "llama-server is missing: ${server_binary}" >&2
   exit 2
@@ -108,6 +115,22 @@ if [[ -n "${PASCAL_MMPROJ_PATH:-}" ]]; then
     exit 2
   }
   model_arguments+=(--mmproj "${PASCAL_MMPROJ_PATH}")
+fi
+
+# Optional logical/physical batch bounds. Architectures whose compute buffer
+# scales with n_kv * n_ubatch (for example per-head relative-bias masks) need a
+# smaller physical batch to admit a long populated context on 16 GiB devices.
+for variable_name in PASCAL_BATCH_SIZE PASCAL_UBATCH_SIZE; do
+  [[ -z "${!variable_name:-}" || "${!variable_name}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "${variable_name} must be a positive integer when set" >&2
+    exit 2
+  }
+done
+if [[ -n "${PASCAL_BATCH_SIZE:-}" ]]; then
+  model_arguments+=(--batch-size "${PASCAL_BATCH_SIZE}")
+fi
+if [[ -n "${PASCAL_UBATCH_SIZE:-}" ]]; then
+  model_arguments+=(--ubatch-size "${PASCAL_UBATCH_SIZE}")
 fi
 
 case "${PASCAL_SPEC_TYPE:-none}" in

@@ -22,6 +22,7 @@ source "${config_file}"
 set +a
 
 PASCAL_MODEL_ROOT="${PASCAL_MODEL_ROOT:-${repo_root}/work/models}"
+PASCAL_LLAMA_ROOT="${PASCAL_LLAMA_ROOT:-${repo_root}/work/llama.cpp}"
 profile_dir="${PASCAL_MODEL_PROFILE_DIR:-${repo_root}/config/models}"
 profile_file="${profile_dir}/${profile_name}.env"
 [[ -r "${profile_file}" ]] || {
@@ -68,6 +69,25 @@ hf_binary="${PASCAL_HF_BINARY:-${HOME}/.local/bin/hf}"
   exit 2
 }
 
+# Optional repository path when the published name differs from the local
+# artifact name, for example a subfolder or an intentionally renamed extension.
+source_file="${PASCAL_MODEL_HF_SOURCE_FILE:-${PASCAL_MODEL_HF_FILE}}"
+[[ "${source_file}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "${source_file}" != *..* ]] || {
+  echo "PASCAL_MODEL_HF_SOURCE_FILE must be a safe relative repository path" >&2
+  exit 2
+}
+
+# Optional small companion files (tokenizer, config) published beside the
+# artifact. Only the main artifact carries the pinned size and SHA-256; the
+# companions are pinned by the repository revision.
+read -r -a extra_files <<< "${PASCAL_MODEL_HF_EXTRA_FILES:-}"
+for extra_file in "${extra_files[@]}"; do
+  [[ "${extra_file}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && "${extra_file}" != *..* ]] || {
+    echo "PASCAL_MODEL_HF_EXTRA_FILES entries must be safe relative repository paths" >&2
+    exit 2
+  }
+done
+
 target_dir="$(dirname "${PASCAL_MODEL_PATH}")"
 candidate_dir="${target_dir}.partial"
 candidate_file="${candidate_dir}/${PASCAL_MODEL_HF_FILE}"
@@ -88,12 +108,20 @@ fi
 mkdir -p "${candidate_dir}"
 HF_XET_HIGH_PERFORMANCE=1 "${hf_binary}" download \
   "${PASCAL_MODEL_HF_REPO}" \
-  "${PASCAL_MODEL_HF_FILE}" \
+  "${source_file}" \
+  "${extra_files[@]}" \
   README.md \
   --revision "${PASCAL_MODEL_HF_REVISION}" \
   --local-dir "${candidate_dir}" \
   --max-workers 4
 
+if [[ "${source_file}" != "${PASCAL_MODEL_HF_FILE}" ]]; then
+  [[ -f "${candidate_dir}/${source_file}" ]] || {
+    echo "download did not produce ${candidate_dir}/${source_file}" >&2
+    exit 1
+  }
+  mv "${candidate_dir}/${source_file}" "${candidate_file}"
+fi
 [[ -f "${candidate_file}" ]] || {
   echo "download did not produce ${candidate_file}" >&2
   exit 1
@@ -109,9 +137,10 @@ actual_sha256="$(sha256sum "${candidate_file}" | awk '{ print $1 }')"
   exit 1
 }
 
-printf 'repo=%s\nrevision=%s\nfile=%s\nsize=%s\nsha256=%s\n' \
+printf 'repo=%s\nrevision=%s\nsource=%s\nfile=%s\nsize=%s\nsha256=%s\n' \
   "${PASCAL_MODEL_HF_REPO}" \
   "${PASCAL_MODEL_HF_REVISION}" \
+  "${source_file}" \
   "${PASCAL_MODEL_HF_FILE}" \
   "${PASCAL_MODEL_FILE_SIZE}" \
   "${PASCAL_MODEL_FILE_SHA256}" \

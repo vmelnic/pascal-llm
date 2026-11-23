@@ -1,6 +1,6 @@
 # Decision ledger
 
-Status: 2026-10-21.
+Status: 2026-11-23.
 
 ## Accepted
 
@@ -81,6 +81,14 @@ Status: 2026-10-21.
   gathers the reduced head from one complete host-staged read because partial
   row reads are invalid on the distributed meta buffer.
 
+- Serve Swift 1.5 IQ3_S through Strata 0.2.20 (2026-11-23). It reuses the
+  prepared 0.1.46.3 pack unchanged and passed one real Pi `hi` at 38.1 tok/s;
+  0.1.46.3 stays as rollback.
+- Run Inkling 2 Mini only through Strata's `strata-inkling` with the SQ-20
+  pack. SQ-20 is upstream's native SF4+MX8 encoding of the official weights
+  (reported KLD 0.00000); SQ-15/SQ-10 are fidelity changes needing explicit
+  approval.
+
 ## Not transferable as positive evidence
 
 Earlier P100 experiments used an RTX 3090 primary plus two P100 auxiliaries and
@@ -147,6 +155,17 @@ They may be reopened only through the explicit complete-latency gate in
 - DreamShaper XL Lightning. Its measured four-step path was fast, but the
   inspected image had material color and edge artifacts. The profile and its
   checkpoint were removed rather than presenting a failed quality result.
+
+- Inkling 2 Mini on llama.cpp (2026-11-23). Upstream `inkling2_loop` has no
+  tensor split; layer split assigns the 24 virtual loop slots and their KV by
+  slot index, producing 448 graph splits per token. Measured 15 tok/s decode
+  and 61 tok/s prefill on 3 x P100. The shared llama.cpp tree was not changed.
+  The `inkling-mini` llama.cpp profile was removed; Inkling is served only by
+  Strata (`./ops/strata.sh start inkling`).
+- maya-inkling-mini (`maya-ik2`) and UnbiasedStrata for Inkling 2 Mini. Their
+  >100 tok/s results are RTX 3090/A6000; the kernels use `mma.sync`,
+  `ldmatrix` and `cp.async`, and the build skips `maya-ik2` below sm_80
+  (`CMakeLists.txt` line 899). NInfer accepts only sm_70+.
 
 ## Open decision
 

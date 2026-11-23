@@ -60,7 +60,7 @@ def normalize(config: dict) -> dict:
     config["gpus_asked"] = True
     config["parallel"] = 2
     config["host"] = "0.0.0.0"
-    config["port"] = 8080
+    config["port"] = 8081
     config["api_key"] = "local"
     config["open_browser"] = False
     config["model_name"] = MODEL_ID
@@ -75,7 +75,7 @@ def validate(config: dict) -> None:
         "gpu": config.get("gpu") == EXPECTED_GPUS,
         "parallel": config.get("parallel") == 2,
         "host": config.get("host") == "0.0.0.0",
-        "port": config.get("port") == 8080,
+        "port": config.get("port") == 8081,
         "cuda": config.get("cuda") == 12,
         "context": option_value(args, "--max-context") == EXPECTED_CONTEXT,
         "kv": option_value(args, "--kv") == "fp16",
