@@ -40,7 +40,7 @@ with normal project instructions and skill discovery, and no tool round trip:
 | Swift 1.5 Qwen3.8 GSQ-RCO | IQ2_S with embedded MTP, 8.95 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 46.37 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | Swift 1.5 Qwen3.8 Heretic | i1 Q4_K_M with embedded MTP, 15.66 GiB | 3 x P100 tensor split | 262,144 shared, F16 K/V | not isolated in Pi gate | 40.55 tok/s weighted | short-context Pi coding and tools passed; populated 262K unqualified |
 | Swift 1.5 Flash-Next via Strata 0.1.46.3 | full-expert IQ3_S, 77.99 GiB source | 3 x P100 layer split | 262,144 maximum, F16 K/V, 32K GPU-resident window | 56.5 tok/s short prompt | 39.3-42.9 tok/s | OpenAI, real Pi and two concurrent Pi transports passed; populated 262K unqualified |
-| Swift 1.5 Flash-Next via Strata 0.2.20 (active) | same prepared IQ3_S pack | 3 x P100 layer split, MTP | same | 246.5 tok/s, 5,666-token Pi `hi` | 38.1 tok/s, 164 tokens | one real Pi `hi` passed in 27.9 s; MTP accepted 91/165 |
+| Swift 1.5 Flash-Next via Strata 0.2.20 (selectable) | same prepared IQ3_S pack | 3 x P100 layer split, MTP | same | 246.5 tok/s, 5,666-token Pi `hi` | 38.1 tok/s, 164 tokens | one real Pi `hi` passed in 27.9 s; MTP accepted 91/165 |
 | Inkling 2 Mini via Strata 0.2.20 + pascal-llm TP3 (active) | SQ-20 native SF4+MX8, 19.35 GB | 3 x P100 tensor parallel (`--tp 3`, patches/strata-next) | 262,144 allocated, F16 K/V, global KV split 3/3/2 | ~440 tok/s, 7,001-token Pi `hi` | 58.9 tok/s, 75 tokens | real Pi `hi` through the `pascal-strata` service on 8081 passed in 18.2 s; KLD 0.0013 vs unmodified engine (its own noise 0.0012) |
 | Inkling 2 Mini via unmodified Strata 0.2.20 | same | 3 x P100 layer split; DSpark disabled by the engine in layer split | same | ~229 tok/s | 38.6 tok/s | superseded |
 | Gemma 4 26B A4B | official QAT Q4_0, 13.45 GiB | 1 x P40, native SM61 build | 262,144 configured, F16 K/V | 756.13 tok/s, 5,358 tokens | 55.09 tok/s, 105 tokens | one real Pi `hi` passed in 10.67 s; tools and populated maximum unqualified |
@@ -148,8 +148,8 @@ The complete command list is:
 
 ```bash
 ./ops/strata.sh download
-./ops/strata.sh start
-./ops/strata.sh restart
+./ops/strata.sh start [swift|inkling]
+./ops/strata.sh restart [swift|inkling]
 ./ops/strata.sh status
 ./ops/strata.sh logs
 ./ops/strata.sh models
@@ -160,18 +160,19 @@ The complete command list is:
 
 `download` runs setup for the configured Swift IQ3_S model: it downloads and
 checks the source shards, prepares the runtime packs and builds the engine.
-The prepared runtime model already exists on X99E. Commands take no
-model-profile argument:
-`./ops/strata.sh start` always starts `swift-flash-next-iq3-s`.
+The prepared runtime model already exists on X99E. `start` and `restart` take
+an optional model name, `swift` or `inkling`; without one they keep the
+current selection (default `swift`).
 `models` queries the running server's `/v1/models` endpoint; it does not list
 an upstream download catalog. The llama.cpp profiles above are managed only
 by `model.sh` and are not selectable through `strata.sh`.
 
 `start` and `restart` synchronize the repository, install the user service and
 wait for OpenAI health at `${PASCAL_STRATA_SERVER_URL}` (port `8081`).
-`pi-config` registers the separate `pascal-strata` provider and selects Swift
-as Pi's default while preserving the `pascal-llm` endpoint on port `8080`.
-`pi` launches the normal project-aware Pi session using that Strata provider;
+`pi-config` registers both Strata models under the separate `pascal-strata`
+provider and selects Swift as Pi's default while preserving the `pascal-llm`
+endpoint on port `8080`.
+`pi` launches the normal project-aware Pi session on the active Strata model;
 additional Pi arguments may follow `pi`. The service is manual and remains
 disabled at boot.
 
@@ -307,10 +308,10 @@ The concurrent deployment uses these independent OpenAI-compatible endpoints:
 | Runtime/model | Physical GPUs | Base URL |
 |---|---|---|
 | llama.cpp / Gemma 4 | P40 `3` | `${PASCAL_SERVER_URL}/v1` (port `8080`, unchanged) |
-| Strata / Swift Flash-Next IQ3_S | P100 `0,1,2` | `${PASCAL_STRATA_SERVER_URL}/v1` (port `8081`) |
+| Strata / Inkling 2 Mini SQ-20 or Swift Flash-Next IQ3_S (one at a time) | P100 `0,1,2` | `${PASCAL_STRATA_SERVER_URL}/v1` (port `8081`) |
 
-Pi keeps `pascal-llm` pointed at Gemma and registers Swift under the separate
-`pascal-strata` provider with `./ops/strata.sh pi-config`. Both wrappers retain
+Pi keeps `pascal-llm` pointed at Gemma and registers both Strata models under
+the separate `pascal-strata` provider with `./ops/strata.sh pi-config`. Both wrappers retain
 normal project instruction and skill discovery.
 
 Gemma selects the separate `work/llama.cpp/build-sm61` runtime for P40.
@@ -333,6 +334,7 @@ Qwen abliterated model qwen3.8-27b-abliterated-ud-q4-k-xl
 Swift GSQ model swift-1.5-qwen3.8-27b-gsq-rco-iq2-s-mtp
 Swift Heretic model swift-1.5-qwen3.8-27b-heretic-i1-q4-k-m
 Strata Swift model swift-flash-next-iq3-s
+Strata Inkling model inkling-2-mini-sq20
 Gemma 4 model  gemma-4-26b-a4b-it-qat-q4-0 (Pi hi passed; tools unqualified)
 Ornith model   ornith-1.5-35b-a3b-q4-k-m
 Nemotron model nvidia-nemotron-3.5-lightning-30b-a3b-q4-0 (prepared, unqualified)

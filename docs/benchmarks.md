@@ -1,3 +1,30 @@
+## One real Pi `hi` per pascal* model (2026-11-23)
+
+`pi --no-session --mode json -p hi` from this repository (project `AGENTS.md`,
+skills, xhigh thinking), one model at a time. Gemma stayed on P40 at port 8080
+and was not touched. Each P100 llama.cpp profile ran through `ops/run-server.sh`
+with its own profile as a temporary second instance on port 8083 (its normal
+service, `pascal-llm`, was serving Gemma); Strata was stopped meanwhile. Strata
+models ran through the `pascal-strata` service on port 8081. Decode rates come
+from short replies (10-202 tokens).
+
+| Model | Runtime | Prompt | Prefill | Decode | Pi wall | Reply |
+|---|---|---:|---:|---:|---:|---|
+| gpt-oss-20b MXFP4 | llama.cpp, 3 x P100 | 3,911 | 1,045 tok/s | 79.4 tok/s (65) | 5.2 s | Romanian |
+| Granite 4.0 H-Small Q4_K_M | llama.cpp, 3 x P100 | 5,652 | 243 tok/s | 36.8 tok/s (10) | 24.1 s | English |
+| Nemotron 3.5 Lightning Q4_0 | llama.cpp, 3 x P100 | 6,783 | 374 tok/s | 89.4 tok/s (151) | 20.4 s | Romanian |
+| North Mini Code Q4_K_M | llama.cpp, 3 x P100 | 5,459 | 709 tok/s | 52.1 tok/s (139) | 11.0 s | English |
+| Ornith 1.5 35B Q4_K_M | llama.cpp, 3 x P100 | 5,854 | 641 tok/s | 44.0 tok/s (202) | 14.3 s | Romanian |
+| Qwen3.8 27B UD-Q4_K_M | llama.cpp, 3 x P100 | 5,892 | 291 tok/s | 25.3 tok/s (94) | 24.6 s | Romanian |
+| Qwen3.8 27B abliterated UD-Q4_K_XL | llama.cpp, 3 x P100 | 5,892 | 291 tok/s | 30.7 tok/s (103) | 24.2 s | Romanian |
+| Swift 1.5 GSQ IQ2_S MTP | llama.cpp, 3 x P100 | 5,892 | 270 tok/s | 35.7 tok/s (37) | 23.5 s | Romanian |
+| Swift 1.5 Heretic Q4_K_M MTP | llama.cpp, 3 x P100 | 5,892 | 289 tok/s | 38.1 tok/s (67) | 22.8 s | Romanian |
+| Swift 1.5 Flash-Next IQ3_S | Strata 0.2.20, `pascal-strata` | - | - | 36.6 tok/s (162) | 28.4 s | Romanian |
+| Inkling 2 Mini SQ-20 | Strata 0.2.20 TP3, `pascal-strata` | 7,001 | ~440 tok/s | 59.0 tok/s (75) | 18.2 s | Romanian |
+
+All 11 runs exited normally with `stopReason=stop`. Granite and North answered in
+English despite the project's Romanian instruction. Evidence: `out/pi-hi-round/`.
+
 ## Inkling 2 Mini TP3, one real Pi `hi` (2026-11-23)
 
 The `pascal-strata` service with Inkling selected (Strata 0.2.20 + `patches/strata-next/01-inkling-tp-decode.patch`,

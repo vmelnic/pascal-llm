@@ -109,7 +109,8 @@ The front end moved to `terminal/serve/server.py` with its venv in
 `terminal/.venv`, created through `work/bin/uv` because the host has no
 `python3-venv`.
 
-`pascal-strata.service` now runs Swift from
+`pascal-strata.service` runs the active model (`swift` or `inkling`, chosen by
+`./ops/strata.sh start <model>`). Swift runs from
 `work/strata-next/strata-swift-iq3_s.json`. It is the previous run
 configuration with only `exe`, `cwd` and `log` changed; it reuses the
 unchanged prepared pack, MTP runtime and expert profile under
@@ -157,8 +158,8 @@ driver, CUDA toolkit or system package was installed, removed or changed.
 
 Operate this deployment only through `ops/strata.sh`: `start`, `stop`,
 `restart`, `status`, `logs` and `models` manage or inspect the remote service;
-`pi-config` registers `swift-flash-next-iq3-s` under a separate `pascal-strata`
-provider at port 8081 in `~/.pi/agent/models.json`, preserving `pascal-llm`
+`pi-config` registers `swift-flash-next-iq3-s` and `inkling-2-mini-sq20` under
+a separate `pascal-strata` provider at port 8081 in `~/.pi/agent/models.json`, preserving `pascal-llm`
 at port 8080. It places
 `pascal-strata/swift-flash-next-iq3-s:xhigh` first in the `enabledModels` list in
 `~/.pi/agent/settings.json`, declares `contextWindow: 262144`, and selects it as
