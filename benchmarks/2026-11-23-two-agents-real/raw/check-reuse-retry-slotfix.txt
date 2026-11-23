@@ -1,0 +1,4 @@
+turn 1    prompt    677  reused      0  read    677
+retry     prompt    677  reused    674  read      3
+next turn prompt    718  reused    674  read     44
+retry and next turn reuse the prompt: True

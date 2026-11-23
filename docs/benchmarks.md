@@ -1,3 +1,35 @@
+## Real Pi agents on Inkling TP3, two slots (2026-11-23)
+
+Full method, artifacts and table: `benchmarks/2026-11-23-two-agents-real/`.
+Read-only repository tasks, real Pi tool loops, run from a clone. The test
+found three patch defects, all fixed:
+
+- prefill starving the other slot (now `--prefill-share 0.5`);
+- no prompt reuse across tool turns (now `--tail-role-token 200001`);
+- a TP3 broadcast deadlock in long prefill (now a barrier every 3 chunks and a
+  60 s exchange timeout).
+
+After the fixes:
+
+- 80 of 83 requests reused their prefix (96.4% of 5.22M prompt tokens);
+- turns at ~86K context took 3.0 s median, versus 34-95 s full re-reads at
+  15-33K before;
+- 79 turns ran up to 86,960 tokens with no hang.
+
+Task A took 59.4 s alone (73.5 s before). Task B did not converge: Inkling
+looped on paged `grep` calls (78 tool calls in 88 min) and was stopped.
+
+Two more defects, also fixed:
+
+- a retried turn replaced the good prompt checkpoint;
+- a request running alone always used slot 0, overwriting the other
+  conversation's cache.
+
+Then tasks A and C (a `docs/hardware.md` summary) ran at once in 112.4 s,
+against 97.6 s one after the other. The service went back to one slot, with
+all 262,144 tokens of KV in VRAM; Pi `hi` then decoded at 57.5 tok/s in
+18.1 s.
+
 ## Two simultaneous Pi sessions, 262,144 tokens per slot (2026-11-23)
 
 Full method, artifacts and table: `benchmarks/2026-11-23-two-sessions/`. Two

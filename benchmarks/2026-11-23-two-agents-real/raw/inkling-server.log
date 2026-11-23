@@ -1,0 +1,27 @@
+[strata] thinking limited to 24576 of max_tokens 32768 so the answer has room ("answer_room": false in the config turns this off)
+[strata] thinking limited to 24576 of max_tokens 32768 so the answer has room ("answer_room": false in the config turns this off)
+[strata] reading the prompt: 512 of 7,013 tokens, 1 s so far
+[strata] reading the prompt: 1,024 of 7,013 tokens, 2 s so far
+[strata] reading the prompt: 1,536 of 7,013 tokens, 3 s so far
+[strata] reading the prompt: 2,048 of 7,013 tokens, 4 s so far
+[strata] reading the prompt: 2,560 of 7,013 tokens, 5 s so far
+[strata] reading the prompt: 3,072 of 7,013 tokens, 6 s so far
+[strata] reading the prompt: 3,584 of 7,013 tokens, 8 s so far
+[strata] reading the prompt: 4,096 of 7,013 tokens, 9 s so far
+[strata] reading the prompt: 4,608 of 7,013 tokens, 10 s so far
+[strata] reading the prompt: 4,608 of 7,013 tokens, 10 s so far
+[strata] reading the prompt: 5,120 of 7,013 tokens, 11 s so far
+[strata] reading the prompt: 5,632 of 7,013 tokens, 12 s so far
+[strata] reading the prompt: 6,144 of 7,013 tokens, 13 s so far
+[strata] reading the prompt: 6,656 of 7,013 tokens, 14 s so far
+[strata] reading the prompt: 7,012 of 7,013 tokens, 16 s so far
+[strata] reading the prompt: 4 of max 32768 tokens, 3.7 tok/s, 17 s
+[strata] answering: 63 of max 32768 tokens, 29.9 tok/s, 18 s
+[strata] answering: 68 of max 32768 tokens, 21.0 tok/s, 19 s
+[strata] done: 81 tokens in 19 s (23.4 tok/s) (stop, cancel=False)
+[strata] reading the prompt: 7,013 of 7,013 tokens, 26 s so far
+[strata] reading the prompt: 1 of max 32768 tokens, 4.0 tok/s, 33 s
+[strata] reading the prompt: 60 of max 32768 tokens, 59.1 tok/s, 34 s
+[strata] answering: 119 of max 32768 tokens, 58.7 tok/s, 35 s
+[strata] answering: 178 of max 32768 tokens, 58.5 tok/s, 36 s
+[strata] done: 197 tokens in 37 s (58.5 tok/s) (stop, cancel=False)

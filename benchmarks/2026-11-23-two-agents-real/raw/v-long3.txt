@@ -1,0 +1,8 @@
+[InkCUDA] Loaded /home/vm/pascal-llm/work/models/inkling-2-mini-strata-sq20/Inkling-2-Mini-SQ-20.strata (SQ-20): trunk=3.67 GB (0.95s), experts=3072 VRAM / 0 host (3.43s, hyb=0, promo=0, pf_buf=0MB), sm120_tc=0, screen=0
+[InkCUDA] Loaded /home/vm/pascal-llm/work/models/inkling-2-mini-strata-sq20/Inkling-2-Mini-SQ-20.strata (SQ-20): trunk=3.67 GB (0.96s), experts=3072 VRAM / 0 host (3.37s, hyb=0, promo=0, pf_buf=0MB), sm120_tc=0, screen=0
+[InkCUDA] Loaded /home/vm/pascal-llm/work/models/inkling-2-mini-strata-sq20/Inkling-2-Mini-SQ-20.strata (SQ-20): trunk=3.67 GB (0.96s), experts=3072 VRAM / 0 host (3.32s, hyb=0, promo=0, pf_buf=0MB), sm120_tc=0, screen=0
+[InkCUDA] Elastic global KV grown: 8192 -> 262144 tokens (max_ctx=262144)
+[InkCUDA] Elastic global KV grown: 8192 -> 262144 tokens (max_ctx=262144)
+[InkCUDA] Elastic global KV grown: 8192 -> 262144 tokens (max_ctx=262144)
+[InkCUDA] tensor-parallel decode: TP3[GPU2,GPU0,GPU1] Tesla P100-PCIE-16GB (sm_60, 56 SMs, 15.9 GiB VRAM, sm120_tc=0)
+[bench] backend=cuda-tp format=strata parallel=1 gpus=3 kv=fp16 prompt=16384 gen=32 | prefill=431.0 ppts (38.01s) | decode=52.9 tps agg (52.9 tps/slot, 0.60s)

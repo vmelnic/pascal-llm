@@ -196,3 +196,29 @@ and 100,608 mapped host tokens (2,358 MiB) on the two ranks that own 3 global
 visits. `--bench --parallel 2` (same prompt per slot, `STRATA_BENCH_SAME_PROMPT`)
 emits the 1-slot greedy tokens in both slots; 88.3 tok/s total (44.2 per slot).
 Two concurrent Pi sessions: `benchmarks/2026-11-23-two-sessions/`.
+
+## Multi-turn serving fixes (2026-11-23)
+
+Real Pi tool loops (`benchmarks/2026-11-23-two-agents-real/`) exposed three
+defects, now fixed in the patch:
+
+1. Prefill starved a decoding slot (1 decode token per 512-token step).
+   `--prefill-share F` adds decode-only steps after each prefill step until the
+   decoding slots have had (1 - F) of the time. Prefill chunks are unchanged.
+2. No prompt reuse on tool turns. The served prompt ends with an empty
+   thinking turn that the next turn does not repeat, so the `prompt_len - 1`
+   checkpoint never matched. `--tail-role-token ID` checkpoints in front of
+   the last role token (`<|message_model|>` = 200001), as the main Strata
+   engine does.
+3. Chunked broadcasts (M=512: 12 chunks over 4 receive slots) could overwrite
+   a slot a slower rank had not read, because the owner waits for nobody.
+   `tp_bcast` now inserts a one-float all-reduce barrier after every 3 chunks,
+   and `tp_ld_wait` traps after 60 s without data instead of hanging.
+   Greedy tokens are unchanged.
+
+Serving decision (2026-11-23): one slot (`--parallel 1 --tail-role-token 200001`).
+Two agents at once finished in 112.4 s against 97.6 s one after the other, and
+the second slot pushes the tail of every slot's global KV beyond 161,536 tokens
+into mapped host RAM. With one slot, all 262,144 tokens of KV stay in VRAM
+(12,941 / 11,917 / 12,941 MiB), and Pi `hi` decodes at 57.5 tok/s with the
+7,001-token prompt read in ~16 s (18.1 s wall).

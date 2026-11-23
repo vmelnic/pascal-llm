@@ -541,7 +541,7 @@ index bcc69196..633f4d68 100644
                      const float sc1 = ue8m0_to_f32(s1[i >> 1]);
                      __half2 w0[8], w1[8];
 diff --git a/engine/src/inkling2/cuda/ink_runner.cuh b/engine/src/inkling2/cuda/ink_runner.cuh
-index 5cce0a82..b33e61d0 100644
+index 5cce0a82..5cfe5b49 100644
 --- a/engine/src/inkling2/cuda/ink_runner.cuh
 +++ b/engine/src/inkling2/cuda/ink_runner.cuh
 @@ -10,6 +10,8 @@
@@ -684,7 +684,7 @@ index 5cce0a82..b33e61d0 100644
                  } else {
                      uint8_t* hdst = h_arena_base + dst_off[di];
                      std::memcpy(hdst, body.data(), body.size());
-@@ -1628,6 +1713,89 @@ struct InkCudaRunner {
+@@ -1628,6 +1713,96 @@ struct InkCudaRunner {
      cudaStream_t st = nullptr;
      cublasHandle_t cublas = nullptr;
  
@@ -710,7 +710,11 @@ index 5cce0a82..b33e61d0 100644
 +    }
 +    bool tp_owns_kv(int v) const { return m.tp_rank < 0 || tp_kv_owner[v] < 0 || tp_kv_owner[v] == m.tp_rank; }
 +    void tp_bcast(float* x, size_t n, int owner) {
-+        for (size_t o = 0; o < n; o += kTpSlotFloats) {
++        int chunk = 0;
++        for (size_t o = 0; o < n; o += kTpSlotFloats, ++chunk) {
++            // The owner waits for nobody: a barrier exchange after every kTpSlots - 1 chunks keeps any rank
++            // from overwriting a receive slot a slower peer has not read yet (see ink_tp.cuh).
++            if (chunk > 0 && chunk % (kTpSlots - 1) == 0) tp_allreduce(tp_barrier_word(), 1);
 +            const int len = (int)std::min(kTpSlotFloats, n - o);
 +            if (tp_graph_mode) {
 +                k_tp_bcast<<<kTpBlocks, kTpThreads, 0, st>>>(tp_peers, x + o, len, owner, tp_rank, tp_world, d_tp_base, tp_step_k++);
@@ -722,7 +726,10 @@ index 5cce0a82..b33e61d0 100644
 +    float* d_tp_scratch = nullptr;     // compact local blocks for M > 1 row-split projections
 +    static constexpr size_t kTpScratchFloats = (size_t)16 * 16384;
 +    unsigned* d_tp_counter = nullptr;  // last-CTA counter for the fused M=1 router
++    float* d_tp_barrier = nullptr;     // one float all-reduced as a barrier inside chunked broadcasts
++    float* tp_barrier_word() { return d_tp_barrier; }
 +    float* tp_scratch() {
++        if (!d_tp_barrier) { d_tp_barrier = dalloc<float>(1); INK_CK(cudaMemset(d_tp_barrier, 0, sizeof(float))); }
 +        if (!d_tp_scratch) d_tp_scratch = dalloc<float>(kTpScratchFloats);
 +        if (!d_tp_counter) { d_tp_counter = dalloc<unsigned>(16); INK_CK(cudaMemset(d_tp_counter, 0, 16 * sizeof(unsigned))); }
 +        return d_tp_scratch;
@@ -774,7 +781,7 @@ index 5cce0a82..b33e61d0 100644
      int max_slots = 1;
      int max_ctx = 4096;
      int kv_alloc_ctx = 0;         // Elastic global KV current allocated capacity (dev_ctx + host_ctx <= max_ctx!)
-@@ -1939,11 +2107,12 @@ struct InkCudaRunner {
+@@ -1939,11 +2114,12 @@ struct InkCudaRunner {
                  swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
              }
              const size_t per_visit_pos = kv_bytes_per_visit_pos(kv_dtype);
@@ -788,7 +795,7 @@ index 5cce0a82..b33e61d0 100644
                  }
              }
              const size_t swa_kv_bytes = (size_t)n_swa_g0 * max_slots * swa_ring * per_visit_pos;
-@@ -1963,7 +2132,7 @@ struct InkCudaRunner {
+@@ -1963,7 +2139,7 @@ struct InkCudaRunner {
              // Check mapped host RAM budget for Host KV Offloading (8 global visits total!)
              const uint64_t host_avail = ink_ram_available_bytes();
              const uint64_t host_os_res = 2ull << 30;
@@ -797,7 +804,7 @@ index 5cce0a82..b33e61d0 100644
              const int host_fit_ctx = (host_avail > host_os_res)
                  ? (int)std::min<size_t>((size_t)max_ctx, ((size_t)(host_avail - host_os_res) / std::max<size_t>(1, per_pos_all_glob)) & ~(size_t)63)
                  : max_ctx;
-@@ -2012,8 +2181,9 @@ struct InkCudaRunner {
+@@ -2012,8 +2188,9 @@ struct InkCudaRunner {
              const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
              INK_CK(cudaSetDevice(dev));
              const bool swa = m.man.c.is_swa[ip] != 0;
@@ -809,7 +816,7 @@ index 5cce0a82..b33e61d0 100644
              kv_desc[v] = {};
              kv_desc[v].cap_pos  = dcap + hcap;
              kv_desc[v].dev_cap  = dcap;
-@@ -2274,7 +2444,7 @@ struct InkCudaRunner {
+@@ -2274,7 +2451,7 @@ struct InkCudaRunner {
              int n_glob_s = 0;
              for (int v = 0; v < kInkVisits; ++v) {
                  const int ip = ink_visit_phys(v);
@@ -818,7 +825,7 @@ index 5cce0a82..b33e61d0 100644
              }
              if (n_glob_s == 0) continue;
              size_t vf = 0, vt = 0;
-@@ -2301,7 +2471,7 @@ struct InkCudaRunner {
+@@ -2301,7 +2478,7 @@ struct InkCudaRunner {
                              }
                              bool all_ok = true;
                              for (int v = 0; v < kInkVisits && all_ok; ++v) {
@@ -827,7 +834,7 @@ index 5cce0a82..b33e61d0 100644
                                  const int ip = ink_visit_phys(v);
                                  const int dev = m.ls_active ? m.stage_gpu[m.layer_owner[ip]] : m.primary_gpu;
                                  cudaSetDevice(dev);
-@@ -2321,7 +2491,7 @@ struct InkCudaRunner {
+@@ -2321,7 +2498,7 @@ struct InkCudaRunner {
                              cudaSetDevice(m.primary_gpu);
                              if (all_ok) {
                                  for (int v = 0; v < kInkVisits; ++v) {
@@ -836,7 +843,7 @@ index 5cce0a82..b33e61d0 100644
                                      kv_desc[v].dev_cap  = kv_dev_ctx;
                                      kv_desc[v].host_cap = hcap;
                                      kv_desc[v].cap_pos  = kv_dev_ctx + hcap;
-@@ -2335,7 +2505,7 @@ struct InkCudaRunner {
+@@ -2335,7 +2512,7 @@ struct InkCudaRunner {
                                               kv_dev_ctx, kv_host_ctx, kv_alloc_ctx);
                                  return true;
                              }
@@ -845,7 +852,7 @@ index 5cce0a82..b33e61d0 100644
                          }
                      }
                      return false;
-@@ -2355,7 +2525,7 @@ struct InkCudaRunner {
+@@ -2355,7 +2532,7 @@ struct InkCudaRunner {
          }
  
          for (int v = 0; v < kInkVisits; ++v) {
@@ -854,7 +861,7 @@ index 5cce0a82..b33e61d0 100644
              const int ip = ink_visit_phys(v);
              const int s  = m.ls_active ? m.layer_owner[ip] : 0;
              const int dev = m.ls_active ? m.stage_gpu[s] : m.primary_gpu;
-@@ -2643,6 +2813,31 @@ struct InkCudaRunner {
+@@ -2643,6 +2820,31 @@ struct InkCudaRunner {
              mp.N[i] = (int)ti.rows();
              mp.cumN[i + 1] = mp.cumN[i] + mp.N[i];
          }
@@ -886,7 +893,7 @@ index 5cce0a82..b33e61d0 100644
          if (can_fuse) {
              const int grid = (mp.cumN[count] + 7) / 8;
              if (ti0.fmt == FMT_BF16) {
-@@ -2688,6 +2883,17 @@ struct InkCudaRunner {
+@@ -2688,6 +2890,17 @@ struct InkCudaRunner {
          if (ti.fmt == FMT_BF16) {
              const bool is_fp16 = cur_attn_fp16 && (tname.find(".attn.") != std::string::npos);
              const int bf16_gemv_max = is_fp16 ? 3 : ((exact_fp32_x || cur_cc < 80) ? 16 : 7);
@@ -904,7 +911,7 @@ index 5cce0a82..b33e61d0 100644
              if (M <= bf16_gemv_max) {
                  InkMultiProj mp{};
                  mp.W[0] = W; mp.Y[0] = Y; mp.N[0] = N; mp.cumN[0] = 0; mp.cumN[1] = N; mp.count = 1;
-@@ -2870,7 +3076,7 @@ struct InkCudaRunner {
+@@ -2870,7 +3083,7 @@ struct InkCudaRunner {
              const float* q_res = (const float*)m.trunk_ptr_stage(cur_stage, "model.llm.attn_res.attn_queries." + std::to_string(ip - 1));
              const int nq = is_swa ? 1 : 3;
              if (!has_msg) {
@@ -913,7 +920,7 @@ index 5cce0a82..b33e61d0 100644
                  in_q = d_mixed;
                  in_k = is_swa ? d_mixed : (d_mixed + 1 * n_hid);
                  in_v = is_swa ? d_mixed : (d_mixed + 2 * n_hid);
-@@ -2979,6 +3185,9 @@ struct InkCudaRunner {
+@@ -2979,6 +3192,9 @@ struct InkCudaRunner {
              }
          };
  
@@ -923,7 +930,7 @@ index 5cce0a82..b33e61d0 100644
          // 5-6. FUSED Post-QKV (K/V ShortConv4 + Q/K/V/R Clip + V RMSNorm + Global Tau + KV Write/Stage) in 1 launch for decode/batched/tree!
          const auto& ti_qc = m.tinfo(p + ".attn.q_l2_clip.scale");
          const auto& ti_rc = m.tinfo(p + ".attn.rel_l2_clip.scale");
-@@ -3121,6 +3330,9 @@ struct InkCudaRunner {
+@@ -3121,6 +3337,9 @@ struct InkCudaRunner {
          }
          prof_mark_end(3); prof_mark_start();
  
@@ -933,7 +940,7 @@ index 5cce0a82..b33e61d0 100644
          // 8. Output projection wo + FUSED post-attn ShortConv + residual add / block boundary!
          linear(p + ".attn.wo_ud.weight", d_attn_out, d_wo_raw, M, 0, false, (mode == 2));
          prof_mark_end(4); prof_mark_start();
-@@ -3150,7 +3362,7 @@ struct InkCudaRunner {
+@@ -3150,7 +3369,7 @@ struct InkCudaRunner {
                      (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.mlp.forget_weight"),
                      mlp_nw, d_moe_in, M, /*cat_ready=*/true, exact_x);
              } else {
@@ -942,7 +949,7 @@ index 5cce0a82..b33e61d0 100644
              }
          }
          prof_mark_end(0); prof_mark_start();
-@@ -3208,6 +3420,46 @@ struct InkCudaRunner {
+@@ -3208,6 +3427,46 @@ struct InkCudaRunner {
              k_ink_add_f32<<<(n_add + 255) / 256, 256, 0, st>>>(d_moe_raw, d_peer_y_rx, n_add);
              prof_mark_end(5); prof_mark_start();
              run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
@@ -989,7 +996,7 @@ index 5cce0a82..b33e61d0 100644
          } else if (m.layer_has_host[ip] && m.hybrid.active && cur_stage == 0) {
              launch_ink_moe_hybrid(
                  st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
-@@ -3353,7 +3605,7 @@ struct InkCudaRunner {
+@@ -3353,7 +3612,7 @@ struct InkCudaRunner {
              for (int b = 0; b < n_blocks; ++b) stp.p[b] = block_ptrs[b];
              stp.p[n_blocks] = d_cur;
              stp.count = n_blocks + 1;
@@ -998,7 +1005,7 @@ index 5cce0a82..b33e61d0 100644
              k_ink_rms_norm<<<M, 256, 0, st>>>(d_moe_in, (const float*)m.trunk_ptr("model.llm.norm.weight"), d_h_norm, nullptr, M, kInkHidden);
              if (want_taps) INK_CK(cudaMemcpyAsync(d_taps[3], d_h_norm, n_hid * 4, cudaMemcpyDeviceToDevice, st));
          }
-@@ -3373,6 +3625,7 @@ struct InkCudaRunner {
+@@ -3373,6 +3632,7 @@ struct InkCudaRunner {
              GraphKey key{M, 0, want_taps ? 1 : 0, (int)kv_dtype};
              cudaGraphExec_t exec = nullptr;
              for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -1006,7 +1013,7 @@ index 5cce0a82..b33e61d0 100644
              if (!exec) {
                  cudaGraph_t gr = nullptr;
                  cudaError_t ge = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
-@@ -3389,13 +3642,16 @@ struct InkCudaRunner {
+@@ -3389,13 +3649,16 @@ struct InkCudaRunner {
                      if (gr) cudaGraphDestroy(gr);
                      use_cuda_graph = false;
                      std::fprintf(stderr, "[InkCUDA] CUDA Graph capture unavailable (err=%d): falling back to eager mode\n", (int)ge);
@@ -1023,7 +1030,7 @@ index 5cce0a82..b33e61d0 100644
              if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote(m.d_sec4, m.d_experts, st);
              return;
          }
-@@ -3425,7 +3681,7 @@ struct InkCudaRunner {
+@@ -3425,7 +3688,7 @@ struct InkCudaRunner {
          INK_CK(cudaMemcpyAsync(d_tree_anc,  h_bytes + 128, kInkMaxTree * kInkMaxTreeDepth, cudaMemcpyHostToDevice, st));
          INK_CK(cudaMemcpyAsync(d_tree_dep,  h_bytes + 384, kInkMaxTree, cudaMemcpyHostToDevice, st));
  
@@ -1032,7 +1039,7 @@ index 5cce0a82..b33e61d0 100644
              GraphKey key{M, 2, want_taps ? 1 : 0, (int)kv_dtype};
              cudaGraphExec_t exec = nullptr;
              for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
-@@ -3467,7 +3723,7 @@ struct InkCudaRunner {
+@@ -3467,7 +3730,7 @@ struct InkCudaRunner {
          INK_CK(cudaMemcpyAsync(d_slots, slot_buf + B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
          INK_CK(cudaMemcpyAsync(d_pos, slot_buf + 2 * B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
  
@@ -1041,7 +1048,7 @@ index 5cce0a82..b33e61d0 100644
              GraphKey key{B, 10, want_taps ? 1 : 0, (int)kv_dtype};
              cudaGraphExec_t exec = nullptr;
              for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
-@@ -3503,6 +3759,28 @@ struct InkCudaRunner {
+@@ -3503,6 +3766,28 @@ struct InkCudaRunner {
      void head_argmax_exact(int M, int32_t* h_out_ids) {
          prof_mark_start();
          const auto& ui = m.tinfo("model.llm.unembed.weight");
@@ -1070,7 +1077,7 @@ index 5cce0a82..b33e61d0 100644
          if (m.unembed_screen.ready && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K) && M <= kInkMaxTree) {
              const int V = m.man.c.vocab_unpadded;
              const int g1 = (V + 7) / 8;
-@@ -3551,7 +3829,20 @@ struct InkCudaRunner {
+@@ -3551,7 +3836,20 @@ struct InkCudaRunner {
      void head_logits_from(const float* d_h_src, int n_want) {
          ensure_logits(n_want);
          const int V = m.man.c.vocab_unpadded;
@@ -1094,10 +1101,10 @@ index 5cce0a82..b33e61d0 100644
      }
 diff --git a/engine/src/inkling2/cuda/ink_tp.cuh b/engine/src/inkling2/cuda/ink_tp.cuh
 new file mode 100644
-index 00000000..5b681539
+index 00000000..dbef81d6
 --- /dev/null
 +++ b/engine/src/inkling2/cuda/ink_tp.cuh
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,167 @@
 +// ink_tp.cuh - Tensor-parallel decode exchange for strata-inkling (pascal-llm patch).
 +//
 +// Each rank runs the same kernel sequence on its own GPU. Exchanges use a
@@ -1109,7 +1116,13 @@ index 00000000..5b681539
 +// Receive slots rotate over kTpSlots epochs. A rank cannot write epoch e+kTpSlots
 +// into a peer's slot before that peer has finished exchange e: the writer must
 +// first read the peer's data of e+1..e+kTpSlots-1, which the peer only writes
-+// after its exchange-e kernel completed (stream order).
++// after its exchange-e kernel completed (stream order). This holds only when one
++// of every kTpSlots consecutive exchanges makes every rank wait for every other:
++// a broadcast's owner waits for nobody, so a chunked broadcast inserts a barrier
++// exchange after every kTpSlots - 1 chunks (InkCudaRunner::tp_bcast).
++//
++// A wait that sees no data for 60 s prints the exchange and traps, so a protocol
++// fault ends the engine with a diagnosable error instead of hanging every GPU.
 +//
 +// All-reduce sums ranks in fixed order 0..world-1, so every rank holds
 +// bit-identical results and the replicated state never diverges.
@@ -1160,11 +1173,27 @@ index 00000000..5b681539
 +    asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};" :: "l"(p), "r"(__float_as_uint(v)), "r"(epoch) : "memory");
 +}
 +
++__device__ __forceinline__ long long tp_now_ns() {
++    long long t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++
 +__device__ __forceinline__ float tp_ld_wait(const uint2* p, unsigned epoch) {
-+    unsigned v, e;
-+    do {
++    unsigned v, e, spins = 0;
++    long long t0 = 0;
++    for (;;) {
 +        asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(v), "=r"(e) : "l"(p) : "memory");
-+    } while (e != epoch);
++        if (e == epoch) break;
++        if (((++spins) & 0xFFFFFu) == 0u) {
++            const long long now = tp_now_ns();
++            if (t0 == 0) t0 = now;
++            else if (now - t0 > 60000000000LL) {
++                printf("[InkTP] exchange timeout: waiting for epoch %u, slot holds epoch %u\n", epoch, e);
++                __trap();
++            }
++        }
++    }
 +    return __uint_as_float(v);
 +}
 +
@@ -1678,7 +1707,7 @@ index e8b05e78..d07bc9fa 100644
  #elif defined(INKLING_ENABLE_EP_CUDA)
          return make_ep_cuda_backend();
 diff --git a/engine/src/inkling2/ink_main.cpp b/engine/src/inkling2/ink_main.cpp
-index e9ab31b8..0ec45df5 100644
+index e9ab31b8..b3654c00 100644
 --- a/engine/src/inkling2/ink_main.cpp
 +++ b/engine/src/inkling2/ink_main.cpp
 @@ -166,6 +166,8 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
@@ -1776,7 +1805,18 @@ index e9ab31b8..0ec45df5 100644
      }
  
      double kld_sum = 0.0, nll_sum = 0.0;
-@@ -462,6 +491,8 @@ int main(int argc, char** argv) {
+@@ -409,6 +438,10 @@ int main(int argc, char** argv) {
+             cfg.bopts.max_ctx = std::atoi(next().c_str());
+         } else if (a == "--parallel" || a == "--batch" || a == "--slots") {
+             cfg.bopts.parallel = std::max(1, std::min(kMaxParallelSlots, std::atoi(next().c_str())));
++        } else if (a == "--tail-role-token") {
++            cfg.tail_role_token = std::atoi(next().c_str());
++        } else if (a == "--prefill-share") {
++            cfg.prefill_share = std::strtof(next().c_str(), nullptr);
+         } else if (a == "--chunk") {
+             cfg.bopts.chunk = std::max(1, std::atoi(next().c_str()));
+         } else if (a == "--kv-dtype" || a == "--kv") {
+@@ -462,6 +495,8 @@ int main(int argc, char** argv) {
                  cfg.bopts.gpu_ids.clear();
                  cfg.bopts.gpus = std::max(1, std::atoi(spec.c_str()));
              }
@@ -1785,3 +1825,131 @@ index e9ab31b8..0ec45df5 100644
          } else if (a == "--ep-split") {
              cfg.bopts.ep_split = std::atof(next().c_str());
          } else if (a == "--layer-split") {
+diff --git a/engine/src/inkling2/ink_serve.h b/engine/src/inkling2/ink_serve.h
+index 6cbb1e8c..86fd8b2a 100644
+--- a/engine/src/inkling2/ink_serve.h
++++ b/engine/src/inkling2/ink_serve.h
+@@ -417,7 +417,8 @@ struct ActiveReq {
+     std::vector<int32_t> cached_prefix;       // tokens currently resident in slot KV
+     std::vector<int32_t> prompt_ckpt_prefix;  // prompt-end checkpoint prefix saved before generation (#6627)
+     int reused_tokens = 0;                    // prefix tokens reused for this request
+-    bool ckpt_pending = false;                // true while prefilling up to prompt_len - 1 to save checkpoint
++    bool ckpt_pending = false;                // true while prefilling up to ckpt_at to save checkpoint
++    int ckpt_at = 0;                          // checkpoint position: prompt_len - 1, or in front of the tail role token
+     double t_start = 0.0;
+     double prompt_ms = 0.0;
+     double decode_t0 = 0.0;
+@@ -436,6 +437,14 @@ struct ServeConfig {
+     bool force_cpu = false;
+     bool anti_loop = true;
+     std::string version = "0.1.66";
++    // pascal-llm: share of wall time prefill may take while another slot is decoding (1 = upstream behaviour:
++    // every step feeds a full prefill chunk). Below 1, decode-only steps follow each prefill step until the
++    // decoding slots got their (1 - share) of the time. Prefill chunks themselves are unchanged.
++    float prefill_share = 1.0f;
++    // pascal-llm: --tail-role-token ID (as the main Strata engine): save the prompt checkpoint in front of the
++    // prompt's last ID token instead of at prompt_len - 1, so a next turn that renders the reply's opener differently
++    // (Inkling's empty thinking turn before tool calls) still resumes from the checkpoint.
++    int tail_role_token = -1;
+ };
+ 
+ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& backend) {
+@@ -444,6 +453,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+     const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
+     const int chunk_sz = std::max(1, cfg.bopts.chunk);
+     const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
++    const float pf_share = std::min(1.0f, std::max(0.05f, cfg.prefill_share));
++    double dec_owed_ms = 0.0;   // decode-only time still owed to decoding slots (prefill share < 1)
++    if (pf_share < 1.0f) std::fprintf(stderr, "[inkling2] prefill share %.2f while another slot decodes\n", pf_share);
+ 
+     // Probe Vision shard lazily (zero VRAM/RAM until first image request)
+     bool images_ok = false;
+@@ -617,7 +629,16 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+             proto("RESUME %d", reuse);
+         }
+         rq.reused_tokens = reuse;
+-        rq.ckpt_pending = (pg.images.empty() && rq.prompt_len >= 16 && reuse < rq.prompt_len - 1);
++        // The checkpoint sits in front of the prompt's last tail role token. When the reused part already covers
++        // it (a retried request resumes exactly there), the existing checkpoint is kept: falling back to
++        // prompt_len - 1 would replace it with one the next turn no longer matches.
++        rq.ckpt_at = rq.prompt_len - 1;
++        if (cfg.tail_role_token >= 0) {
++            for (int i = rq.prompt_len - 1; i >= 0; --i) {
++                if (rq.prompt_ids[i] == cfg.tail_role_token) { rq.ckpt_at = i; break; }
++            }
++        }
++        rq.ckpt_pending = (pg.images.empty() && rq.prompt_len >= 16 && reuse < rq.ckpt_at);
+         rq.prefill_pos = reuse;
+         rq.cur_pos = reuse;
+         rq.hist = rq.prompt_ids;
+@@ -691,6 +712,23 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+                 }
+                 pg.slot = free_s;
+             }
++            if (pg.cmd == "GEN" && pg.images.empty() && P > 1) {
++                // pascal-llm: the server sends a request that runs alone as GEN, which used slot 0 regardless of
++                // which slot holds its conversation, overwriting another conversation's cache. Pick the free slot
++                // whose cached tokens or prompt checkpoint are the longest start of this prompt (slot 0 if none).
++                auto held = [&](const std::vector<int32_t>& h) -> int {
++                    if (h.empty() || h.size() > pg.ids.size()) return 0;
++                    for (size_t i = 0; i < h.size(); ++i) if (h[i] != pg.ids[i]) return 0;
++                    return static_cast<int>(h.size());
++                };
++                int best = 0, best_len = 0;
++                for (int s = 0; s < P; ++s) {
++                    if (reqs[s].active) continue;
++                    const int l = std::max(held(reqs[s].cached_prefix), held(reqs[s].prompt_ckpt_prefix));
++                    if (l > best_len) { best = s; best_len = l; }
++                }
++                pg.slot = best;
++            }
+             if (pg.slot < 0 || pg.slot >= P) {
+                 proto("ERR BGEN: slot %d out of range 0..%d", pg.slot, P - 1);
+                 return true;
+@@ -903,8 +941,11 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+             --token_budget;
+         }
+ 
++        const int n_dec = static_cast<int>(logit_slots.size());
++        const bool pf_allowed = !(n_dec > 0 && pf_share < 1.0f && dec_owed_ms > 0.0);
++
+         // Then fill remaining budget with chunked-prefill tokens across prefilling slots (round-robin!)
+-        if (token_budget > 0) {
++        if (token_budget > 0 && pf_allowed) {
+             std::vector<int> pf_slots;
+             for (int s = 0; s < P; ++s) if (reqs[s].active && reqs[s].prefill_pos < reqs[s].prompt_len) pf_slots.push_back(s);
+             if (!pf_slots.empty()) {
+@@ -914,8 +955,8 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+                     const int rem = rq.prompt_len - rq.prefill_pos;
+                     int take = std::min(rem, per_slot);
+                     // #6627: Pause 1 token before prompt_len so we save the exact prompt-end checkpoint at prompt_len - 1!
+-                    if (rq.ckpt_pending && rq.prefill_pos < rq.prompt_len - 1 && rq.prefill_pos + take >= rq.prompt_len) {
+-                        take = (rq.prompt_len - 1) - rq.prefill_pos;
++                    if (rq.ckpt_pending && rq.prefill_pos < rq.ckpt_at && rq.prefill_pos + take > rq.ckpt_at) {
++                        take = rq.ckpt_at - rq.prefill_pos;
+                     }
+                     const int img_base = static_cast<int>(merged_img_embeds.size()) / c.hidden;
+                     if (!rq.img_embeds.empty()) {
+@@ -942,6 +983,13 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+             return 1;
+         }
+         const double step_ms = (now_s() - t_step0) * 1000.0;
++        if (pf_share < 1.0f) {
++            int fed = 0;
++            for (int s = 0; s < P; ++s) fed += prefill_fed[s];
++            if (n_dec == 0) dec_owed_ms = 0.0;
++            else if (fed > 0) dec_owed_ms += step_ms * (1.0 - pf_share) / pf_share;
++            else dec_owed_ms = std::max(0.0, dec_owed_ms - step_ms);
++        }
+ 
+         // Update prefill progress & emit PP lines (+ save prompt-end checkpoint at prompt_len - 1 for #6627!)
+         for (int s = 0; s < P; ++s) {
+@@ -951,7 +999,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend&
+                 rq.prefill_pos += prefill_fed[s];
+                 rq.cur_pos = rq.prefill_pos;
+                 rq.prompt_ms += step_ms;
+-                if (rq.ckpt_pending && rq.prefill_pos == rq.prompt_len - 1) {
++                if (rq.ckpt_pending && rq.prefill_pos == rq.ckpt_at) {
+                     rq.ckpt_pending = false;
+                     if (backend.save_prompt_checkpoint(rq.slot, rq.prefill_pos)) {
+                         rq.prompt_ckpt_prefix.assign(rq.prompt_ids.begin(), rq.prompt_ids.begin() + rq.prefill_pos);
